@@ -93,6 +93,17 @@ class AgentsSDKExtractor(ResumeExtractor):
     name = "openai-agents-sdk"
 
     async def parse(self, text: str) -> ResumeProfile:
+        # Build the configured client first so model_provider loads backend/.env
+        # before we choose the provider-specific structured-output path.
+        configured_model()
+        primary_model = os.getenv("APP_AGENT_MODEL", "gpt-5.6-sol").strip()
+        prompt_json_models = {
+            item.strip() for item in os.getenv("APP_AGENT_PROMPT_JSON_MODELS", "").split(",") if item.strip()
+        }
+        if primary_model in prompt_json_models:
+            parsed = await self._parse_fallback(text, primary_model)
+            self.name = f"openai-agents-sdk:{primary_model}:prompt-json"
+            return parsed
         try:
             return await self._parse_primary(text)
         except (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError, ModelBehaviorError):
