@@ -1,19 +1,35 @@
-# OfferPilot — 求职投递 Agent MVP
+# 职达 Zhida
 
-一个本地优先的简历资料库：上传 PDF、DOCX 或 TXT 简历，自动拆分姓名、性别、年龄、联系方式、教育、技能、实习和项目经历，并允许逐项修改和保存。
+> 上传一次简历，建立可复用的求职档案。
 
-## 技术选择
+职达是一个本地优先、human-in-the-loop 的求职资料 Agent。它将多份 PDF、DOCX 或 TXT 简历拆成结构化信息，合并为候选人主档案，并保留字段置信度、原文证据和冲突记录。用户始终拥有最终决定权。
 
-- 前端：React + TypeScript + Vite
-- API：FastAPI + Pydantic
-- 存储：SQLite（结构化资料）+ 本地 uploads（原始简历）
-- Agent：PydanticAI 适配层。默认使用无需 API Key 的规则解析器；配置模型后切换为大模型结构化解析。
+## 第一阶段能力
 
-PydanticAI 适合这里的原因是：输出直接受 Pydantic schema 约束，和 FastAPI 共用数据模型；以后增加职位分析、表单映射、投递前检查时，也能逐步扩展成工具调用或工作流，而不必现在就引入很重的图编排。
+- 候选人主档案：联系方式、求职偏好、教育、实习、项目、技能、语言、证书和奖项
+- 多简历资料库：语言、默认版本、文件大小、解析方式和更新时间
+- 本地文件解析：PDF、DOCX、TXT，单份最大 10MB
+- 文件 SHA-256 去重与安全文件名
+- 本地规则解析器，以及可选的 PydanticAI 结构化解析器
+- 字段级置信度、来源原文和确认/修改/拒绝状态
+- 多简历自动合并；冲突信息必须由用户选择，不静默覆盖
+- 原始文件下载、重新解析、删除及 JSON 数据导出
+- SQLite 本地持久化，默认不将简历发送到云端模型
 
-## 启动
+扫描版 PDF 的 OCR、账户系统、职位匹配和浏览器投递不属于第一阶段。
 
-需要 Node.js 20+ 和 Python 3.11+。
+## 技术栈
+
+- React 19 + TypeScript + Vite
+- FastAPI + Pydantic
+- SQLite + 本地文件存储
+- PydanticAI Agent 适配层
+
+## 本地启动
+
+需要 Python 3.9+ 和 Node.js 20+。
+
+后端：
 
 ```bash
 cd backend
@@ -23,19 +39,19 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-另开一个终端：
+前端：
 
 ```bash
 cd frontend
-npm install
-npm run dev
+pnpm install
+pnpm run dev
 ```
 
-打开 <http://localhost:5173>。API 文档位于 <http://localhost:8000/docs>。
+打开 <http://localhost:5173>，API 文档位于 <http://localhost:8000/docs>。
 
-## 使用大模型解析（可选）
+## 可选：启用大模型解析
 
-默认 `APP_AGENT_MODE=rules`，所有数据只在本机处理。要启用 PydanticAI：
+默认 `APP_AGENT_MODE=rules`，解析过程完全在本地进行。启用 PydanticAI 前，请先理解简历文本会发送给配置的模型服务商：
 
 ```bash
 export APP_AGENT_MODE=pydantic_ai
@@ -43,10 +59,18 @@ export APP_AGENT_MODEL=openai:gpt-5-mini
 export OPENAI_API_KEY=你的密钥
 ```
 
-然后重启后端。模型只负责把已抽取的简历文本转成 schema；原始文件仍由本地应用保存。
+敏感字段缺失时，Agent 必须保持空白，不得根据姓名、毕业年份等信息推测。
 
-## 当前边界
+## 验证
 
-- 规则解析器是可运行的保底版本，对中文常见标题和联系方式效果较好，但复杂双栏 PDF、扫描件和非常规排版仍需要后续 OCR/LLM 增强。
-- MVP 不包含账户系统、云端对象存储和真实投递；后续做自动投递时，应始终在最终提交前让用户确认。
+```bash
+cd backend && .venv/bin/python smoke_test.py
+cd frontend && pnpm run build
+```
+
+冒烟测试使用临时数据库和临时上传目录，不会污染用户资料。
+
+## 隐私
+
+`backend/data/`、`backend/uploads/`、`.env`、虚拟环境与前端构建产物均被 Git 忽略。删除一份简历时，数据库记录、相关冲突和原始文件会一并删除。
 

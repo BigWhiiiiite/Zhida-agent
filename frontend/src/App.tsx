@@ -1,81 +1,75 @@
-import { useEffect, useRef, useState } from 'react'
-import { BriefcaseBusiness, Check, FileText, Plus, Save, Sparkles, UploadCloud } from 'lucide-react'
-import { api } from './api'
-import type { Education, Experience, Project, ResumeProfile, ResumeRecord } from './types'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { AlertTriangle, BriefcaseBusiness, Check, ChevronRight, CircleUserRound, Download, FileJson, Files, LayoutDashboard, Plus, RefreshCw, Save, ShieldCheck, Sparkles, Trash2, UploadCloud } from 'lucide-react'
+import { API, api } from './api'
+import type { CandidateProfile, Conflict, Education, Evidence, Experience, Project, ResumeProfile, ResumeRecord } from './types'
 
-const input = (label: string, value: string | number | null, onChange: (v: string) => void, type = 'text') => (
-  <label className="field"><span>{label}</span><input type={type} value={value ?? ''} onChange={e => onChange(e.target.value)} /></label>
-)
+type Page='overview'|'profile'|'resumes'|'review'
+const emptyEducation:Education={school:'',college:'',degree:'',major:'',start_date:'',end_date:'',gpa:'',ranking:'',courses:[],description:'',current:false}
+const emptyExperience:Experience={organization:'',department:'',role:'',employment_type:'',location:'',start_date:'',end_date:'',current:false,description:'',achievements:[],technologies:[]}
+const emptyProject:Project={name:'',role:'',start_date:'',end_date:'',background:'',description:'',achievements:[],technologies:[],project_url:'',github_url:''}
+const labels:Record<string,string>={name:'姓名',english_name:'英文姓名',gender:'性别',birth_date:'出生日期',age:'年龄',phone:'手机号',email:'邮箱',wechat:'微信',location:'当前城市',hometown:'籍贯',website:'个人网站',github:'GitHub',linkedin:'LinkedIn',target_role:'目标岗位',available_date:'可入职时间',internship_duration:'实习时长',days_per_week:'每周天数',expected_salary:'期望薪资',remote_preference:'远程偏好',summary:'个人简介',education:'教育经历',internships:'实习经历',projects:'项目经历',skills:'技能'}
 
-export default function App() {
-  const [resumes, setResumes] = useState<ResumeRecord[]>([])
-  const [selected, setSelected] = useState<string>('')
-  const [draft, setDraft] = useState<ResumeRecord | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [message, setMessage] = useState('')
-  const fileInput = useRef<HTMLInputElement>(null)
-
-  useEffect(() => { api.list().then(items => { setResumes(items); if (items[0]) setSelected(items[0].id) }).catch(e => setMessage(e.message)) }, [])
-  useEffect(() => { setDraft(resumes.find(r => r.id === selected) ?? null) }, [selected, resumes])
-
-  const setProfile = (patch: Partial<ResumeProfile>) => setDraft(d => d ? ({ ...d, profile: { ...d.profile, ...patch } }) : d)
-  const upload = async (file?: File) => {
-    if (!file) return
-    setBusy(true); setMessage('正在读取并拆分简历…')
-    try { const item = await api.upload(file); setResumes(r => [item, ...r]); setSelected(item.id); setMessage('解析完成，请检查并修正字段。') }
-    catch (e) { setMessage(e instanceof Error ? e.message : '上传失败') }
-    finally { setBusy(false) }
-  }
-  const save = async () => {
-    if (!draft) return
-    setBusy(true)
-    try { const item = await api.save(draft.id, draft.label, draft.profile); setResumes(r => r.map(x => x.id === item.id ? item : x)); setMessage('修改已保存。') }
-    catch (e) { setMessage(e instanceof Error ? e.message : '保存失败') }
-    finally { setBusy(false) }
-  }
-
-  return <div className="app-shell">
-    <aside>
-      <div className="brand"><span className="brand-icon"><BriefcaseBusiness size={20}/></span><div><strong>OfferPilot</strong><small>求职投递 Agent</small></div></div>
-      <button className="upload-button" onClick={() => fileInput.current?.click()} disabled={busy}><Plus size={18}/> 上传新简历</button>
-      <input ref={fileInput} hidden type="file" accept=".pdf,.docx,.txt" onChange={e => upload(e.target.files?.[0])}/>
-      <div className="side-title">我的简历 <span>{resumes.length}</span></div>
-      <nav>{resumes.map(r => <button key={r.id} className={selected === r.id ? 'resume-item active' : 'resume-item'} onClick={() => setSelected(r.id)}>
-        <FileText size={18}/><span><strong>{r.label}</strong><small>{r.filename}</small></span>{selected === r.id && <Check size={15}/>} </button>)}</nav>
-      <div className="privacy"><Sparkles size={16}/><span><strong>本地优先</strong><small>默认不把简历发送给模型</small></span></div>
-    </aside>
-    <main>
-      <header><div><p className="eyebrow">PROFILE WORKSPACE</p><h1>把一份简历，变成可复用的求职资料</h1><p>Agent 已把简历拆成投递表单需要的字段。逐项检查一次，之后反复复用。</p></div>
-        {draft && <button className="save-button" onClick={save} disabled={busy}><Save size={17}/> 保存修改</button>}
-      </header>
-      {message && <div className="notice">{message}</div>}
-      {!draft ? <section className="empty" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); upload(e.dataTransfer.files[0]) }}>
-        <div className="upload-orbit"><UploadCloud size={30}/></div><h2>上传你的第一份简历</h2><p>拖入文件，或点击选择 PDF、DOCX、TXT（最大 10MB）</p><button onClick={() => fileInput.current?.click()}>选择简历文件</button>
-      </section> : <Editor draft={draft} setDraft={setDraft} setProfile={setProfile}/>} 
-    </main>
-  </div>
+export default function App(){
+  const [page,setPage]=useState<Page>('overview'); const [profile,setProfile]=useState<CandidateProfile|null>(null)
+  const [resumes,setResumes]=useState<ResumeRecord[]>([]); const [conflicts,setConflicts]=useState<Conflict[]>([])
+  const [selected,setSelected]=useState(''); const [rawText,setRawText]=useState(''); const [busy,setBusy]=useState(false); const [notice,setNotice]=useState('')
+  const fileInput=useRef<HTMLInputElement>(null)
+  const reload=async()=>{try{const [p,r,c]=await Promise.all([api.profile(),api.list(),api.conflicts()]);setProfile(p);setResumes(r);setConflicts(c);if(!selected&&r[0])setSelected(r[0].id)}catch(e){setNotice(message(e))}}
+  useEffect(()=>{reload()},[])
+  const active=resumes.find(r=>r.id===selected)??null
+  const upload=async(file?:File)=>{if(!file)return;setBusy(true);setNotice('Agent 正在读取、拆分并合并资料…');try{const item=await api.upload(file);await reload();setSelected(item.id);setPage('review');setNotice('解析完成。请检查识别证据和冲突。')}catch(e){setNotice(message(e))}finally{setBusy(false);if(fileInput.current)fileInput.current.value=''}}
+  const openReview=async(id:string)=>{setSelected(id);setPage('review');try{setRawText((await api.text(id)).text)}catch(e){setNotice(message(e))}}
+  const updateResumeLocal=(item:ResumeRecord)=>setResumes(all=>all.map(r=>r.id===item.id?item:r))
+  const nav=[['overview','总览',LayoutDashboard],['profile','主档案',CircleUserRound],['resumes','简历资料库',Files],['review','待确认',AlertTriangle]] as const
+  return <div className="shell"><aside><div className="brand"><span><BriefcaseBusiness size={20}/></span><div><strong>职达 Zhida</strong><small>求职资料 Agent</small></div></div>
+    <button className="primary full" onClick={()=>fileInput.current?.click()} disabled={busy}><Plus size={17}/>上传新简历</button><input ref={fileInput} hidden type="file" accept=".pdf,.docx,.txt" onChange={e=>upload(e.target.files?.[0])}/>
+    <nav>{nav.map(([key,label,Icon])=><button key={key} className={page===key?'active':''} onClick={()=>setPage(key)}><Icon size={18}/>{label}{key==='review'&&<b>{conflicts.length+resumes.flatMap(r=>r.evidence).filter(e=>e.status==='pending_review').length}</b>}</button>)}</nav>
+    <div className="privacy"><ShieldCheck size={17}/><div><strong>本地优先</strong><small>默认不向云端发送简历</small></div></div></aside>
+    <main><Top page={page}/>{notice&&<div className="notice">{notice}<button onClick={()=>setNotice('')}>×</button></div>}
+      {page==='overview'&&profile&&<Overview profile={profile} resumes={resumes} conflicts={conflicts} go={setPage}/>}
+      {page==='profile'&&profile&&<ProfileEditor profile={profile} onSave={async p=>{setBusy(true);try{setProfile(await api.saveProfile(p));setNotice('主档案已保存。')}catch(e){setNotice(message(e))}finally{setBusy(false)}}}/>}
+      {page==='resumes'&&<ResumeLibrary resumes={resumes} busy={busy} upload={()=>fileInput.current?.click()} onReview={openReview} onRefresh={async r=>{setBusy(true);try{updateResumeLocal(await api.reparse(r.id));await reload();setNotice('重新解析完成。')}catch(e){setNotice(message(e))}finally{setBusy(false)}}} onDefault={async r=>{updateResumeLocal(await api.saveResume(r.id,{is_default:true}));await reload()}} onDelete={async r=>{if(!confirm(`确定删除“${r.label}”及其原始文件吗？`))return;await api.deleteResume(r.id);await reload();setNotice('简历及原始文件已删除。')}}/>}
+      {page==='review'&&<ReviewWorkspace resumes={resumes} active={active} conflicts={conflicts} rawText={rawText} select={openReview} onReviewed={updateResumeLocal} onResolved={async(id,choice,custom)=>{await api.resolve(id,choice,custom);await reload();setNotice('冲突已处理，主档案已更新。')}}/>}
+    </main></div>
 }
 
-function Editor({ draft, setDraft, setProfile }: { draft: ResumeRecord; setDraft: React.Dispatch<React.SetStateAction<ResumeRecord | null>>; setProfile: (p: Partial<ResumeProfile>) => void }) {
-  const p = draft.profile
-  const updateList = <T,>(key: 'education'|'internships'|'projects', index: number, patch: Partial<T>) => {
-    const list = [...(p[key] as T[])]; list[index] = { ...list[index], ...patch }; setProfile({ [key]: list })
-  }
-  return <div className="editor">
-    <section className="card summary-card"><div className="section-head"><div><span>01</span><div><h2>简历身份</h2><p>这份简历用于什么方向？</p></div></div><em>{draft.parser === 'local-rules' ? '规则解析' : 'AI 解析'}</em></div>
-      <div className="grid two">{input('简历名称', draft.label, v => setDraft(d => d ? {...d, label: v} : d))}{input('目标岗位', p.target_role, v => setProfile({target_role:v}))}</div>
-    </section>
-    <section className="card"><SectionTitle number="02" title="基本信息" subtitle="投递表单中的高频字段"/><div className="grid three">
-      {input('姓名', p.name, v => setProfile({name:v}))}<label className="field"><span>性别</span><select value={p.gender} onChange={e => setProfile({gender:e.target.value as ResumeProfile['gender']})}><option>未识别</option><option>男</option><option>女</option><option>其他</option></select></label>
-      {input('年龄', p.age, v => setProfile({age:v ? Number(v) : null}), 'number')}{input('手机号', p.phone, v => setProfile({phone:v}))}{input('邮箱', p.email, v => setProfile({email:v}), 'email')}{input('所在地', p.location, v => setProfile({location:v}))}
-    </div><label className="field full"><span>个人简介</span><textarea value={p.summary} onChange={e => setProfile({summary:e.target.value})}/></label></section>
-    <ListSection<Education> number="03" title="教育经历" items={p.education} empty={{school:'',degree:'',major:'',start_date:'',end_date:''}} onItems={education => setProfile({education})} render={(item,i) => <div className="grid three">{input('学校',item.school,v=>updateList('education',i,{school:v}))}{input('学历',item.degree,v=>updateList('education',i,{degree:v}))}{input('专业',item.major,v=>updateList('education',i,{major:v}))}{input('开始时间',item.start_date,v=>updateList('education',i,{start_date:v}))}{input('结束时间',item.end_date,v=>updateList('education',i,{end_date:v}))}</div>}/>
-    <ListSection<Experience> number="04" title="实习经历" items={p.internships} empty={{organization:'',role:'',start_date:'',end_date:'',description:''}} onItems={internships => setProfile({internships})} render={(item,i) => <><div className="grid two">{input('公司/组织',item.organization,v=>updateList('internships',i,{organization:v}))}{input('职位',item.role,v=>updateList('internships',i,{role:v}))}{input('开始时间',item.start_date,v=>updateList('internships',i,{start_date:v}))}{input('结束时间',item.end_date,v=>updateList('internships',i,{end_date:v}))}</div><label className="field full"><span>工作内容</span><textarea value={item.description} onChange={e=>updateList('internships',i,{description:e.target.value})}/></label></>}/>
-    <ListSection<Project> number="05" title="项目经历" items={p.projects} empty={{name:'',role:'',start_date:'',end_date:'',description:'',technologies:[]}} onItems={projects => setProfile({projects})} render={(item,i) => <><div className="grid two">{input('项目名称',item.name,v=>updateList('projects',i,{name:v}))}{input('项目角色',item.role,v=>updateList('projects',i,{role:v}))}{input('开始时间',item.start_date,v=>updateList('projects',i,{start_date:v}))}{input('结束时间',item.end_date,v=>updateList('projects',i,{end_date:v}))}</div><label className="field full"><span>项目描述</span><textarea value={item.description} onChange={e=>updateList('projects',i,{description:e.target.value})}/></label></>}/>
-    <section className="card"><SectionTitle number="06" title="技能关键词" subtitle="用逗号分隔，后续用于岗位匹配"/><label className="field full"><textarea value={p.skills.join('，')} onChange={e=>setProfile({skills:e.target.value.split(/[,，]/).map(x=>x.trim()).filter(Boolean)})}/></label></section>
-  </div>
-}
+function Top({page}:{page:Page}){const copy={overview:['候选人资料总览','一次维护，反复用于之后的每次申请。'],profile:['候选人主档案','这里是你的事实来源，Agent 不会擅自覆盖已确认信息。'],resumes:['简历资料库','管理不同语言、岗位方向和版本的简历。'],review:['识别结果检查','对照原文确认 Agent 拆分的字段，并处理资料冲突。']}[page];return <header><div><p className="eyebrow">ZHIDA / PROFILE WORKSPACE</p><h1>{copy[0]}</h1><p>{copy[1]}</p></div><a className="export" href={`${API}/export`} target="_blank"><FileJson size={17}/>导出 JSON</a></header>}
 
-function SectionTitle({number,title,subtitle}:{number:string,title:string,subtitle:string}) { return <div className="section-head"><div><span>{number}</span><div><h2>{title}</h2><p>{subtitle}</p></div></div></div> }
-function ListSection<T>({number,title,items,empty,onItems,render}:{number:string,title:string,items:T[],empty:T,onItems:(v:T[])=>void,render:(v:T,i:number)=>React.ReactNode}) { return <section className="card"><SectionTitle number={number} title={title} subtitle={`已识别 ${items.length} 条，可继续增删`}/>{items.map((item,i)=><div className="list-entry" key={i}><div className="entry-top"><strong>{title} {i+1}</strong><button onClick={()=>onItems(items.filter((_,n)=>n!==i))}>移除</button></div>{render(item,i)}</div>)}<button className="add-row" onClick={()=>onItems([...items,{...empty}])}><Plus size={16}/> 添加一条</button></section> }
+function Overview({profile,resumes,conflicts,go}:{profile:CandidateProfile;resumes:ResumeRecord[];conflicts:Conflict[];go:(p:Page)=>void}){
+  const pending=resumes.flatMap(r=>r.evidence).filter(e=>e.status==='pending_review').length
+  const fields=[profile.name,profile.phone,profile.email,profile.location,profile.target_role,profile.summary,profile.education.length,profile.internships.length,profile.projects.length,profile.skills.length]
+  const complete=Math.round(fields.filter(Boolean).length/fields.length*100)
+  return <><section className="metric-grid"><Metric label="资料完整度" value={`${complete}%`} note="继续补充可提升投递覆盖" tone="green"/><Metric label="简历版本" value={String(resumes.length)} note={resumes.some(r=>r.is_default)?'已设置默认版本':'还没有默认简历'}/><Metric label="待确认字段" value={String(pending)} note="确认后成为可信资料"/><Metric label="信息冲突" value={String(conflicts.length)} note={conflicts.length?'需要你做最终选择':'目前没有冲突'} tone={conflicts.length?'amber':'green'}/></section>
+    <section className="overview-grid"><div className="card profile-hero"><div className="avatar">{profile.name?.[0]||'职'}</div><div><p>候选人主档案</p><h2>{profile.name||'尚未填写姓名'}</h2><span>{profile.target_role||'添加目标岗位'} · {profile.location||'添加当前城市'}</span></div><button onClick={()=>go('profile')}>编辑档案<ChevronRight size={16}/></button></div>
+    <div className="card next-step"><Sparkles size={22}/><div><h3>下一步建议</h3><p>{pending?`还有 ${pending} 个识别字段等待确认。`:'上传一份新的简历，Agent 会自动合并新增经历。'}</p></div><button onClick={()=>go(pending?'review':'resumes')}>开始处理</button></div></section>
+    <section className="card"><SectionTitle n="资料" title="经历素材概览" sub="主档案中的可复用事实"/><div className="fact-row"><Fact n={profile.education.length} label="教育经历"/><Fact n={profile.internships.length} label="实习经历"/><Fact n={profile.projects.length} label="项目经历"/><Fact n={profile.skills.length} label="技能关键词"/></div></section></>}
+function Metric({label,value,note,tone=''}:{label:string;value:string;note:string;tone?:string}){return <div className={`metric ${tone}`}><span>{label}</span><strong>{value}</strong><small>{note}</small></div>}
+function Fact({n,label}:{n:number;label:string}){return <div><strong>{n}</strong><span>{label}</span></div>}
 
+function ProfileEditor({profile,onSave}:{profile:CandidateProfile;onSave:(p:ResumeProfile)=>void}){
+  const [draft,setDraft]=useState<ResumeProfile>(profile);useEffect(()=>setDraft(profile),[profile])
+  const set=(key:keyof ResumeProfile,value:unknown)=>setDraft(d=>({...d,[key]:value}))
+  return <div className="stack"><section className="card"><SectionTitle n="01" title="基本信息" sub="敏感信息只由你填写或确认"/><div className="form-grid three">
+    <Input label="姓名" value={draft.name} set={v=>set('name',v)}/><Input label="英文姓名" value={draft.english_name} set={v=>set('english_name',v)}/><Select label="性别" value={draft.gender} values={['未识别','男','女','其他']} set={v=>set('gender',v)}/><Input label="出生日期" type="date" value={draft.birth_date} set={v=>set('birth_date',v)}/><Input label="年龄" type="number" value={draft.age} set={v=>set('age',v?Number(v):null)}/><Input label="手机号" value={draft.phone} set={v=>set('phone',v)}/><Input label="邮箱" type="email" value={draft.email} set={v=>set('email',v)}/><Input label="微信" value={draft.wechat} set={v=>set('wechat',v)}/><Input label="当前城市" value={draft.location} set={v=>set('location',v)}/><Input label="籍贯" value={draft.hometown} set={v=>set('hometown',v)}/><Input label="GitHub" value={draft.github} set={v=>set('github',v)}/><Input label="LinkedIn" value={draft.linkedin} set={v=>set('linkedin',v)}/><Input label="个人网站" value={draft.website} set={v=>set('website',v)}/></div><Text label="个人简介" value={draft.summary} set={v=>set('summary',v)}/></section>
+    <section className="card"><SectionTitle n="02" title="求职偏好" sub="后续用于职位筛选和申请表单"/><div className="form-grid three"><Input label="目标岗位" value={draft.target_role} set={v=>set('target_role',v)}/><Input label="目标城市（逗号分隔）" value={draft.target_cities.join('，')} set={v=>set('target_cities',split(v))}/><Input label="目标行业（逗号分隔）" value={draft.target_industries.join('，')} set={v=>set('target_industries',split(v))}/><Input label="可入职时间" value={draft.available_date} set={v=>set('available_date',v)}/><Input label="实习时长" value={draft.internship_duration} set={v=>set('internship_duration',v)}/><Input label="每周可实习天数" value={draft.days_per_week} set={v=>set('days_per_week',v)}/><Input label="期望薪资" value={draft.expected_salary} set={v=>set('expected_salary',v)}/><Input label="远程偏好" value={draft.remote_preference} set={v=>set('remote_preference',v)}/></div></section>
+    <EditableList title="教育经历" n="03" items={draft.education} empty={emptyEducation} set={v=>set('education',v)} render={(x,i,edit)=><div className="form-grid three"><Input label="学校" value={x.school} set={v=>edit(i,{school:v})}/><Input label="学院" value={x.college} set={v=>edit(i,{college:v})}/><Input label="专业" value={x.major} set={v=>edit(i,{major:v})}/><Input label="学历" value={x.degree} set={v=>edit(i,{degree:v})}/><Input label="开始时间" value={x.start_date} set={v=>edit(i,{start_date:v})}/><Input label="毕业时间" value={x.end_date} set={v=>edit(i,{end_date:v})}/><Input label="GPA" value={x.gpa} set={v=>edit(i,{gpa:v})}/><Input label="排名" value={x.ranking} set={v=>edit(i,{ranking:v})}/></div>}/>
+    <EditableList title="实习经历" n="04" items={draft.internships} empty={emptyExperience} set={v=>set('internships',v)} render={(x,i,edit)=><><div className="form-grid three"><Input label="公司/组织" value={x.organization} set={v=>edit(i,{organization:v})}/><Input label="部门" value={x.department} set={v=>edit(i,{department:v})}/><Input label="职位" value={x.role} set={v=>edit(i,{role:v})}/><Input label="地点" value={x.location} set={v=>edit(i,{location:v})}/><Input label="开始时间" value={x.start_date} set={v=>edit(i,{start_date:v})}/><Input label="结束时间" value={x.end_date} set={v=>edit(i,{end_date:v})}/></div><Text label="工作内容" value={x.description} set={v=>edit(i,{description:v})}/></>}/>
+    <EditableList title="项目经历" n="05" items={draft.projects} empty={emptyProject} set={v=>set('projects',v)} render={(x,i,edit)=><><div className="form-grid three"><Input label="项目名称" value={x.name} set={v=>edit(i,{name:v})}/><Input label="角色" value={x.role} set={v=>edit(i,{role:v})}/><Input label="开始时间" value={x.start_date} set={v=>edit(i,{start_date:v})}/><Input label="结束时间" value={x.end_date} set={v=>edit(i,{end_date:v})}/><Input label="技术栈（逗号分隔）" value={x.technologies.join('，')} set={v=>edit(i,{technologies:split(v)})}/><Input label="GitHub" value={x.github_url} set={v=>edit(i,{github_url:v})}/></div><Text label="项目描述" value={x.description} set={v=>edit(i,{description:v})}/></>}/>
+    <section className="card"><SectionTitle n="06" title="技能与补充资料" sub="使用逗号分隔多个项目"/><div className="form-grid two"><Text label="技能" value={draft.skills.join('，')} set={v=>set('skills',split(v))}/><Text label="语言能力" value={draft.languages.join('，')} set={v=>set('languages',split(v))}/><Text label="证书" value={draft.certificates.join('，')} set={v=>set('certificates',split(v))}/><Text label="奖项" value={draft.awards.join('，')} set={v=>set('awards',split(v))}/></div></section>
+    <div className="sticky-save"><span>主档案是 Agent 后续工作的事实基础</span><button className="primary" onClick={()=>onSave(draft)}><Save size={17}/>保存主档案</button></div></div>}
+
+function ResumeLibrary({resumes,busy,upload,onReview,onRefresh,onDefault,onDelete}:{resumes:ResumeRecord[];busy:boolean;upload:()=>void;onReview:(id:string)=>void;onRefresh:(r:ResumeRecord)=>void;onDefault:(r:ResumeRecord)=>void;onDelete:(r:ResumeRecord)=>void}){return <section className="card"><div className="library-head"><SectionTitle n={String(resumes.length).padStart(2,'0')} title="简历版本" sub="支持 PDF、DOCX、TXT，单份最大 10MB"/><button className="primary" onClick={upload}><UploadCloud size={17}/>上传简历</button></div>{!resumes.length?<div className="empty"><UploadCloud size={30}/><h2>还没有简历</h2><p>上传后，Agent 会自动拆分并合并到主档案。</p></div>:<div className="resume-grid">{resumes.map(r=><article className="resume-card" key={r.id}><div className="file-icon"><Files size={22}/></div><div className="resume-main"><div><h3>{r.label}{r.is_default&&<em>默认</em>}</h3><p>{r.filename}</p></div><div className="tag-row"><span>{r.language}</span><span>{formatBytes(r.file_size)}</span><span>{r.parser==='local-rules'?'本地解析':'AI 解析'}</span></div><small>{r.evidence.filter(e=>e.status==='pending_review').length} 个字段待确认 · {new Date(r.updated_at).toLocaleDateString('zh-CN')}</small></div><div className="actions"><button onClick={()=>onReview(r.id)}>检查</button><a href={`${API}/resumes/${r.id}/download`}><Download size={15}/></a><button title="重新解析" disabled={busy} onClick={()=>onRefresh(r)}><RefreshCw size={15}/></button>{!r.is_default&&<button title="设为默认" onClick={()=>onDefault(r)}><Check size={15}/></button>}<button className="danger" title="删除" onClick={()=>onDelete(r)}><Trash2 size={15}/></button></div></article>)}</div>}</section>}
+
+function ReviewWorkspace({resumes,active,conflicts,rawText,select,onReviewed,onResolved}:{resumes:ResumeRecord[];active:ResumeRecord|null;conflicts:Conflict[];rawText:string;select:(id:string)=>void;onReviewed:(r:ResumeRecord)=>void;onResolved:(id:string,c:'current'|'incoming'|'custom',v?:unknown)=>void}){
+  const [tab,setTab]=useState<'fields'|'conflicts'>('fields')
+  return <div className="stack"><div className="review-toolbar"><select value={active?.id||''} onChange={e=>select(e.target.value)}><option value="">选择简历</option>{resumes.map(r=><option value={r.id} key={r.id}>{r.label}</option>)}</select><div><button className={tab==='fields'?'active':''} onClick={()=>setTab('fields')}>识别字段</button><button className={tab==='conflicts'?'active':''} onClick={()=>setTab('conflicts')}>资料冲突 <b>{conflicts.length}</b></button></div></div>
+    {tab==='conflicts'?<ConflictList conflicts={conflicts} resolve={onResolved}/>:!active?<div className="card empty"><Files size={28}/><h2>选择一份简历开始检查</h2></div>:<div className="review-grid"><section className="card source"><div className="source-head"><div><h2>简历原文</h2><p>{active.filename}</p></div><span>{active.language}</span></div><pre>{rawText||'正在读取原文…'}</pre></section><section className="card evidence"><div className="source-head"><div><h2>Agent 识别结果</h2><p>确认、修改或拒绝每个字段</p></div><span>{active.evidence.filter(e=>e.status==='pending_review').length} 待处理</span></div>{active.evidence.map(e=><EvidenceItem key={e.id} item={e} act={async(status,value)=>onReviewed(await api.review(active.id,e.id,status,value))}/>)}</section></div>}</div>}
+function EvidenceItem({item,act}:{item:Evidence;act:(s:string,v?:unknown)=>void}){const [editing,setEditing]=useState(false);const [value,setValue]=useState(typeof item.value==='string'?item.value:JSON.stringify(item.value,undefined,2));const tone=item.confidence>=.9?'high':item.confidence>=.75?'medium':'low';return <article className={`evidence-item ${item.status}`}><div className="evidence-top"><strong>{labels[item.field_path]??item.field_path}</strong><span className={tone}>{Math.round(item.confidence*100)}% 置信度</span></div>{editing?<textarea value={value} onChange={e=>setValue(e.target.value)}/>:<div className="evidence-value">{value}</div>}<blockquote>{item.source_text||'未找到直接原文'}</blockquote><div className="evidence-actions"><span>{item.status==='pending_review'?'等待确认':item.status==='confirmed'?'已确认':item.status==='edited'?'已修改':'已拒绝'}</span>{editing?<><button onClick={()=>{act('edited',value);setEditing(false)}}>保存修改</button><button onClick={()=>setEditing(false)}>取消</button></>:<><button onClick={()=>act('confirmed')}><Check size={14}/>确认</button><button onClick={()=>setEditing(true)}>修改</button><button className="reject" onClick={()=>act('rejected')}>拒绝</button></>}</div></article>}
+function ConflictList({conflicts,resolve}:{conflicts:Conflict[];resolve:(id:string,c:'current'|'incoming'|'custom',v?:unknown)=>void}){return <section className="card"><SectionTitle n={String(conflicts.length).padStart(2,'0')} title="资料冲突" sub="新简历不会静默覆盖主档案，请选择真实信息"/>{!conflicts.length?<div className="success-empty"><ShieldCheck size={30}/><h3>没有待处理冲突</h3><p>主档案中的信息目前一致。</p></div>:<div className="conflict-list">{conflicts.map(c=><article key={c.id}><div><span>{labels[c.field_path]??c.field_path}</span><small>来自：{c.resume_label}</small></div><button onClick={()=>resolve(c.id,'current')}><small>保留主档案</small><strong>{display(c.current_value)}</strong></button><button onClick={()=>resolve(c.id,'incoming')}><small>采用新简历</small><strong>{display(c.incoming_value)}</strong></button></article>)}</div>}</section>}
+
+function SectionTitle({n,title,sub}:{n:string;title:string;sub:string}){return <div className="section-title"><span>{n}</span><div><h2>{title}</h2><p>{sub}</p></div></div>}
+function Input({label,value,set,type='text'}:{label:string;value:string|number|null;set:(v:string)=>void;type?:string}){return <label className="field"><span>{label}</span><input type={type} value={value??''} onChange={e=>set(e.target.value)}/></label>}
+function Select({label,value,values,set}:{label:string;value:string;values:string[];set:(v:string)=>void}){return <label className="field"><span>{label}</span><select value={value} onChange={e=>set(e.target.value)}>{values.map(v=><option key={v}>{v}</option>)}</select></label>}
+function Text({label,value,set}:{label:string;value:string;set:(v:string)=>void}){return <label className="field text"><span>{label}</span><textarea value={value} onChange={e=>set(e.target.value)}/></label>}
+function EditableList<T>({title,n,items,empty,set,render}:{title:string;n:string;items:T[];empty:T;set:(v:T[])=>void;render:(x:T,i:number,edit:(i:number,p:Partial<T>)=>void)=>React.ReactNode}){const edit=(i:number,p:Partial<T>)=>{const next=[...items];next[i]={...next[i],...p};set(next)};return <section className="card"><SectionTitle n={n} title={title} sub={`共 ${items.length} 条，可手动补充和修正`}/>{items.map((x,i)=><div className="list-item" key={i}><div className="list-head"><strong>{title} {i+1}</strong><button onClick={()=>set(items.filter((_,j)=>i!==j))}>移除</button></div>{render(x,i,edit)}</div>)}<button className="add" onClick={()=>set([...items,{...empty}])}><Plus size={16}/>添加一条</button></section>}
+const split=(v:string)=>v.split(/[,，、]/).map(x=>x.trim()).filter(Boolean);const message=(e:unknown)=>e instanceof Error?e.message:'操作失败';const display=(v:unknown)=>typeof v==='string'?v:JSON.stringify(v);const formatBytes=(n:number)=>n?`${(n/1024).toFixed(n>1024*1024?0:1)} ${n>1024*1024?'MB':'KB'}`:'—'
