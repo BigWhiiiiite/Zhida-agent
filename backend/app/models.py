@@ -111,6 +111,7 @@ class ResumeRecord(BaseModel):
     is_default: bool = False
     file_size: int = 0
     content_hash: str = ""
+    error_message: str = ""
     evidence: list[FieldEvidence] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime

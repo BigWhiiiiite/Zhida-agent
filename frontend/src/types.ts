@@ -10,7 +10,7 @@ export type ResumeProfile = {
 }
 export type CandidateProfile = ResumeProfile & { id:string; created_at:string|null; updated_at:string|null }
 export type Evidence = { id:string; field_path:string; value:unknown; confidence:number; source_text:string; source_page:number|null; status:'pending_review'|'confirmed'|'edited'|'rejected' }
-export type ResumeRecord = { id:string; filename:string; label:string; profile:ResumeProfile; parser:string; status:string; language:string; tags:string[]; target_role:string; is_default:boolean; file_size:number; content_hash:string; evidence:Evidence[]; created_at:string; updated_at:string }
+export type ResumeRecord = { id:string; filename:string; label:string; profile:ResumeProfile; parser:string; status:string; language:string; tags:string[]; target_role:string; is_default:boolean; file_size:number; content_hash:string; error_message:string; evidence:Evidence[]; created_at:string; updated_at:string }
 export type Conflict = { id:string; field_path:string; current_value:unknown; incoming_value:unknown; resume_id:string; resume_label:string; status:string; resolution:unknown; created_at:string }
 export type PageField = { selector:string; label:string; name:string; field_type:string; required:boolean; options:string[]; current_value:string }
 export type BrowserSnapshot = { session_id:string; url:string; title:string; fields:PageField[] }

@@ -10,6 +10,7 @@ from uuid import uuid4
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
+from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
 from .agent import get_resume_extractor
 from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult, FormPlan
@@ -19,9 +20,9 @@ from .form_agent import create_form_plan
 from .models import (CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
                      ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
 from .profile_service import apply_profile_value, build_evidence, detect_language, merge_into_profile
-from .storage import (create_resume, delete_resume, find_by_hash, get_conflict, get_profile,
+from .storage import (create_pending_resume, delete_resume, find_by_hash, get_conflict, get_profile,
                       get_resume, get_resume_internal, initialize, list_conflicts, list_resumes,
-                      raw_text_for, replace_parse_result, resolve_conflict, save_profile,
+                      mark_resume_failed, mark_resume_parsing, raw_text_for, replace_parse_result, resolve_conflict, save_profile,
                       update_evidence, update_resume)
 
 
@@ -71,11 +72,21 @@ def resume(resume_id: str) -> ResumeRecord:
     return record
 
 
-async def _parse_file(path: Path, resume_id: str) -> tuple[ResumeProfile, str, list[FieldEvidence], str]:
-    text = extract_text(path)
-    if not text.strip(): raise ValueError("没有提取到文本，扫描版简历需要 OCR")
-    extractor = get_resume_extractor(); parsed = await extractor.parse(text)
-    return parsed, extractor.name, build_evidence(parsed, text, extractor.name), text
+RETRYABLE_MODEL_ERRORS = (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)
+
+
+def _retryable_parse_error(exc: Exception, resume_id: str, action: str) -> HTTPException:
+    if isinstance(exc, RETRYABLE_MODEL_ERRORS):
+        message = f"模型代理暂时不可用，简历文件已保留。请稍后在简历资料库点击“重新解析”。"
+        return HTTPException(503, detail={"message": message, "resume_id": resume_id, "retryable": True},
+                             headers={"Retry-After": "30"})
+    return HTTPException(422, detail={"message": f"{action}：{exc}", "resume_id": resume_id, "retryable": True})
+
+
+async def _parse_text(text: str) -> tuple[ResumeProfile, str, list[FieldEvidence]]:
+    extractor = get_resume_extractor()
+    parsed = await extractor.parse(text)
+    return parsed, extractor.name, build_evidence(parsed, text, extractor.name)
 
 
 @app.post("/api/resumes", response_model=ResumeRecord, status_code=201)
@@ -89,19 +100,32 @@ async def upload_resume(file: UploadFile = File(...)) -> ResumeRecord:
     if len(content) > MAX_FILE_SIZE: raise HTTPException(413, "文件不能超过 10MB")
     digest = hashlib.sha256(content).hexdigest()
     duplicate = find_by_hash(digest)
-    if duplicate: raise HTTPException(409, {"message": "这份简历已经上传", "resume_id": duplicate.id})
+    if duplicate:
+        message = "这份简历已保留，可在资料库点击重新解析" if duplicate.status == "failed" else "这份简历已经上传"
+        raise HTTPException(409, {"message": message, "resume_id": duplicate.id})
 
     resume_id = str(uuid4()); stored_name = f"{resume_id}{suffix}"; path = UPLOAD_DIR / stored_name
     path.write_bytes(content)
     try:
-        parsed, parser, evidence, text = await _parse_file(path, resume_id)
-        record = create_resume(resume_id, original_name, stored_name, parsed.name or Path(original_name).stem,
-                               parsed, parser, detect_language(text), len(content), digest, text, evidence)
-        merge_into_profile(parsed, resume_id)
-        return record
+        text = extract_text(path)
+        if not text.strip(): raise ValueError("没有提取到文本，扫描版简历需要 OCR")
     except Exception as exc:
         path.unlink(missing_ok=True)
-        raise HTTPException(422, f"简历解析失败：{exc}") from exc
+        raise HTTPException(422, f"简历文本提取失败：{exc}") from exc
+
+    parser = get_resume_extractor().name
+    create_pending_resume(resume_id, original_name, stored_name, Path(original_name).stem, parser,
+                          detect_language(text), len(content), digest, text)
+    try:
+        parsed, parser, evidence = await _parse_text(text)
+        record = replace_parse_result(resume_id, parsed, parser, evidence)
+        merge_into_profile(parsed, resume_id)
+        return record  # type: ignore[return-value]
+    except Exception as exc:
+        public_error = _retryable_parse_error(exc, resume_id, "简历解析失败")
+        detail = public_error.detail if isinstance(public_error.detail, dict) else {"message": str(public_error.detail)}
+        mark_resume_failed(resume_id, str(detail.get("message", "解析失败")))
+        raise public_error from exc
 
 
 @app.patch("/api/resumes/{resume_id}", response_model=ResumeRecord)
@@ -135,13 +159,19 @@ async def reparse_resume(resume_id: str) -> ResumeRecord:
     if not row: raise HTTPException(404, "简历不存在")
     path = UPLOAD_DIR / Path(row["stored_filename"]).name
     if not path.exists(): raise HTTPException(404, "原始文件不存在")
+    mark_resume_parsing(resume_id)
     try:
-        parsed, parser, evidence, _ = await _parse_file(path, resume_id)
+        text = extract_text(path)
+        if not text.strip(): raise ValueError("没有提取到文本，扫描版简历需要 OCR")
+        parsed, parser, evidence = await _parse_text(text)
         record = replace_parse_result(resume_id, parsed, parser, evidence)
         merge_into_profile(parsed, resume_id)
         return record  # type: ignore[return-value]
     except Exception as exc:
-        raise HTTPException(422, f"重新解析失败：{exc}") from exc
+        public_error = _retryable_parse_error(exc, resume_id, "重新解析失败")
+        detail = public_error.detail if isinstance(public_error.detail, dict) else {"message": str(public_error.detail)}
+        mark_resume_failed(resume_id, str(detail.get("message", "重新解析失败")))
+        raise public_error from exc
 
 
 @app.get("/api/resumes/{resume_id}/text")

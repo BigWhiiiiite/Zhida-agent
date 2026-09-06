@@ -2,8 +2,13 @@ import type { BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, Fill
 
 export const API = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api'
 
+export class ApiError extends Error{
+  status:number; detail:unknown
+  constructor(message:string,status:number,detail:unknown){super(message);this.name='ApiError';this.status=status;this.detail=detail}
+}
+
 async function result<T>(response:Response):Promise<T>{
-  if(!response.ok){const body=await response.json().catch(()=>({})); const detail=body.detail; throw new Error(typeof detail==='string'?detail:(detail?.message??'请求失败'))}
+  if(!response.ok){const body=await response.json().catch(()=>({})); const detail=body.detail; throw new ApiError(typeof detail==='string'?detail:(detail?.message??'请求失败'),response.status,detail)}
   if(response.status===204) return undefined as T
   return response.json()
 }

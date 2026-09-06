@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -10,6 +11,12 @@ from agents import ModelSettings, set_tracing_disabled
 from agents.models.openai_responses import OpenAIResponsesModel
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from dotenv import load_dotenv
+
+
+# Agents SDK 0.8.4 logs the full model input on terminal errors in one run-loop
+# branch. Application code already turns those errors into safe API messages, so
+# silence the SDK logger to prevent resumes from appearing in server logs.
+logging.getLogger("openai.agents").setLevel(logging.CRITICAL)
 
 
 async def normalize_proxy_response(response: httpx.Response) -> None:
@@ -71,8 +78,9 @@ def configured_model() -> tuple[OpenAIResponsesModel, ModelSettings]:
     # `ultra` is a Codex configuration preset. The Responses wire API exposed by
     # this proxy currently accepts `max` as its highest reasoning effort.
     wire_effort = "max" if effort.lower() == "ultra" else effort.lower()
+    max_retries = max(0, min(int(os.getenv("APP_MODEL_MAX_RETRIES", "4")), 6))
     http_client = DefaultAsyncHttpxClient(event_hooks={"response": [normalize_proxy_response]})
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=120, max_retries=2,
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=120, max_retries=max_retries,
                          http_client=http_client)
 
     # The custom proxy is OpenAI-compatible but tracing should not be sent to a second endpoint.

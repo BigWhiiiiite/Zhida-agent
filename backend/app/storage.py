@@ -48,6 +48,7 @@ def initialize() -> None:
             "target_role": "TEXT NOT NULL DEFAULT ''", "is_default": "INTEGER NOT NULL DEFAULT 0",
             "file_size": "INTEGER NOT NULL DEFAULT 0", "content_hash": "TEXT NOT NULL DEFAULT ''",
             "raw_text": "TEXT NOT NULL DEFAULT ''", "evidence_json": "TEXT NOT NULL DEFAULT '[]'",
+            "error_message": "TEXT NOT NULL DEFAULT ''",
         })
         conn.execute("""
             CREATE TABLE IF NOT EXISTS candidate_profiles (
@@ -75,7 +76,7 @@ def _record(row: sqlite3.Row) -> ResumeRecord:
         profile=ResumeProfile.model_validate_json(row["profile_json"]), parser=row["parser"],
         status=row["status"], language=row["language"], tags=json.loads(row["tags_json"] or "[]"),
         target_role=row["target_role"], is_default=bool(row["is_default"]),
-        file_size=row["file_size"], content_hash=row["content_hash"], evidence=evidence,
+        file_size=row["file_size"], content_hash=row["content_hash"], error_message=row["error_message"], evidence=evidence,
         created_at=row["created_at"], updated_at=row["updated_at"],
     )
 
@@ -118,6 +119,20 @@ def create_resume(resume_id: str, filename: str, stored_filename: str, label: st
     return get_resume(resume_id)  # type: ignore[return-value]
 
 
+def create_pending_resume(resume_id: str, filename: str, stored_filename: str, label: str, parser: str,
+                          language: str, file_size: int, content_hash: str, raw_text: str) -> ResumeRecord:
+    now = _now()
+    with _connection() as conn:
+        conn.execute("""INSERT INTO resumes
+            (id, filename, label, profile_json, parser, created_at, updated_at, stored_filename,
+             status, language, tags_json, target_role, is_default, file_size, content_hash, raw_text,
+             evidence_json, error_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'parsing', ?, '[]', '', 0, ?, ?, ?, '[]', '')""",
+            (resume_id, filename, label, ResumeProfile().model_dump_json(), parser, now, now, stored_filename,
+             language, file_size, content_hash, raw_text))
+    return get_resume(resume_id)  # type: ignore[return-value]
+
+
 def update_resume(resume_id: str, **changes: Any) -> ResumeRecord | None:
     current = get_resume(resume_id)
     if not current:
@@ -137,8 +152,24 @@ def update_resume(resume_id: str, **changes: Any) -> ResumeRecord | None:
 
 def replace_parse_result(resume_id: str, profile: ResumeProfile, parser: str, evidence: list[FieldEvidence]) -> ResumeRecord | None:
     with _connection() as conn:
-        conn.execute("UPDATE resumes SET profile_json=?, parser=?, evidence_json=?, status='needs_review', updated_at=? WHERE id=?",
-            (profile.model_dump_json(), parser, json.dumps([e.model_dump(mode='json') for e in evidence], ensure_ascii=False), _now(), resume_id))
+        conn.execute("""UPDATE resumes SET profile_json=?, parser=?, evidence_json=?, target_role=?,
+            status='needs_review', error_message='', updated_at=? WHERE id=?""",
+            (profile.model_dump_json(), parser, json.dumps([e.model_dump(mode='json') for e in evidence], ensure_ascii=False),
+             profile.target_role, _now(), resume_id))
+    return get_resume(resume_id)
+
+
+def mark_resume_parsing(resume_id: str) -> ResumeRecord | None:
+    with _connection() as conn:
+        conn.execute("UPDATE resumes SET status='parsing', error_message='', updated_at=? WHERE id=?",
+                     (_now(), resume_id))
+    return get_resume(resume_id)
+
+
+def mark_resume_failed(resume_id: str, message: str) -> ResumeRecord | None:
+    with _connection() as conn:
+        conn.execute("UPDATE resumes SET status='failed', error_message=?, updated_at=? WHERE id=?",
+                     (message[:500], _now(), resume_id))
     return get_resume(resume_id)
 
 

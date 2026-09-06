@@ -1,5 +1,6 @@
 """Run with: .venv/bin/python smoke_test.py"""
 import asyncio
+import logging
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,6 +8,7 @@ from tempfile import TemporaryDirectory
 import httpx
 from agents.usage import Usage
 from fastapi.testclient import TestClient
+from openai import APIConnectionError
 
 from app import main, storage
 from app.model_provider import normalize_proxy_response
@@ -35,6 +37,14 @@ async def verify_proxy_normalization() -> None:
 
 asyncio.run(verify_proxy_normalization())
 assert Usage().input_tokens_details.cached_tokens == 0
+assert logging.getLogger("openai.agents").level == logging.CRITICAL
+
+
+class UnavailableExtractor:
+    name = "unavailable-test-provider"
+
+    async def parse(self, _: str):
+        raise APIConnectionError(request=httpx.Request("POST", "https://proxy.example/v1/responses"))
 
 
 with TemporaryDirectory() as temporary:
@@ -81,6 +91,24 @@ with TemporaryDirectory() as temporary:
 
         assert client.get(f"/api/resumes/{first_json['id']}/download").status_code == 200
         assert client.post(f"/api/resumes/{first_json['id']}/parse").status_code == 200
+
+        original_extractor = main.get_resume_extractor
+        main.get_resume_extractor = lambda: UnavailableExtractor()
+        try:
+            failed_text = "姓名：网络故障测试\n邮箱：retry@example.com".encode()
+            failed = client.post("/api/resumes", files={"file": ("retry.txt", failed_text, "text/plain")})
+            assert failed.status_code == 503, failed.text
+            failed_id = failed.json()["detail"]["resume_id"]
+            retained = client.get(f"/api/resumes/{failed_id}").json()
+            assert retained["status"] == "failed"
+            assert retained["error_message"]
+            assert (main.UPLOAD_DIR / f"{failed_id}.txt").exists()
+        finally:
+            main.get_resume_extractor = original_extractor
+        retried = client.post(f"/api/resumes/{failed_id}/parse")
+        assert retried.status_code == 200, retried.text
+        assert retried.json()["status"] == "needs_review"
+
         assert client.get("/api/export").status_code == 200
         assert client.delete(f"/api/resumes/{first_json['id']}").status_code == 204
         assert client.get(f"/api/resumes/{first_json['id']}").status_code == 404
