@@ -64,23 +64,24 @@ async def normalize_proxy_response(response: httpx.Response) -> None:
         response.headers["content-length"] = str(len(content))
 
 
-@lru_cache(maxsize=1)
-def configured_model() -> tuple[OpenAIResponsesModel, ModelSettings]:
+@lru_cache(maxsize=8)
+def configured_model(model_name: str | None = None, reasoning_effort: str | None = None) -> tuple[OpenAIResponsesModel, ModelSettings]:
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     key_env = os.getenv("APP_MODEL_API_KEY_ENV", "ISRC_API_KEY")
     api_key = os.getenv(key_env)
     if not api_key:
         raise RuntimeError(f"缺少模型密钥：请先设置环境变量 {key_env}")
 
-    model_name = os.getenv("APP_AGENT_MODEL", "gpt-5.6-sol")
+    model_name = model_name or os.getenv("APP_AGENT_MODEL", "gpt-5.6-sol")
     base_url = os.getenv("APP_MODEL_BASE_URL", "https://llmapi.isrc.ac.cn/v1")
-    effort = os.getenv("APP_MODEL_REASONING_EFFORT", "ultra")
+    effort = reasoning_effort or os.getenv("APP_MODEL_REASONING_EFFORT", "ultra")
     # `ultra` is a Codex configuration preset. The Responses wire API exposed by
     # this proxy currently accepts `max` as its highest reasoning effort.
     wire_effort = "max" if effort.lower() == "ultra" else effort.lower()
-    max_retries = max(0, min(int(os.getenv("APP_MODEL_MAX_RETRIES", "4")), 6))
+    max_retries = max(0, min(int(os.getenv("APP_MODEL_MAX_RETRIES", "0")), 6))
+    timeout = max(10, min(float(os.getenv("APP_MODEL_TIMEOUT_SECONDS", "30")), 300))
     http_client = DefaultAsyncHttpxClient(event_hooks={"response": [normalize_proxy_response]})
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=120, max_retries=max_retries,
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries,
                          http_client=http_client)
 
     # The custom proxy is OpenAI-compatible but tracing should not be sent to a second endpoint.

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from openai import APIConnectionError
 
 from app import main, storage
+from app.agent import _profile_from_model_text
 from app.model_provider import normalize_proxy_response
 
 os.environ["APP_AGENT_MODE"] = "rules"
@@ -38,6 +39,11 @@ async def verify_proxy_normalization() -> None:
 asyncio.run(verify_proxy_normalization())
 assert Usage().input_tokens_details.cached_tokens == 0
 assert logging.getLogger("openai.agents").level == logging.CRITICAL
+fallback_profile = _profile_from_model_text(
+    '```json\n{"name":"备用模型测试","email":"fallback@example.com"}\n```'
+)
+assert fallback_profile.name == "备用模型测试"
+assert fallback_profile.email == "fallback@example.com"
 
 
 class UnavailableExtractor:

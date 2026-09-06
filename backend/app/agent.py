@@ -1,8 +1,11 @@
+import json
 import os
 import re
 from abc import ABC, abstractmethod
 
 from agents import Agent, Runner
+from agents.exceptions import ModelBehaviorError
+from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
 from .model_provider import configured_model
 from .models import Education, Experience, Project, ResumeProfile
@@ -90,6 +93,17 @@ class AgentsSDKExtractor(ResumeExtractor):
     name = "openai-agents-sdk"
 
     async def parse(self, text: str) -> ResumeProfile:
+        try:
+            return await self._parse_primary(text)
+        except (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError, ModelBehaviorError):
+            fallback_model = os.getenv("APP_AGENT_FALLBACK_MODEL", "").strip()
+            if not fallback_model:
+                raise
+            parsed = await self._parse_fallback(text, fallback_model)
+            self.name = f"openai-agents-sdk:{fallback_model}:fallback"
+            return parsed
+
+    async def _parse_primary(self, text: str) -> ResumeProfile:
         model, settings = configured_model()
         agent = Agent(
             name="Zhida Resume Parser",
@@ -106,6 +120,40 @@ class AgentsSDKExtractor(ResumeExtractor):
         if not isinstance(result.final_output, ResumeProfile):
             raise RuntimeError("模型没有返回有效的简历结构")
         return result.final_output
+
+    async def _parse_fallback(self, text: str, model_name: str) -> ResumeProfile:
+        # Some relay-backed models ignore Responses API structured-output metadata.
+        # Keep Agents SDK as the runner, but ask for schema-shaped JSON explicitly
+        # and validate it locally before the data can enter the candidate profile.
+        model, settings = configured_model(model_name, "low")
+        schema = json.dumps(ResumeProfile.model_json_schema(), ensure_ascii=False)
+        agent = Agent(
+            name="Zhida Resume Parser Fallback",
+            model=model,
+            model_settings=settings,
+            instructions=(
+                "你是严谨的中英文简历解析器。只提取原文明确出现的信息，不得猜测或编造。"
+                "只输出一个 JSON 对象，不要 Markdown、代码围栏、解释或中文字段名。"
+                "字段名和数据类型必须严格符合用户消息中提供的 JSON Schema；缺失字段使用 schema 默认值。"
+            ),
+        )
+        prompt = f"JSON Schema:\n{schema}\n\n请按该 schema 解析以下简历：\n{text[:50000]}"
+        result = await Runner.run(agent, prompt, max_turns=2)
+        if not isinstance(result.final_output, str):
+            raise RuntimeError("备用模型没有返回 JSON 文本")
+        return _profile_from_model_text(result.final_output)
+
+
+def _profile_from_model_text(output: str) -> ResumeProfile:
+    """Accept plain JSON or a single Markdown JSON fence, then validate strictly."""
+    candidate = output.strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, count=1, flags=re.I)
+        candidate = re.sub(r"\s*```$", "", candidate, count=1)
+    start, end = candidate.find("{"), candidate.rfind("}")
+    if start < 0 or end < start:
+        raise RuntimeError("备用模型没有返回有效 JSON")
+    return ResumeProfile.model_validate_json(candidate[start:end + 1])
 
 
 def get_resume_extractor() -> ResumeExtractor:
