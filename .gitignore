@@ -1,0 +1,8 @@
+.DS_Store
+backend/.venv/
+backend/data/
+backend/uploads/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+.env

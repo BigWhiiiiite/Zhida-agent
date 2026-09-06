@@ -1,0 +1,7 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+python-multipart==0.0.20
+pydantic-ai-slim[openai]==0.8.1
+pypdf==6.0.0
+python-docx==1.2.0
+
