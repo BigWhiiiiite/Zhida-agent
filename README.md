@@ -65,10 +65,12 @@ pnpm run dev
 APP_AGENT_MODE=agents_sdk
 APP_AGENT_MODEL=gpt-5.6-sol
 APP_MODEL_BASE_URL=https://llmapi.isrc.ac.cn/v1
-APP_MODEL_REASONING_EFFORT=ultra
+APP_MODEL_REASONING_EFFORT=max
 APP_MODEL_API_KEY_ENV=ISRC_API_KEY
 ISRC_API_KEY=你的密钥
 ```
+
+Codex 配置中的 `ultra` 在 Responses API 上会由职达自动转换为当前支持的最高档 `max`。
 
 使用模型解析简历或分析网页时，对应的简历文本、页面字段和候选人资料会发送到这个模型代理。敏感字段缺失时，Agent 必须保持空白，不得根据姓名、毕业年份等信息推测。
 

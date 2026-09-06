@@ -1,13 +1,40 @@
 """Run with: .venv/bin/python smoke_test.py"""
+import asyncio
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import httpx
+from agents.usage import Usage
 from fastapi.testclient import TestClient
 
 from app import main, storage
+from app.model_provider import normalize_proxy_response
 
 os.environ["APP_AGENT_MODE"] = "rules"
+
+
+async def verify_proxy_normalization() -> None:
+    response = httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        request=httpx.Request("POST", "https://proxy.example/v1/responses"),
+        json={
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 15,
+            }
+        },
+    )
+    await normalize_proxy_response(response)
+    assert response.json()["usage"]["input_tokens_details"]["cache_write_tokens"] == 0
+
+
+asyncio.run(verify_proxy_normalization())
+assert Usage().input_tokens_details.cached_tokens == 0
 
 
 with TemporaryDirectory() as temporary:
