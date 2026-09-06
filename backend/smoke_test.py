@@ -1,10 +1,13 @@
 """Run with: .venv/bin/python smoke_test.py"""
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
 from app import main, storage
+
+os.environ["APP_AGENT_MODE"] = "rules"
 
 
 with TemporaryDirectory() as temporary:

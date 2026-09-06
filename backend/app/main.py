@@ -12,7 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
 from .agent import get_resume_extractor
+from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult, FormPlan
+from .browser_service import browser_demo
 from .extractors import extract_text
+from .form_agent import create_form_plan
 from .models import (CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
                      ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
 from .profile_service import apply_profile_value, build_evidence, detect_language, merge_into_profile
@@ -35,10 +38,12 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    initialize(); UPLOAD_DIR.mkdir(parents=True, exist_ok=True); yield
+    initialize(); UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    yield
+    await browser_demo.close()
 
 
-app = FastAPI(title="职达 Zhida API", description="本地优先的候选人资料与简历解析服务", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="职达 Zhida API", description="候选人资料、简历解析与求职表单 Demo", version="0.3.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -178,3 +183,48 @@ def solve_conflict(conflict_id: str, payload: ConflictResolution) -> ProfileConf
 def export_data() -> ExportBundle:
     return ExportBundle(exported_at=datetime.now(timezone.utc), profile=get_profile(),
                         resumes=list_resumes(), conflicts=list_conflicts(pending_only=False))
+
+
+@app.post("/api/browser/start", response_model=BrowserSnapshot)
+async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
+    try:
+        return await browser_demo.start(payload.url)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"打开网站失败：{exc}") from exc
+
+
+@app.get("/api/browser/{session_id}/snapshot", response_model=BrowserSnapshot)
+async def browser_snapshot(session_id: str) -> BrowserSnapshot:
+    try:
+        return await browser_demo.snapshot_for(session_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/browser/{session_id}/plan", response_model=FormPlan)
+async def plan_form(session_id: str) -> FormPlan:
+    try:
+        snapshot = await browser_demo.snapshot_for(session_id)
+        return await create_form_plan(snapshot, get_profile())
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"模型分析失败：{exc}") from exc
+
+
+@app.post("/api/browser/{session_id}/execute", response_model=ExecutionResult)
+async def execute_form_plan(session_id: str, payload: ExecutePlanRequest) -> ExecutionResult:
+    try:
+        return await browser_demo.execute(session_id, payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.delete("/api/browser/{session_id}", status_code=204, response_class=Response)
+async def close_browser(session_id: str) -> Response:
+    if browser_demo.session_id != session_id:
+        raise HTTPException(404, "浏览器会话不存在")
+    await browser_demo.close()
+    return Response(status_code=204)

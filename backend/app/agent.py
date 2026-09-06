@@ -2,6 +2,9 @@ import os
 import re
 from abc import ABC, abstractmethod
 
+from agents import Agent, Runner
+
+from .model_provider import configured_model
 from .models import Education, Experience, Project, ResumeProfile
 
 
@@ -83,29 +86,29 @@ class RuleBasedExtractor(ResumeExtractor):
         )
 
 
-class PydanticAIExtractor(ResumeExtractor):
-    name = "pydantic-ai"
-
-    def __init__(self) -> None:
-        from pydantic_ai import Agent
-
-        model = os.getenv("APP_AGENT_MODEL", "openai:gpt-5-mini")
-        self.agent = Agent(
-            model,
-            output_type=ResumeProfile,
-            system_prompt=(
-                "你是严谨的中文求职简历解析 Agent。只提取原文明确出现的信息；"
-                "不猜测敏感信息。经历按时间拆分，描述保持简洁。无法识别时使用空值。"
-            ),
-        )
+class AgentsSDKExtractor(ResumeExtractor):
+    name = "openai-agents-sdk"
 
     async def parse(self, text: str) -> ResumeProfile:
-        result = await self.agent.run("请将以下简历结构化：\n\n" + text[:50000])
-        return result.output
+        model, settings = configured_model()
+        agent = Agent(
+            name="Zhida Resume Parser",
+            model=model,
+            model_settings=settings,
+            output_type=ResumeProfile,
+            instructions=(
+                "你是严谨的中英文求职简历解析 Agent。将每段教育、实习和项目分别拆成独立记录。"
+                "只提取原文明确出现的信息，不猜测性别、年龄、日期、成果或敏感信息。"
+                "保留量化成果和技术栈；无法识别时使用空值，不得编造。"
+            ),
+        )
+        result = await Runner.run(agent, "请结构化以下简历：\n\n" + text[:50000], max_turns=3)
+        if not isinstance(result.final_output, ResumeProfile):
+            raise RuntimeError("模型没有返回有效的简历结构")
+        return result.final_output
 
 
 def get_resume_extractor() -> ResumeExtractor:
-    if os.getenv("APP_AGENT_MODE", "rules").lower() == "pydantic_ai":
-        return PydanticAIExtractor()
-    return RuleBasedExtractor()
-
+    if os.getenv("APP_AGENT_MODE", "agents_sdk").lower() == "rules":
+        return RuleBasedExtractor()
+    return AgentsSDKExtractor()

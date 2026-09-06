@@ -1,4 +1,4 @@
-import type { CandidateProfile, Conflict, ResumeProfile, ResumeRecord } from './types'
+import type { BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, ResumeProfile, ResumeRecord } from './types'
 
 export const API = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api'
 
@@ -20,5 +20,9 @@ export const api={
   review:(resumeId:string,evidenceId:string,status:string,value?:unknown)=>fetch(`${API}/resumes/${resumeId}/evidence/${evidenceId}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,value})}).then(result<ResumeRecord>),
   conflicts:()=>fetch(`${API}/conflicts`).then(result<Conflict[]>),
   resolve:(id:string,choice:'current'|'incoming'|'custom',custom_value?:unknown)=>fetch(`${API}/conflicts/${id}/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice,custom_value})}).then(result<Conflict>),
+  startBrowser:(url:string)=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}).then(result<BrowserSnapshot>),
+  browserSnapshot:(id:string)=>fetch(`${API}/browser/${id}/snapshot`).then(result<BrowserSnapshot>),
+  planForm:(id:string)=>fetch(`${API}/browser/${id}/plan`,{method:'POST'}).then(result<FormPlan>),
+  executeForm:(id:string,actions:FillAction[])=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actions,min_confidence:.85})}).then(result<ExecutionResult>),
+  closeBrowser:(id:string)=>fetch(`${API}/browser/${id}`,{method:'DELETE'}).then(result<void>),
 }
-
