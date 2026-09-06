@@ -103,6 +103,10 @@ cd frontend && pnpm run build
 
 冒烟测试使用临时数据库和临时上传目录，不会污染用户资料。
 
+## 工程复盘
+
+- [001：Agents SDK 与自定义 Responses 代理的兼容性](docs/incident-001-agents-sdk-responses-compatibility.md)
+
 ## 隐私
 
 `backend/data/`、`backend/uploads/`、`.env`、虚拟环境与前端构建产物均被 Git 忽略。删除一份简历时，数据库记录、相关冲突和原始文件会一并删除。
