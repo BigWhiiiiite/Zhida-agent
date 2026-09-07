@@ -3,12 +3,14 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
-from .browser_models import ActionResult, BrowserSnapshot, ExecutePlanRequest, ExecutionResult, PageField
+from .browser_models import (ActionResult, BrowserSnapshot, ExecutePlanRequest, ExecutionResult, PageField,
+                             PreSubmitCheck, RequiredFieldIssue)
 
 
 SENSITIVE_FIELD_HINTS = {
@@ -74,23 +76,43 @@ class BrowserDemoService:
             raise LookupError("浏览器会话尚未启动")
         data = await self.page.evaluate("""
         () => {
+          const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+          const labelledBy = el => clean((el.getAttribute('aria-labelledby') || '').split(/\\s+/)
+            .map(id => document.getElementById(id)?.innerText || '').join(' '));
+          const labelFor = el => {
+            const explicit = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
+            const wrapping = el.closest('label');
+            const question = el.closest('.application-question, .application-additional, fieldset, [role="group"], .form-field, .field');
+            const questionLabel = question?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"]');
+            const optionLabel = clean(explicit?.innerText || wrapping?.innerText);
+            const groupLabel = clean(questionLabel?.innerText);
+            const internalName = (el.getAttribute('name') || '').includes('[');
+            if ((internalName || ['radio', 'checkbox', 'file'].includes(el.type)) && groupLabel) {
+              return clean(groupLabel === optionLabel ? groupLabel : `${groupLabel}${optionLabel ? ` — ${optionLabel}` : ''}`);
+            }
+            return clean(explicit?.innerText || wrapping?.innerText || labelledBy(el) ||
+              el.getAttribute('aria-label') || groupLabel || el.getAttribute('placeholder') || el.getAttribute('name'));
+          };
           const elements = [...document.querySelectorAll('input, select, textarea')]
-            .filter(el => !['hidden','submit','button','image','reset','password','file'].includes((el.type || '').toLowerCase()))
-            .filter(el => !el.disabled && el.getClientRects().length > 0);
+            .filter(el => !['hidden','submit','button','image','reset','password'].includes((el.type || '').toLowerCase()))
+            .filter(el => !el.disabled && (el.type === 'file' || el.getClientRects().length > 0));
           return elements.map((el, index) => {
             const marker = el.getAttribute('data-zhida-field') ||
               `zhida-${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`;
             el.setAttribute('data-zhida-field', marker);
-            const explicit = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
-            const wrapping = el.closest('label');
-            const label = (explicit?.innerText || wrapping?.innerText || el.getAttribute('aria-label') ||
-              el.getAttribute('placeholder') || el.getAttribute('name') || '').trim().slice(0, 300);
-            const options = el.tagName === 'SELECT' ? [...el.options].map(o => o.text.trim()).filter(Boolean) : [];
+            const label = labelFor(el).slice(0, 500);
+            let options = el.tagName === 'SELECT' ? [...el.options].map(o => clean(o.text)).filter(Boolean) : [];
+            if (['radio', 'checkbox'].includes(el.type) && el.name) {
+              options = [...document.querySelectorAll(`input[name="${CSS.escape(el.name)}"]`)]
+                .map(item => clean(item.closest('label')?.innerText || item.value)).filter(Boolean);
+            }
             return {
               selector: `[data-zhida-field="${marker}"]`, label,
               name: el.getAttribute('name') || '', field_type: (el.type || el.tagName).toLowerCase(),
-              required: el.required || el.getAttribute('aria-required') === 'true', options,
-              current_value: ['checkbox','radio'].includes(el.type) ? String(el.checked) : String(el.value || '')
+              required: el.required || el.getAttribute('aria-required') === 'true' || /[*✱]/.test(label), options,
+              current_value: el.type === 'file' ? [...(el.files || [])].map(file => file.name).join(', ') :
+                (['checkbox','radio'].includes(el.type) ? String(el.checked) : String(el.value || '')),
+              accept: el.getAttribute('accept') || ''
             };
           });
         }
@@ -102,11 +124,95 @@ class BrowserDemoService:
         self._require(session_id)
         return await self.snapshot()
 
-    async def execute(self, session_id: str, request: ExecutePlanRequest) -> ExecutionResult:
+    async def pre_submit_check(self, session_id: str) -> PreSubmitCheck:
+        page = self._require(session_id)
+        data = await page.evaluate("""
+        () => {
+          const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+          const labelFor = el => {
+            const explicit = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
+            const question = el.closest('.application-question, .application-additional, fieldset, [role="group"], .form-field, .field');
+            return clean(explicit?.innerText || question?.querySelector('.application-label, legend, .question-label')?.innerText ||
+              el.closest('label')?.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name);
+          };
+          const candidates = [...document.querySelectorAll('input, select, textarea')]
+            .filter(el => !el.disabled && !['hidden','submit','button','image','reset','password'].includes((el.type || '').toLowerCase()))
+            .filter(el => el.type === 'file' || el.getClientRects().length > 0);
+          let filledCount = 0;
+          let requiredTotal = 0;
+          const missing = [];
+          const handledRadioNames = new Set();
+          for (const el of candidates) {
+            const marker = el.getAttribute('data-zhida-field') || '';
+            const label = labelFor(el).slice(0, 500);
+            const required = el.required || el.getAttribute('aria-required') === 'true' || /[*✱]/.test(label);
+            let filled = false;
+            if (el.type === 'file') filled = Boolean(el.files?.length);
+            else if (el.type === 'radio') {
+              if (handledRadioNames.has(el.name)) continue;
+              handledRadioNames.add(el.name);
+              filled = [...document.querySelectorAll(`input[name="${CSS.escape(el.name)}"]`)].some(item => item.checked);
+            } else if (el.type === 'checkbox') filled = el.checked;
+            else filled = clean(el.value).length > 0;
+            if (filled) filledCount += 1;
+            if (required) {
+              requiredTotal += 1;
+              if (!filled) missing.push({selector: marker ? `[data-zhida-field="${marker}"]` : '', label, field_type: el.type || el.tagName.toLowerCase()});
+            }
+          }
+          const validationErrors = [...document.querySelectorAll('[aria-invalid="true"], .error-message, .field-error, .application-error')]
+            .filter(el => el.getClientRects().length > 0).map(el => clean(el.innerText)).filter(Boolean).slice(0, 30);
+          const humanChallenges = [];
+          const challengePresent = document.querySelector(
+            '.h-captcha, .g-recaptcha, [data-sitekey], iframe[src*="captcha" i], [class*="turnstile" i]');
+          const challengeCompleted = [...document.querySelectorAll(
+            'textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"], input[name="cf-turnstile-response"]')]
+            .some(el => clean(el.value).length > 0);
+          if (challengePresent && !challengeCompleted) {
+            humanChallenges.push('页面包含需要用户完成的人机验证');
+          }
+          const fileUploads = [...document.querySelectorAll('input[type="file"]')]
+            .flatMap(el => [...(el.files || [])].map(file => file.name));
+          const submitLabels = [...document.querySelectorAll('button, input[type="submit"]')]
+            .filter(el => el.getClientRects().length > 0)
+            .map(el => ({text: clean(el.innerText || el.value || el.getAttribute('aria-label')),
+              primary: el.type === 'submit' || /submit/i.test(`${el.id} ${el.getAttribute('data-qa') || ''}`)}))
+            .filter(item => /submit|apply|send application|提交|申请/i.test(item.text))
+            .sort((a, b) => Number(b.primary) - Number(a.primary)).map(item => item.text).slice(0, 10);
+          return {required_total: requiredTotal, filled_count: filledCount, required_missing: missing,
+            validation_errors: [...new Set(validationErrors)], human_challenges: humanChallenges,
+            file_uploads: fileUploads, submit_labels: submitLabels};
+        }
+        """)
+        missing = [RequiredFieldIssue.model_validate(item) for item in data["required_missing"]]
+        return PreSubmitCheck(url=page.url, ready=not missing and not data["validation_errors"] and not data["human_challenges"],
+                              required_total=data["required_total"], filled_count=data["filled_count"],
+                              required_missing=missing, validation_errors=data["validation_errors"],
+                              human_challenges=data["human_challenges"],
+                              file_uploads=data["file_uploads"], submit_labels=data["submit_labels"])
+
+    async def execute(self, session_id: str, request: ExecutePlanRequest,
+                      resume_path: Path | None = None) -> ExecutionResult:
         page = self._require(session_id)
         snapshot = await self.snapshot()
         fields = {field.selector: field for field in snapshot.fields}
         results: list[ActionResult] = []
+        if resume_path:
+            resume_fields = [field for field in snapshot.fields if field.field_type == "file" and
+                             any(hint in f"{field.label} {field.name}".lower()
+                                 for hint in ("resume", "cv", "curriculum", "简历"))]
+            for field in resume_fields[:1]:
+                try:
+                    await page.locator(field.selector).first.set_input_files(str(resume_path), timeout=10000)
+                    actual = await page.locator(field.selector).first.evaluate(
+                        "el => [...(el.files || [])].map(file => file.name).join(', ')")
+                    verified = resume_path.name in actual
+                    results.append(ActionResult(selector=field.selector, label=field.label or "Resume/CV",
+                                                status="filled" if verified else "failed", verified=verified,
+                                                actual_value=actual, message="简历已上传" if verified else "简历上传后未能验证"))
+                except Exception as exc:
+                    results.append(ActionResult(selector=field.selector, label=field.label or "Resume/CV",
+                                                status="failed", message=str(exc)[:240]))
         for action in request.actions:
             field = fields.get(action.selector)
             field_description = f"{field.label} {field.name}".lower() if field else ""
@@ -120,8 +226,9 @@ class BrowserDemoService:
                 field is None
                 or action.action not in {"fill", "select", "check"}
                 or not compatible
-                or action.sensitive
-                or deterministically_sensitive
+                or (action.action in {"fill", "select"} and not str(action.value).strip())
+                or (action.sensitive and not action.user_confirmed)
+                or (deterministically_sensitive and not action.user_confirmed)
                 or action.confidence < request.min_confidence
             )
             if unsafe:
@@ -139,14 +246,65 @@ class BrowserDemoService:
                         await locator.select_option(value=str(action.value), timeout=8000)
                 elif action.action == "check":
                     await locator.set_checked(bool(action.value), timeout=8000)
-                results.append(ActionResult(selector=action.selector, label=action.label, status="filled"))
+                if field.field_type in {"checkbox", "radio"}:
+                    actual = str(await locator.is_checked()).lower()
+                    expected = str(bool(action.value)).lower()
+                    verified = actual.strip() == expected.strip()
+                elif field.field_type in {"select-one", "select-multiple"}:
+                    actual_value = await locator.input_value()
+                    selected_text = (await locator.locator("option:checked").first.text_content() or "").strip()
+                    actual = selected_text or actual_value
+                    expected = str(action.value)
+                    verified = expected.strip() in {actual_value.strip(), selected_text}
+                else:
+                    actual = await locator.input_value()
+                    expected = str(action.value)
+                    verified = actual.strip() == expected.strip()
+                results.append(ActionResult(selector=action.selector, label=action.label,
+                                            status="filled" if verified else "failed", verified=verified,
+                                            actual_value=actual,
+                                            message="回读验证成功" if verified else f"回读值不一致，期望 {expected}"))
             except Exception as exc:
                 results.append(ActionResult(selector=action.selector, label=action.label, status="failed",
                                             message=str(exc)[:240]))
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(800)
+        # A reactive ATS may normalize or clear a value after the input event.
+        # Re-read every planned action after the page settles so the result is
+        # based on final DOM state instead of an optimistic immediate read.
+        actions_by_selector = {action.selector: action for action in request.actions}
+        for result in results:
+            action = actions_by_selector.get(result.selector)
+            field = fields.get(result.selector)
+            if result.status != "filled" or not action or not field:
+                continue
+            try:
+                locator = page.locator(result.selector).first
+                expected = str(action.value)
+                if field.field_type in {"checkbox", "radio"}:
+                    result.actual_value = str(await locator.is_checked()).lower()
+                    result.verified = result.actual_value == str(bool(action.value)).lower()
+                elif field.field_type in {"select-one", "select-multiple"}:
+                    actual_value = await locator.input_value()
+                    selected_text = (await locator.locator("option:checked").first.text_content() or "").strip()
+                    result.actual_value = selected_text or actual_value
+                    result.verified = expected.strip() in {actual_value.strip(), selected_text}
+                else:
+                    result.actual_value = await locator.input_value()
+                    result.verified = result.actual_value.strip() == expected.strip()
+                if not result.verified:
+                    result.status = "failed"
+                    result.message = f"页面稳定后回读值不一致，期望 {expected}"
+            except Exception as exc:
+                result.status = "failed"
+                result.verified = False
+                result.message = str(exc)[:240]
+        check = await self.pre_submit_check(session_id)
         return ExecutionResult(url=page.url, completed=sum(r.status == "filled" for r in results),
                                skipped=sum(r.status == "skipped" for r in results),
-                               failed=sum(r.status == "failed" for r in results), results=results)
+                               failed=sum(r.status == "failed" for r in results),
+                               verified=sum(r.verified for r in results),
+                               unverified=sum(r.status == "filled" and not r.verified for r in results),
+                               results=results, pre_submit=check)
 
     async def close(self) -> None:
         if self.context:

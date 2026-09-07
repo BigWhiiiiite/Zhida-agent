@@ -17,6 +17,7 @@ class PageField(BaseModel):
     required: bool = False
     options: list[str] = Field(default_factory=list)
     current_value: str = ""
+    accept: str = ""
 
 
 class BrowserSnapshot(BaseModel):
@@ -38,6 +39,7 @@ class FillAction(BaseModel):
     confidence: float = Field(default=0, ge=0, le=1)
     reason: str = ""
     sensitive: bool = False
+    user_confirmed: bool = False
 
 
 class FormPlan(BaseModel):
@@ -50,6 +52,7 @@ class FormPlan(BaseModel):
 class ExecutePlanRequest(BaseModel):
     actions: list[FillAction]
     min_confidence: float = Field(default=0.85, ge=0, le=1)
+    resume_id: str = ""
 
 
 class ActionResult(BaseModel):
@@ -57,6 +60,26 @@ class ActionResult(BaseModel):
     label: str
     status: Literal["filled", "skipped", "failed"]
     message: str = ""
+    verified: bool = False
+    actual_value: str = ""
+
+
+class RequiredFieldIssue(BaseModel):
+    selector: str
+    label: str
+    field_type: str
+
+
+class PreSubmitCheck(BaseModel):
+    url: str
+    ready: bool = False
+    required_total: int = 0
+    filled_count: int = 0
+    required_missing: list[RequiredFieldIssue] = Field(default_factory=list)
+    validation_errors: list[str] = Field(default_factory=list)
+    human_challenges: list[str] = Field(default_factory=list)
+    file_uploads: list[str] = Field(default_factory=list)
+    submit_labels: list[str] = Field(default_factory=list)
 
 
 class ExecutionResult(BaseModel):
@@ -64,4 +87,7 @@ class ExecutionResult(BaseModel):
     completed: int
     skipped: int
     failed: int
+    verified: int = 0
+    unverified: int = 0
     results: list[ActionResult]
+    pre_submit: PreSubmitCheck

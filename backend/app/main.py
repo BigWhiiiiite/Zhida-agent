@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
 from .agent import get_resume_extractor
-from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult, FormPlan
+from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult, FormPlan, PreSubmitCheck
 from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
 from .form_agent import create_form_plan
@@ -273,7 +273,22 @@ async def plan_form(session_id: str) -> FormPlan:
 @app.post("/api/browser/{session_id}/execute", response_model=ExecutionResult)
 async def execute_form_plan(session_id: str, payload: ExecutePlanRequest) -> ExecutionResult:
     try:
-        return await browser_demo.execute(session_id, payload)
+        resume_path: Path | None = None
+        if payload.resume_id:
+            row = get_resume_internal(payload.resume_id)
+            if not row: raise HTTPException(404, "选择的简历不存在")
+            candidate = UPLOAD_DIR / Path(row["stored_filename"]).name
+            if not candidate.exists(): raise HTTPException(404, "选择的简历原始文件不存在")
+            resume_path = candidate
+        return await browser_demo.execute(session_id, payload, resume_path)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/browser/{session_id}/check", response_model=PreSubmitCheck)
+async def check_form_before_submit(session_id: str) -> PreSubmitCheck:
+    try:
+        return await browser_demo.pre_submit_check(session_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
 
