@@ -7,11 +7,13 @@ from tempfile import TemporaryDirectory
 
 import httpx
 from agents.usage import Usage
+from docx import Document
 from fastapi.testclient import TestClient
 from openai import APIConnectionError
 
 from app import main, storage
 from app.agent import _profile_from_model_text
+from app.extractors import extract_text
 from app.model_provider import normalize_proxy_response
 
 os.environ["APP_AGENT_MODE"] = "rules"
@@ -55,6 +57,15 @@ class UnavailableExtractor:
 
 with TemporaryDirectory() as temporary:
     root = Path(temporary)
+    merged_docx = root / "merged.docx"
+    document = Document()
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).merge(table.cell(1, 0)).text = "重复标题"
+    table.cell(0, 1).text = "第一行"
+    table.cell(1, 1).text = "第二行"
+    document.save(merged_docx)
+    assert extract_text(merged_docx).count("重复标题") == 1
+
     storage.DB_PATH = root / "test.db"
     main.UPLOAD_DIR = root / "uploads"
 
@@ -96,6 +107,19 @@ with TemporaryDirectory() as temporary:
         assert reviewed.json()["evidence"][0]["status"] == "confirmed"
 
         assert client.get(f"/api/resumes/{first_json['id']}/download").status_code == 200
+        preview = client.get(f"/api/resumes/{first_json['id']}/preview")
+        assert preview.status_code == 200
+        assert "text/html" in preview.headers["content-type"]
+
+        skills_evidence = next(item for item in first_json["evidence"] if item["field_path"] == "skills")
+        edited = client.patch(
+            f"/api/resumes/{first_json['id']}/evidence/{skills_evidence['id']}",
+            json={"status": "edited", "value": ["Python", "React"]},
+        )
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["profile"]["skills"] == ["Python", "React"]
+        assert client.get("/api/profile").json()["skills"] == ["Python", "React"]
+
         assert client.post(f"/api/resumes/{first_json['id']}/parse").status_code == 200
 
         original_extractor = main.get_resume_extractor

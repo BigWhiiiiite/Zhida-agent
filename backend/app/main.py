@@ -9,20 +9,21 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
 from .agent import get_resume_extractor
 from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult, FormPlan
 from .browser_service import browser_demo
-from .extractors import extract_text
+from .extractors import extract_text, preview_html
 from .form_agent import create_form_plan
 from .models import (CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
                      ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
-from .profile_service import apply_profile_value, build_evidence, detect_language, merge_into_profile
+from .profile_service import (apply_profile_value, build_evidence, detect_language, merge_into_profile,
+                              sync_edited_profile_value)
 from .storage import (create_pending_resume, delete_resume, find_by_hash, get_conflict, get_profile,
                       get_resume, get_resume_internal, initialize, list_conflicts, list_resumes,
-                      mark_resume_failed, mark_resume_parsing, raw_text_for, replace_parse_result, resolve_conflict, save_profile,
+                      mark_resume_failed, mark_resume_parsing, replace_parse_result, resolve_conflict, save_profile,
                       update_evidence, update_resume)
 
 
@@ -118,7 +119,7 @@ async def upload_resume(file: UploadFile = File(...)) -> ResumeRecord:
                           detect_language(text), len(content), digest, text)
     try:
         parsed, parser, evidence = await _parse_text(text)
-        record = replace_parse_result(resume_id, parsed, parser, evidence)
+        record = replace_parse_result(resume_id, parsed, parser, evidence, text)
         merge_into_profile(parsed, resume_id)
         return record  # type: ignore[return-value]
     except Exception as exc:
@@ -153,6 +154,18 @@ def download_resume(resume_id: str) -> FileResponse:
     return FileResponse(path, filename=row["filename"])
 
 
+@app.get("/api/resumes/{resume_id}/preview")
+def preview_resume(resume_id: str) -> Response:
+    row = get_resume_internal(resume_id)
+    if not row: raise HTTPException(404, "简历不存在")
+    path = UPLOAD_DIR / Path(row["stored_filename"]).name
+    if not path.exists(): raise HTTPException(404, "原始文件不存在")
+    if path.suffix.lower() == ".pdf":
+        return FileResponse(path, filename=row["filename"], media_type="application/pdf",
+                            content_disposition_type="inline")
+    return HTMLResponse(preview_html(path, row["filename"]), headers={"X-Content-Type-Options": "nosniff"})
+
+
 @app.post("/api/resumes/{resume_id}/parse", response_model=ResumeRecord)
 async def reparse_resume(resume_id: str) -> ResumeRecord:
     row = get_resume_internal(resume_id)
@@ -164,7 +177,7 @@ async def reparse_resume(resume_id: str) -> ResumeRecord:
         text = extract_text(path)
         if not text.strip(): raise ValueError("没有提取到文本，扫描版简历需要 OCR")
         parsed, parser, evidence = await _parse_text(text)
-        record = replace_parse_result(resume_id, parsed, parser, evidence)
+        record = replace_parse_result(resume_id, parsed, parser, evidence, text)
         merge_into_profile(parsed, resume_id)
         return record  # type: ignore[return-value]
     except Exception as exc:
@@ -176,19 +189,32 @@ async def reparse_resume(resume_id: str) -> ResumeRecord:
 
 @app.get("/api/resumes/{resume_id}/text")
 def resume_text(resume_id: str) -> dict[str, str]:
-    text = raw_text_for(resume_id)
-    if text is None: raise HTTPException(404, "简历不存在")
-    return {"text": text}
+    row = get_resume_internal(resume_id)
+    if not row: raise HTTPException(404, "简历不存在")
+    path = UPLOAD_DIR / Path(row["stored_filename"]).name
+    if path.exists():
+        try:
+            # Re-extract locally so older uploads immediately benefit from extractor fixes
+            # without spending another model request.
+            return {"text": extract_text(path)}
+        except Exception:
+            pass
+    return {"text": row["raw_text"]}
 
 
 @app.patch("/api/resumes/{resume_id}/evidence/{evidence_id}", response_model=ResumeRecord)
 def review_evidence(resume_id: str, evidence_id: str, payload: ReviewUpdate) -> ResumeRecord:
     current = get_resume(resume_id)
     evidence = next((item for item in current.evidence if item.id == evidence_id), None) if current else None
+    if not evidence: raise HTTPException(404, "简历或识别字段不存在")
+    if payload.status == "edited":
+        if payload.value is None: raise HTTPException(422, "修改后的字段不能为空")
+        try:
+            sync_edited_profile_value(resume_id, evidence.field_path, payload.value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, f"字段格式不正确：{exc}") from exc
     record = update_evidence(resume_id, evidence_id, payload.status, payload.value)
     if not record: raise HTTPException(404, "简历或识别字段不存在")
-    if evidence and payload.status == "edited" and payload.value is not None:
-        apply_profile_value(evidence.field_path, payload.value)
     return record
 
 

@@ -150,12 +150,13 @@ def update_resume(resume_id: str, **changes: Any) -> ResumeRecord | None:
     return get_resume(resume_id)
 
 
-def replace_parse_result(resume_id: str, profile: ResumeProfile, parser: str, evidence: list[FieldEvidence]) -> ResumeRecord | None:
+def replace_parse_result(resume_id: str, profile: ResumeProfile, parser: str,
+                         evidence: list[FieldEvidence], raw_text: str) -> ResumeRecord | None:
     with _connection() as conn:
-        conn.execute("""UPDATE resumes SET profile_json=?, parser=?, evidence_json=?, target_role=?,
+        conn.execute("""UPDATE resumes SET profile_json=?, parser=?, evidence_json=?, target_role=?, raw_text=?,
             status='needs_review', error_message='', updated_at=? WHERE id=?""",
             (profile.model_dump_json(), parser, json.dumps([e.model_dump(mode='json') for e in evidence], ensure_ascii=False),
-             profile.target_role, _now(), resume_id))
+             profile.target_role, raw_text, _now(), resume_id))
     return get_resume(resume_id)
 
 

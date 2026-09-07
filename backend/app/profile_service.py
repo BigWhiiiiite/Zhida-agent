@@ -5,7 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from .models import FieldEvidence, ResumeProfile
-from .storage import create_conflict, get_profile, save_profile
+from .storage import create_conflict, get_profile, get_resume, save_profile, update_resume
 
 
 SCALAR_FIELDS = [
@@ -93,11 +93,24 @@ def merge_into_profile(incoming: ResumeProfile, resume_id: str) -> None:
         save_profile(current)
 
 
-def apply_profile_value(field_path: str, value: Any) -> None:
-    if field_path not in SCALAR_FIELDS:
-        return
-    current = get_profile()
-    profile = ResumeProfile.model_validate(current.model_dump())
-    setattr(profile, field_path, value)
-    save_profile(profile)
+def _updated_profile(profile: ResumeProfile, field_path: str, value: Any) -> ResumeProfile:
+    if field_path not in ResumeProfile.model_fields:
+        raise ValueError(f"不支持修改字段：{field_path}")
+    data = profile.model_dump()
+    data[field_path] = value
+    return ResumeProfile.model_validate(data)
 
+
+def apply_profile_value(field_path: str, value: Any) -> None:
+    current = ResumeProfile.model_validate(get_profile().model_dump())
+    save_profile(_updated_profile(current, field_path, value))
+
+
+def sync_edited_profile_value(resume_id: str, field_path: str, value: Any) -> None:
+    """Apply an explicit user edit to both its resume version and the master profile."""
+    resume = get_resume(resume_id)
+    if not resume:
+        raise ValueError("简历不存在")
+    updated_resume = _updated_profile(resume.profile, field_path, value)
+    update_resume(resume_id, profile=updated_resume)
+    apply_profile_value(field_path, value)
