@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -30,7 +30,10 @@ class FillAction(BaseModel):
     selector: str
     label: str
     action: Literal["fill", "select", "check", "skip", "ask_user"]
-    value: Any = ""
+    # Browser actions only need text for inputs/selects or a boolean for checks.
+    # Keeping this concrete also produces a valid strict JSON Schema for models
+    # using structured outputs (an unconstrained Any has no schema `type`).
+    value: str | bool = ""
     value_source: str = ""
     confidence: float = Field(default=0, ge=0, le=1)
     reason: str = ""
