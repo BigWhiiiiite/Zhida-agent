@@ -13,8 +13,11 @@ from openai import APIConnectionError
 
 from app import main, storage
 from app.agent import _profile_from_model_text
+from app.browser_models import BrowserSnapshot, PageField
+from app.form_agent import _form_plan_from_model_text, _local_safe_plan
 from app.extractors import extract_text
 from app.model_provider import normalize_proxy_response
+from app.models import CandidateProfile
 
 os.environ["APP_AGENT_MODE"] = "rules"
 
@@ -46,6 +49,23 @@ fallback_profile = _profile_from_model_text(
 )
 assert fallback_profile.name == "备用模型测试"
 assert fallback_profile.email == "fallback@example.com"
+
+fallback_plan = _form_plan_from_model_text(
+    '```json\n{"page_summary":"test","site_type":"lever","actions":[],"missing_questions":[]}\n```'
+)
+assert fallback_plan.site_type == "lever"
+
+local_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="test", url="https://jobs.lever.co/example/apply", title="Test", fields=[
+        PageField(selector="[data-zhida-field=name]", label="Full name", name="name", required=True),
+        PageField(selector="[data-zhida-field=email]", label="Email", name="email", required=True),
+        PageField(selector="[data-zhida-field=gender]", label="Gender", name="gender", required=True),
+        PageField(selector="[data-zhida-field=resume]", label="Resume/CV", name="resume", field_type="file", required=True),
+    ]),
+    CandidateProfile(name="Test Candidate", email="test@example.com"),
+)
+assert [action.action for action in local_plan.actions] == ["fill", "fill", "ask_user", "skip"]
+assert local_plan.actions[2].sensitive
 
 
 class UnavailableExtractor:
