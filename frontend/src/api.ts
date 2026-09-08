@@ -1,4 +1,4 @@
-import type { BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, PreSubmitCheck, ResumeProfile, ResumeRecord } from './types'
+import type { ApplicationWorkflowState, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, PreSubmitCheck, ResumeProfile, ResumeRecord } from './types'
 
 export const API = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api'
 
@@ -27,6 +27,10 @@ export const api={
   resolve:(id:string,choice:'current'|'incoming'|'custom',custom_value?:unknown)=>fetch(`${API}/conflicts/${id}/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice,custom_value})}).then(result<Conflict>),
   startBrowser:(url:string)=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}).then(result<BrowserSnapshot>),
   browserSnapshot:(id:string)=>fetch(`${API}/browser/${id}/snapshot`).then(result<BrowserSnapshot>),
+  workflowState:(id:string)=>fetch(`${API}/browser/${id}/workflow`).then(result<ApplicationWorkflowState>),
+  advanceWorkflow:(id:string,intent:'start_application'|'refresh')=>fetch(`${API}/browser/${id}/workflow/advance`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({intent})}).then(result<ApplicationWorkflowState>),
+  requestVerificationCode:(id:string,channel:'phone'|'email')=>fetch(`${API}/browser/${id}/workflow/request-code`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel})}).then(result<ApplicationWorkflowState>),
+  enterVerificationCode:(id:string,code:string,submit:boolean)=>fetch(`${API}/browser/${id}/workflow/verification`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,submit})}).then(result<ApplicationWorkflowState>),
   planForm:(id:string)=>fetch(`${API}/browser/${id}/plan`,{method:'POST'}).then(result<FormPlan>),
   executeForm:(id:string,actions:FillAction[],resume_id:string)=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actions,min_confidence:.85,resume_id})}).then(result<ExecutionResult>),
   checkForm:(id:string)=>fetch(`${API}/browser/${id}/check`).then(result<PreSubmitCheck>),

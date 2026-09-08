@@ -9,6 +9,10 @@ from uuid import uuid4
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
+from .application_models import (ApplicationWorkflowState, VerificationCodeRequest,
+                                 VerificationRequest, WorkflowAdvanceRequest)
+from .ats_adapters import (fill_verification_code, inspect_application_page,
+                           request_verification_code, start_application)
 from .browser_models import (ActionResult, BrowserSnapshot, ExecutePlanRequest, ExecutionResult, PageField,
                              PreSubmitCheck, RequiredFieldIssue)
 
@@ -69,7 +73,41 @@ class BrowserDemoService:
     def _require(self, session_id: str) -> Page:
         if not self.page or not self.session_id or session_id != self.session_id:
             raise LookupError("浏览器会话不存在或已经结束")
+        if self.page.is_closed() and self.context:
+            open_pages = [page for page in self.context.pages if not page.is_closed()]
+            if open_pages:
+                self.page = open_pages[-1]
+            else:
+                raise LookupError("浏览器页面已关闭")
         return self.page
+
+    async def workflow_state(self, session_id: str) -> ApplicationWorkflowState:
+        page = self._require(session_id)
+        return await inspect_application_page(page, session_id)
+
+    async def advance_workflow(self, session_id: str,
+                               request: WorkflowAdvanceRequest) -> ApplicationWorkflowState:
+        page = self._require(session_id)
+        if request.intent == "start_application":
+            await start_application(page)
+        return await inspect_application_page(page, session_id)
+
+    async def enter_verification(self, session_id: str,
+                                 request: VerificationCodeRequest) -> ApplicationWorkflowState:
+        page = self._require(session_id)
+        code = request.code.get_secret_value()
+        try:
+            await fill_verification_code(page, code, request.submit)
+        finally:
+            code = ""
+        return await inspect_application_page(page, session_id)
+
+    async def request_code(self, session_id: str, request: VerificationRequest,
+                           phone: str, email: str) -> ApplicationWorkflowState:
+        page = self._require(session_id)
+        value = phone if request.channel == "phone" else email
+        await request_verification_code(page, request.channel, value)
+        return await inspect_application_page(page, session_id)
 
     async def snapshot(self) -> BrowserSnapshot:
         if not self.page or not self.session_id:

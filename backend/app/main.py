@@ -13,6 +13,8 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
 from .agent import get_resume_extractor
+from .application_models import (ApplicationWorkflowState, VerificationCodeRequest,
+                                 VerificationRequest, WorkflowAdvanceRequest)
 from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult, FormPlan, PreSubmitCheck
 from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
@@ -257,6 +259,48 @@ async def browser_snapshot(session_id: str) -> BrowserSnapshot:
         return await browser_demo.snapshot_for(session_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/browser/{session_id}/workflow", response_model=ApplicationWorkflowState)
+async def browser_workflow(session_id: str) -> ApplicationWorkflowState:
+    try:
+        return await browser_demo.workflow_state(session_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/browser/{session_id}/workflow/advance", response_model=ApplicationWorkflowState)
+async def advance_browser_workflow(session_id: str,
+                                   payload: WorkflowAdvanceRequest) -> ApplicationWorkflowState:
+    try:
+        return await browser_demo.advance_workflow(session_id, payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/browser/{session_id}/workflow/request-code", response_model=ApplicationWorkflowState)
+async def request_browser_verification(session_id: str,
+                                       payload: VerificationRequest) -> ApplicationWorkflowState:
+    try:
+        current = get_profile()
+        return await browser_demo.request_code(session_id, payload, current.phone, current.email)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/browser/{session_id}/workflow/verification", response_model=ApplicationWorkflowState)
+async def enter_browser_verification(session_id: str,
+                                     payload: VerificationCodeRequest) -> ApplicationWorkflowState:
+    try:
+        return await browser_demo.enter_verification(session_id, payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.post("/api/browser/{session_id}/plan", response_model=FormPlan)
