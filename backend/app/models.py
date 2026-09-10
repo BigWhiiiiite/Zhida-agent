@@ -9,6 +9,13 @@ from pydantic import BaseModel, Field
 ReviewStatus = Literal["pending_review", "confirmed", "edited", "rejected"]
 
 
+class ModelHealth(BaseModel):
+    status: Literal["ok", "unavailable", "misconfigured"]
+    model: str = ""
+    latency_ms: int = 0
+    message: str = ""
+
+
 class Experience(BaseModel):
     organization: str = ""
     department: str = ""

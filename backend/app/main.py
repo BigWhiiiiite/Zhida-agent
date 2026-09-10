@@ -20,7 +20,8 @@ from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
 from .form_agent import create_form_plan
 from .models import (ApplicationAnswerUpdate, CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
-                     ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
+                     ModelHealth, ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
+from .model_provider import check_model_health
 from .profile_service import (apply_profile_value, build_evidence, detect_language, merge_into_profile,
                               save_application_answer, sync_edited_profile_value)
 from .storage import (create_pending_resume, delete_resume, find_by_hash, get_conflict, get_profile,
@@ -54,6 +55,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http
 
 @app.get("/api/health")
 def health() -> dict[str, str]: return {"status": "ok", "product": "Zhida"}
+
+
+@app.post("/api/model/health", response_model=ModelHealth)
+async def model_health() -> ModelHealth:
+    return await check_model_health()
 
 
 @app.get("/api/profile", response_model=CandidateProfile)

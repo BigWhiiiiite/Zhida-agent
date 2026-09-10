@@ -3,14 +3,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from functools import lru_cache
 from pathlib import Path
 
 import httpx
-from agents import ModelSettings, set_tracing_disabled
+from agents import Agent, ModelSettings, Runner, set_tracing_disabled
 from agents.models.openai_responses import OpenAIResponsesModel
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from openai import (APIConnectionError, APITimeoutError, AsyncOpenAI,
+                    DefaultAsyncHttpxClient, InternalServerError, RateLimitError)
 from dotenv import load_dotenv
+
+from .models import ModelHealth
+
+
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
 
 # Agents SDK 0.8.4 logs the full model input on terminal errors in one run-loop
@@ -67,7 +74,9 @@ async def normalize_proxy_response(response: httpx.Response) -> None:
 @lru_cache(maxsize=16)
 def configured_model(model_name: str | None = None, reasoning_effort: str | None = None,
                      timeout_seconds: float | None = None) -> tuple[OpenAIResponsesModel, ModelSettings]:
-    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    # The local .env is the source of truth. override=True matters when uvicorn's
+    # reloader inherited an older key from its parent process.
+    load_dotenv(ENV_PATH, override=True)
     key_env = os.getenv("APP_MODEL_API_KEY_ENV", "ISRC_API_KEY")
     api_key = os.getenv(key_env)
     if not api_key:
@@ -91,3 +100,42 @@ def configured_model(model_name: str | None = None, reasoning_effort: str | None
     model = OpenAIResponsesModel(model=model_name, openai_client=client)
     settings = ModelSettings(store=False, extra_body={"reasoning": {"effort": wire_effort}})
     return model, settings
+
+
+def reload_model_configuration() -> None:
+    """Reload backend/.env without ever returning or logging the API key."""
+    load_dotenv(ENV_PATH, override=True)
+    configured_model.cache_clear()
+
+
+async def check_model_health() -> ModelHealth:
+    """Run a minimal, non-user-data request and return only sanitized diagnostics."""
+    reload_model_configuration()
+    model_name = os.getenv("APP_AGENT_MODEL", "gpt-5.6-sol").strip()
+    started = time.monotonic()
+    try:
+        model, settings = configured_model(model_name, "low", 30)
+        agent = Agent(name="Zhida model health", instructions="Reply with exactly OK.",
+                      model=model, model_settings=settings)
+        await Runner.run(agent, "OK", max_turns=1)
+        return ModelHealth(status="ok", model=model_name,
+                           latency_ms=round((time.monotonic() - started) * 1000),
+                           message="主模型当前可用")
+    except RuntimeError as exc:
+        return ModelHealth(status="misconfigured", model=model_name,
+                           latency_ms=round((time.monotonic() - started) * 1000), message=str(exc))
+    except RateLimitError:
+        message = "代理上游账号池正在限流，请稍后重试"
+    except APITimeoutError:
+        message = "模型请求超时，请稍后重试"
+    except APIConnectionError:
+        message = "无法连接模型代理"
+    except InternalServerError as exc:
+        if getattr(exc, "code", "") == "model_not_found":
+            message = f"当前 Key 所属分组没有 {model_name} 可用通道"
+        else:
+            message = "代理或上游模型暂时不可用"
+    except Exception:
+        message = "模型健康检查失败"
+    return ModelHealth(status="unavailable", model=model_name,
+                       latency_ms=round((time.monotonic() - started) * 1000), message=message)

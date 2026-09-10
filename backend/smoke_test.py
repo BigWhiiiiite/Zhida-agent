@@ -17,7 +17,7 @@ from app.browser_models import BrowserSnapshot, PageField
 from app.form_agent import _form_plan_from_model_text, _local_safe_plan
 from app.extractors import extract_text
 from app.model_provider import normalize_proxy_response
-from app.models import CandidateProfile
+from app.models import CandidateProfile, ModelHealth
 
 os.environ["APP_AGENT_MODE"] = "rules"
 
@@ -102,6 +102,17 @@ with TemporaryDirectory() as temporary:
 
     with TestClient(main.app) as client:
         assert client.get("/api/health").json()["product"] == "Zhida"
+        original_health_check = main.check_model_health
+        main.check_model_health = lambda: asyncio.sleep(0, result=ModelHealth(
+            status="ok", model="test-model", latency_ms=12, message="主模型当前可用"
+        ))
+        try:
+            model_health = client.post("/api/model/health")
+            assert model_health.status_code == 200
+            assert model_health.json()["status"] == "ok"
+            assert "key" not in model_health.text.lower()
+        finally:
+            main.check_model_health = original_health_check
         initial = client.get("/api/profile")
         assert initial.status_code == 200
 
