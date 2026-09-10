@@ -64,6 +64,13 @@ def initialize() -> None:
                 resolution_json TEXT, created_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS application_queue (
+                id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE,
+                resume_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )
+        """)
         if not conn.execute("SELECT id FROM candidate_profiles WHERE id='default'").fetchone():
             now = _now()
             conn.execute("INSERT INTO candidate_profiles VALUES ('default', ?, ?, ?)", (ResumeProfile().model_dump_json(), now, now))
@@ -260,3 +267,30 @@ def update_evidence(resume_id: str, evidence_id: str, status: str, value: Any | 
 def raw_text_for(resume_id: str) -> str | None:
     row = get_resume_internal(resume_id)
     return row["raw_text"] if row else None
+
+
+def add_job_queue_entries(job_ids: list[str], resume_id: str = "") -> None:
+    now = _now()
+    with _connection() as conn:
+        for job_id in job_ids:
+            existing = conn.execute("SELECT id FROM application_queue WHERE job_id=?", (job_id,)).fetchone()
+            if existing:
+                conn.execute("UPDATE application_queue SET resume_id=?, updated_at=? WHERE job_id=?",
+                             (resume_id, now, job_id))
+            else:
+                conn.execute("""INSERT INTO application_queue
+                    (id, job_id, resume_id, status, created_at, updated_at)
+                    VALUES (?, ?, ?, 'planned', ?, ?)""",
+                    (str(uuid4()), job_id, resume_id, now, now))
+
+
+def list_job_queue_entries() -> list[dict[str, str]]:
+    with _connection() as conn:
+        rows = conn.execute("SELECT * FROM application_queue ORDER BY updated_at DESC").fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_job_queue_entry(queue_id: str) -> bool:
+    with _connection() as conn:
+        cursor = conn.execute("DELETE FROM application_queue WHERE id=?", (queue_id,))
+    return cursor.rowcount > 0

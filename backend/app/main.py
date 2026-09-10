@@ -19,6 +19,8 @@ from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, E
 from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
 from .form_agent import create_form_plan
+from .job_models import ApplicationQueueItem, QueueAddRequest, RecommendationBatch
+from .job_recommendations import add_to_queue, queue_items, recommendation_batch, remove_from_queue
 from .models import (ApplicationAnswerUpdate, CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
                      ModelHealth, ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
 from .model_provider import check_model_health
@@ -48,7 +50,7 @@ async def lifespan(_: FastAPI):
     await browser_demo.close()
 
 
-app = FastAPI(title="职达 Zhida API", description="候选人资料、简历解析与求职表单 Demo", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="职达 Zhida API", description="候选人资料、岗位推荐、简历解析与求职表单 Demo", version="0.4.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -76,6 +78,33 @@ def remember_application_answer(payload: ApplicationAnswerUpdate) -> CandidatePr
         return save_application_answer(payload.question, payload.field_name, payload.value)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/jobs/recommendations", response_model=RecommendationBatch)
+def job_recommendations() -> RecommendationBatch:
+    return recommendation_batch(get_profile())
+
+
+@app.get("/api/jobs/queue", response_model=list[ApplicationQueueItem])
+def application_queue() -> list[ApplicationQueueItem]:
+    return queue_items(get_profile())
+
+
+@app.post("/api/jobs/queue", response_model=list[ApplicationQueueItem], status_code=201)
+def add_application_queue(payload: QueueAddRequest) -> list[ApplicationQueueItem]:
+    try:
+        return add_to_queue(get_profile(), payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/jobs/queue/{queue_id}", status_code=204, response_class=Response)
+def remove_application_queue(queue_id: str) -> Response:
+    if not remove_from_queue(queue_id):
+        raise HTTPException(404, "投递清单项目不存在")
+    return Response(status_code=204)
 
 
 @app.get("/api/resumes", response_model=list[ResumeRecord])

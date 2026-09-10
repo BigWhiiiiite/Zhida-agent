@@ -1,4 +1,4 @@
-import type { ApplicationWorkflowState, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, PreSubmitCheck, ResumeProfile, ResumeRecord } from './types'
+import type { ApplicationQueueItem, ApplicationWorkflowState, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, PreSubmitCheck, RecommendationBatch, ResumeProfile, ResumeRecord } from './types'
 
 export const API = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api'
 
@@ -17,6 +17,10 @@ export const api={
   profile:()=>fetch(`${API}/profile`).then(result<CandidateProfile>),
   saveProfile:(profile:ResumeProfile)=>fetch(`${API}/profile`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(profile)}).then(result<CandidateProfile>),
   saveApplicationAnswer:(question:string,field_name:string,value:string)=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value})}).then(result<CandidateProfile>),
+  recommendations:()=>fetch(`${API}/jobs/recommendations`).then(result<RecommendationBatch>),
+  jobQueue:()=>fetch(`${API}/jobs/queue`).then(result<ApplicationQueueItem[]>),
+  queueJobs:(job_ids:string[],resume_id:string)=>fetch(`${API}/jobs/queue`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids,resume_id})}).then(result<ApplicationQueueItem[]>),
+  removeQueuedJob:(id:string)=>fetch(`${API}/jobs/queue/${id}`,{method:'DELETE'}).then(result<void>),
   list:()=>fetch(`${API}/resumes`).then(result<ResumeRecord[]>),
   upload:(file:File)=>{const data=new FormData();data.append('file',file);return fetch(`${API}/resumes`,{method:'POST',body:data}).then(result<ResumeRecord>)},
   saveResume:(id:string,patch:Partial<ResumeRecord>)=>fetch(`${API}/resumes/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(result<ResumeRecord>),

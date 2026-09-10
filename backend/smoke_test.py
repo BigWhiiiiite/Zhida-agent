@@ -17,7 +17,8 @@ from app.browser_models import BrowserSnapshot, PageField
 from app.form_agent import _form_plan_from_model_text, _local_safe_plan
 from app.extractors import extract_text
 from app.model_provider import normalize_proxy_response
-from app.models import CandidateProfile, ModelHealth
+from app.models import CandidateProfile, Education, ModelHealth
+from app.job_recommendations import recommendation_batch
 
 os.environ["APP_AGENT_MODE"] = "rules"
 
@@ -77,6 +78,14 @@ learned_plan = _local_safe_plan(
 assert [action.value for action in learned_plan.actions] == ["12345678", "GitHub"]
 assert learned_plan.actions[0].value_source == "主档案.qq"
 assert learned_plan.actions[1].value_source.startswith("主档案.application_answers")
+
+graduating_profile = CandidateProfile(
+    target_role="Agent 开发工程师", skills=["Python", "FastAPI", "Agent"],
+    education=[Education(school="Test University", end_date="2026.12")],
+)
+graduating_jobs = recommendation_batch(graduating_profile).jobs
+baidu_agent = next(item for item in graduating_jobs if item.job.job_code == "J101017")
+assert baidu_agent.graduation_match is True
 
 
 class UnavailableExtractor:
@@ -146,6 +155,28 @@ with TemporaryDirectory() as temporary:
 
         profile = client.get("/api/profile").json()
         assert profile["email"] == "first@example.com"
+
+        recommendations = client.get("/api/jobs/recommendations")
+        assert recommendations.status_code == 200
+        recommendation_json = recommendations.json()
+        assert recommendation_json["engine"] == "local-explainable-v1"
+        assert len(recommendation_json["jobs"]) >= 5
+        scores = [item["match_score"] for item in recommendation_json["jobs"]]
+        assert scores == sorted(scores, reverse=True)
+        assert all(item["reasons"] for item in recommendation_json["jobs"])
+        assert all(item["job"]["source_url"].startswith("https://") for item in recommendation_json["jobs"])
+
+        first_job_id = recommendation_json["jobs"][0]["job"]["id"]
+        queued = client.post("/api/jobs/queue", json={"job_ids": [first_job_id], "resume_id": first_json["id"]})
+        assert queued.status_code == 201, queued.text
+        assert queued.json()[0]["job_id"] == first_job_id
+        assert queued.json()[0]["resume_id"] == first_json["id"]
+        queue_id = queued.json()[0]["id"]
+        assert client.get("/api/jobs/queue").json()[0]["recommendation"]["reasons"]
+        assert client.delete(f"/api/jobs/queue/{queue_id}").status_code == 204
+        assert client.get("/api/jobs/queue").json() == []
+        unknown_job = client.post("/api/jobs/queue", json={"job_ids": ["not-a-job"], "resume_id": ""})
+        assert unknown_job.status_code == 422
 
         second_text = "姓名：李春博\n邮箱：new@example.com\n技能\nPydanticAI，React".encode()
         second = client.post("/api/resumes", files={"file": ("english.txt", second_text, "text/plain")})
