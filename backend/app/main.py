@@ -19,10 +19,10 @@ from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, E
 from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
 from .form_agent import create_form_plan
-from .models import (CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
+from .models import (ApplicationAnswerUpdate, CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
                      ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
 from .profile_service import (apply_profile_value, build_evidence, detect_language, merge_into_profile,
-                              sync_edited_profile_value)
+                              save_application_answer, sync_edited_profile_value)
 from .storage import (create_pending_resume, delete_resume, find_by_hash, get_conflict, get_profile,
                       get_resume, get_resume_internal, initialize, list_conflicts, list_resumes,
                       mark_resume_failed, mark_resume_parsing, replace_parse_result, resolve_conflict, save_profile,
@@ -62,6 +62,14 @@ def profile() -> CandidateProfile: return get_profile()
 
 @app.patch("/api/profile", response_model=CandidateProfile)
 def update_profile(payload: ResumeProfile) -> CandidateProfile: return save_profile(payload)
+
+
+@app.post("/api/profile/application-answer", response_model=CandidateProfile)
+def remember_application_answer(payload: ApplicationAnswerUpdate) -> CandidateProfile:
+    try:
+        return save_application_answer(payload.question, payload.field_name, payload.value)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/resumes", response_model=list[ResumeRecord])

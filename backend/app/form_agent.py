@@ -92,12 +92,18 @@ def _direct_profile_value(field: PageField, profile: CandidateProfile) -> tuple[
         (("graduat", "expected month", "毕业时间", "毕业日期", "毕业年月"),
          education.end_date if education else "", "主档案.education.end_date"),
         (("gpa", "绩点"), education.gpa if education else "", "主档案.education.gpa"),
+        (("qq", "qq号", "qq号码", "qq account"), profile.qq, "主档案.qq"),
         (("wechat", "weixin", "微信"), profile.wechat, "主档案.wechat"),
         (("full name", "legal name", "candidate name", "姓名", "名字"), profile.name, "主档案.name"),
     )
     for hints, value, source in mappings:
         if value and any(hint in label for hint in hints):
             return str(value), source
+    normalized_label = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", field.label.casefold())
+    for question, value in profile.application_answers.items():
+        normalized_question = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", question.casefold())
+        if value and normalized_question and normalized_question == normalized_label:
+            return value, f"主档案.application_answers.{question}"
     return "", ""
 
 

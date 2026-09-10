@@ -3,10 +3,10 @@ export type Project = { name:string; role:string; start_date:string; end_date:st
 export type Education = { school:string; college:string; degree:string; major:string; start_date:string; end_date:string; gpa:string; ranking:string; courses:string[]; description:string; current:boolean }
 export type ResumeProfile = {
   name:string; english_name:string; gender:'男'|'女'|'其他'|'未识别'; birth_date:string; age:number|null;
-  phone:string; email:string; wechat:string; location:string; hometown:string; website:string; github:string; linkedin:string;
+  phone:string; email:string; qq:string; wechat:string; location:string; hometown:string; website:string; github:string; linkedin:string;
   target_role:string; target_industries:string[]; target_cities:string[]; available_date:string; internship_duration:string;
   days_per_week:string; expected_salary:string; remote_preference:string; summary:string;
-  education:Education[]; internships:Experience[]; projects:Project[]; skills:string[]; languages:string[]; certificates:string[]; awards:string[];
+  education:Education[]; internships:Experience[]; projects:Project[]; skills:string[]; languages:string[]; certificates:string[]; awards:string[]; application_answers:Record<string,string>;
 }
 export type CandidateProfile = ResumeProfile & { id:string; created_at:string|null; updated_at:string|null }
 export type Evidence = { id:string; field_path:string; value:unknown; confidence:number; source_text:string; source_page:number|null; status:'pending_review'|'confirmed'|'edited'|'rejected' }

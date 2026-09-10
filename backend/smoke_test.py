@@ -67,6 +67,17 @@ local_plan = _local_safe_plan(
 assert [action.action for action in local_plan.actions] == ["fill", "fill", "ask_user", "skip"]
 assert local_plan.actions[2].sensitive
 
+learned_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="learned", url="https://careers.example/apply", title="Test", fields=[
+        PageField(selector="[data-zhida-field=qq]", label="QQ号", name="qq", required=True),
+        PageField(selector="[data-zhida-field=community]", label="你最常参与的技术社区", name="community"),
+    ]),
+    CandidateProfile(qq="12345678", application_answers={"你最常参与的技术社区": "GitHub"}),
+)
+assert [action.value for action in learned_plan.actions] == ["12345678", "GitHub"]
+assert learned_plan.actions[0].value_source == "主档案.qq"
+assert learned_plan.actions[1].value_source.startswith("主档案.application_answers")
+
 
 class UnavailableExtractor:
     name = "unavailable-test-provider"
@@ -93,6 +104,21 @@ with TemporaryDirectory() as temporary:
         assert client.get("/api/health").json()["product"] == "Zhida"
         initial = client.get("/api/profile")
         assert initial.status_code == 200
+
+        remembered_qq = client.post("/api/profile/application-answer", json={
+            "question": "QQ号", "field_name": "candidate_qq", "value": "12345678",
+        })
+        assert remembered_qq.status_code == 200
+        assert remembered_qq.json()["qq"] == "12345678"
+        remembered_custom = client.post("/api/profile/application-answer", json={
+            "question": "你最常参与的技术社区", "field_name": "community", "value": "GitHub",
+        })
+        assert remembered_custom.status_code == 200
+        assert remembered_custom.json()["application_answers"]["你最常参与的技术社区"] == "GitHub"
+        rejected_sensitive = client.post("/api/profile/application-answer", json={
+            "question": "是否同意隐私条款", "field_name": "consent", "value": "是",
+        })
+        assert rejected_sensitive.status_code == 422
 
         first_text = (
             "姓名：李春博\n性别：男\n年龄：24\n邮箱：first@example.com\n"

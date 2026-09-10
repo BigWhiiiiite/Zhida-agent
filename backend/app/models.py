@@ -58,6 +58,7 @@ class ResumeProfile(BaseModel):
     age: int | None = None
     phone: str = ""
     email: str = ""
+    qq: str = ""
     wechat: str = ""
     location: str = ""
     hometown: str = ""
@@ -80,12 +81,19 @@ class ResumeProfile(BaseModel):
     languages: list[str] = Field(default_factory=list)
     certificates: list[str] = Field(default_factory=list)
     awards: list[str] = Field(default_factory=list)
+    application_answers: dict[str, str] = Field(default_factory=dict)
 
 
 class CandidateProfile(ResumeProfile):
     id: str = "default"
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class ApplicationAnswerUpdate(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    field_name: str = Field(default="", max_length=500)
+    value: str = Field(min_length=1, max_length=5000)
 
 
 class FieldEvidence(BaseModel):

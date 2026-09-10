@@ -9,11 +9,52 @@ from .storage import create_conflict, get_profile, get_resume, save_profile, upd
 
 
 SCALAR_FIELDS = [
-    "name", "english_name", "gender", "birth_date", "age", "phone", "email", "wechat",
+    "name", "english_name", "gender", "birth_date", "age", "phone", "email", "qq", "wechat",
     "location", "hometown", "website", "github", "linkedin", "target_role", "available_date",
     "internship_duration", "days_per_week", "expected_salary", "remote_preference", "summary",
 ]
 LIST_FIELDS = ["skills", "languages", "certificates", "awards", "target_industries", "target_cities"]
+
+NON_REUSABLE_ANSWER_HINTS = (
+    "consent", "agree", "privacy", "terms", "legal", "declaration", "authorization", "visa",
+    "sponsorship", "salary", "compensation", "gender", "sex", "race", "ethnicity", "disability",
+    "veteran", "referral", "available", "availability", "work permit", "right to work",
+    "同意", "隐私", "条款", "声明", "工作许可", "签证", "担保", "薪资", "薪酬", "性别",
+    "种族", "族裔", "残障", "退伍", "调剂", "内推", "政治面貌", "户口", "婚姻", "身份证",
+    "到岗", "可入职",
+)
+
+
+def _answer_profile_field(question: str, field_name: str) -> str:
+    description = f"{question} {field_name}".casefold()
+    mappings = (
+        (("qq", "qq号", "qq号码", "qq account"), "qq"),
+        (("wechat", "weixin", "微信"), "wechat"),
+        (("email", "e-mail", "邮箱", "电子邮件"), "email"),
+        (("phone", "mobile", "telephone", "手机", "电话"), "phone"),
+        (("linkedin",), "linkedin"),
+        (("github",), "github"),
+        (("portfolio", "personal website", "个人网站", "作品集"), "website"),
+    )
+    return next((field for hints, field in mappings if any(hint in description for hint in hints)), "")
+
+
+def save_application_answer(question: str, field_name: str, value: str):
+    """Persist an explicit reusable answer without learning legal/sensitive decisions."""
+    cleaned_question = re.sub(r"\s+", " ", question).strip().strip("*✱ ")
+    cleaned_value = value.strip()
+    description = f"{cleaned_question} {field_name}".casefold()
+    if any(hint in description for hint in NON_REUSABLE_ANSWER_HINTS):
+        raise ValueError("这类敏感或本次申请答案不会保存到可复用主档案")
+    if not cleaned_question or not cleaned_value:
+        raise ValueError("问题和答案不能为空")
+    current = ResumeProfile.model_validate(get_profile().model_dump())
+    direct_field = _answer_profile_field(cleaned_question, field_name)
+    if direct_field:
+        setattr(current, direct_field, cleaned_value)
+    else:
+        current.application_answers[cleaned_question] = cleaned_value
+    return save_profile(current)
 
 
 def detect_language(text: str) -> str:

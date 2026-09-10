@@ -16,6 +16,7 @@ async function result<T>(response:Response):Promise<T>{
 export const api={
   profile:()=>fetch(`${API}/profile`).then(result<CandidateProfile>),
   saveProfile:(profile:ResumeProfile)=>fetch(`${API}/profile`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(profile)}).then(result<CandidateProfile>),
+  saveApplicationAnswer:(question:string,field_name:string,value:string)=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value})}).then(result<CandidateProfile>),
   list:()=>fetch(`${API}/resumes`).then(result<ResumeRecord[]>),
   upload:(file:File)=>{const data=new FormData();data.append('file',file);return fetch(`${API}/resumes`,{method:'POST',body:data}).then(result<ResumeRecord>)},
   saveResume:(id:string,patch:Partial<ResumeRecord>)=>fetch(`${API}/resumes/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(result<ResumeRecord>),
