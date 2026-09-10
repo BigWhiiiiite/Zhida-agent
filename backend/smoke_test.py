@@ -68,6 +68,49 @@ local_plan = _local_safe_plan(
 assert [action.action for action in local_plan.actions] == ["fill", "fill", "ask_user", "skip"]
 assert local_plan.actions[2].sensitive
 
+relationship_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="relationship", url="https://careers.example/apply", title="Test", fields=[
+        PageField(selector="[data-zhida-field=emergency-name]", label="紧急联系人姓名", required=True),
+        PageField(selector="[data-zhida-field=emergency-phone]", label="紧急联系人电话", required=True),
+    ]),
+    CandidateProfile(name="候选人本人", phone="13800138000"),
+)
+assert [action.action for action in relationship_plan.actions] == ["ask_user", "ask_user"]
+assert all(action.sensitive and not action.value for action in relationship_plan.actions)
+
+decision_fields = [
+    PageField(selector="[data-zhida-field=transfer-yes]", label="是否接受调剂 — 是", name="transfer",
+              field_type="radio", group_label="是否接受调剂", option_label="是", option_value="yes",
+              options=["是", "否"], required=True),
+    PageField(selector="[data-zhida-field=transfer-no]", label="是否接受调剂 — 否", name="transfer",
+              field_type="radio", group_label="是否接受调剂", option_label="否", option_value="no",
+              options=["是", "否"], required=True),
+]
+decision_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="decision", url="https://careers.example/apply", title="Test",
+                    fields=decision_fields),
+    CandidateProfile(),
+)
+assert [action.action for action in decision_plan.actions] == ["ask_user", "ask_user"]
+remembered_decision = _local_safe_plan(
+    BrowserSnapshot(session_id="decision", url="https://careers.example/apply", title="Test",
+                    fields=decision_fields),
+    CandidateProfile(application_answers={"是否接受调剂": "否"}),
+)
+assert [action.action for action in remembered_decision.actions] == ["skip", "check"]
+assert remembered_decision.actions[1].user_confirmed
+
+education_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="education", url="https://careers.example/apply", title="Test", fields=[
+        PageField(selector="[data-zhida-field=level]", label="最高学历", field_type="select-one",
+                  options=["高中", "大学专科", "大学本科", "硕士研究生"]),
+        PageField(selector="[data-zhida-field=degree]", label="学位", field_type="select-one",
+                  options=["学士", "硕士", "博士"]),
+    ]),
+    CandidateProfile(education=[Education(school="Test University", degree="本科")]),
+)
+assert [action.value for action in education_plan.actions] == ["大学本科", "学士"]
+
 learned_plan = _local_safe_plan(
     BrowserSnapshot(session_id="learned", url="https://careers.example/apply", title="Test", fields=[
         PageField(selector="[data-zhida-field=qq]", label="QQ号", name="qq", required=True),
@@ -86,6 +129,14 @@ graduating_profile = CandidateProfile(
 graduating_jobs = recommendation_batch(graduating_profile).jobs
 baidu_agent = next(item for item in graduating_jobs if item.job.job_code == "J101017")
 assert baidu_agent.graduation_match is True
+
+shenzhen_batch = recommendation_batch(graduating_profile, "深圳市")
+assert shenzhen_batch.selected_location == "深圳"
+assert "深圳" in shenzhen_batch.available_locations
+assert shenzhen_batch.jobs
+assert all(item.location_match is True for item in shenzhen_batch.jobs)
+assert all(any("深圳" in location for location in item.job.locations) for item in shenzhen_batch.jobs)
+assert all(any("所选城市：深圳" in reason for reason in item.reasons) for item in shenzhen_batch.jobs)
 
 
 class UnavailableExtractor:
@@ -111,6 +162,15 @@ with TemporaryDirectory() as temporary:
 
     with TestClient(main.app) as client:
         assert client.get("/api/health").json()["product"] == "Zhida"
+        assert client.get("/api/profile").status_code == 401
+        registered = client.post("/api/auth/register", json={
+            "email": "alice@example.com", "password": "Alice-pass-2026", "display_name": "Alice",
+        })
+        assert registered.status_code == 201, registered.text
+        assert registered.json()["user"]["email"] == "alice@example.com"
+        assert "password" not in registered.text.lower()
+        assert "httponly" in registered.headers["set-cookie"].lower()
+        assert client.get("/api/auth/me").json()["display_name"] == "Alice"
         original_health_check = main.check_model_health
         main.check_model_health = lambda: asyncio.sleep(0, result=ModelHealth(
             status="ok", model="test-model", latency_ms=12, message="主模型当前可用"
@@ -150,6 +210,24 @@ with TemporaryDirectory() as temporary:
         assert first_json["profile"]["name"] == "李春博"
         assert first_json["evidence"]
 
+        assert client.post("/api/auth/logout").status_code == 204
+        bob = client.post("/api/auth/register", json={
+            "email": "bob@example.com", "password": "Bob-pass-2026", "display_name": "Bob",
+        })
+        assert bob.status_code == 201, bob.text
+        assert client.get("/api/resumes").json() == []
+        assert client.get("/api/profile").json()["email"] == ""
+        assert client.get(f"/api/resumes/{first_json['id']}").status_code == 404
+        assert client.post("/api/auth/logout").status_code == 204
+        assert client.post("/api/auth/login", json={
+            "email": "alice@example.com", "password": "incorrect-password",
+        }).status_code == 401
+        signed_in = client.post("/api/auth/login", json={
+            "email": "ALICE@example.com", "password": "Alice-pass-2026",
+        })
+        assert signed_in.status_code == 200, signed_in.text
+        assert client.get("/api/resumes").json()[0]["id"] == first_json["id"]
+
         duplicate = client.post("/api/resumes", files={"file": ("copy.txt", first_text, "text/plain")})
         assert duplicate.status_code == 409
 
@@ -165,6 +243,13 @@ with TemporaryDirectory() as temporary:
         assert scores == sorted(scores, reverse=True)
         assert all(item["reasons"] for item in recommendation_json["jobs"])
         assert all(item["job"]["source_url"].startswith("https://") for item in recommendation_json["jobs"])
+
+        shenzhen_recommendations = client.get("/api/jobs/recommendations", params={"location": "深圳"})
+        assert shenzhen_recommendations.status_code == 200
+        shenzhen_json = shenzhen_recommendations.json()
+        assert shenzhen_json["selected_location"] == "深圳"
+        assert shenzhen_json["jobs"]
+        assert all("深圳" in item["job"]["locations"] for item in shenzhen_json["jobs"])
 
         first_job_id = recommendation_json["jobs"][0]["job"]["id"]
         queued = client.post("/api/jobs/queue", json={"job_ids": [first_job_id], "resume_id": first_json["id"]})

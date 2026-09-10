@@ -23,10 +23,13 @@
 .profile-warning small { font-size: 9px; margin-top: 3px; }
 .recommendation-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 15px; }
 .recommendation-filters { display: flex; align-items: center; gap: 8px; }
+.recommendation-filters label { display: flex; flex-direction: column; gap: 4px; }
+.recommendation-filters label > span { color: var(--muted); font-size: 8px; font-weight: 700; }
 .recommendation-filters select, .queue-resume select {
   border: 1px solid var(--line); background: #fff; color: #263a30;
   border-radius: 8px; padding: 9px 10px; font-size: 10px;
 }
+.job-empty { grid-column: 1 / -1; min-height: 210px; }
 .batch-bar {
   display: flex; align-items: center; gap: 12px; background: #f4f7f1;
   border-radius: 10px; padding: 10px 12px; margin-top: 18px;

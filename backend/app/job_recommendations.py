@@ -205,15 +205,21 @@ def _match_graduation(profile: CandidateProfile, job: JobPosting) -> bool | None
     return start <= graduation <= end
 
 
-def _match_location(profile: CandidateProfile, job: JobPosting) -> bool | None:
-    targets = [item.replace("市", "").strip().lower() for item in profile.target_cities if item.strip()]
+def _normalize_location(value: str) -> str:
+    return value.replace("市", "").strip().lower()
+
+
+def _match_location(profile: CandidateProfile, job: JobPosting, preferred_location: str = "") -> bool | None:
+    selected = _normalize_location(preferred_location)
+    targets = ([selected] if selected else
+               [_normalize_location(item) for item in profile.target_cities if item.strip()])
     if not targets:
         return None
-    locations = [item.replace("市", "").strip().lower() for item in job.locations]
+    locations = [_normalize_location(item) for item in job.locations]
     return any(target in location or location in target for target in targets for location in locations)
 
 
-def _score(profile: CandidateProfile, job: JobPosting) -> JobRecommendation:
+def _score(profile: CandidateProfile, job: JobPosting, preferred_location: str = "") -> JobRecommendation:
     corpus = _profile_corpus(profile)
     matched_required = [skill for skill in job.required_skills if _has_skill(skill, corpus)]
     matched_preferred = [skill for skill in job.preferred_skills if _has_skill(skill, corpus)]
@@ -223,7 +229,7 @@ def _score(profile: CandidateProfile, job: JobPosting) -> JobRecommendation:
     target = profile.target_role.lower()
     role_match = bool(target and any(keyword.lower() in target or keyword.lower() in corpus
                                      for keyword in job.role_keywords))
-    location_match = _match_location(profile, job)
+    location_match = _match_location(profile, job, preferred_location)
     graduation_match = _match_graduation(profile, job)
 
     required_ratio = len(matched_required) / max(1, len(job.required_skills))
@@ -240,7 +246,8 @@ def _score(profile: CandidateProfile, job: JobPosting) -> JobRecommendation:
     if role_match:
         reasons.append("目标岗位与该职位方向一致")
     if location_match:
-        reasons.append("工作地点符合目标城市")
+        reasons.append(f"工作地点包含所选城市：{preferred_location}" if preferred_location else
+                       "工作地点符合目标城市")
     if graduation_match:
         reasons.append("毕业时间符合 2027 届校招窗口")
     if missing:
@@ -256,15 +263,29 @@ def _score(profile: CandidateProfile, job: JobPosting) -> JobRecommendation:
                              queue_track=track)
 
 
-def recommendation_batch(profile: CandidateProfile) -> RecommendationBatch:
-    jobs = sorted((_score(profile, job) for job in JOB_CATALOG),
+def recommendation_batch(profile: CandidateProfile, preferred_location: str = "") -> RecommendationBatch:
+    available_locations = list(dict.fromkeys(
+        location for job in JOB_CATALOG for location in job.locations if location.strip()
+    ))
+    selected_location = next(
+        (location for location in available_locations
+         if _normalize_location(location) == _normalize_location(preferred_location)), ""
+    ) if preferred_location.strip() else ""
+    recommendations = [_score(profile, job, selected_location) for job in JOB_CATALOG]
+    if selected_location:
+        recommendations = [item for item in recommendations if item.location_match is True]
+    jobs = sorted(recommendations,
                   key=lambda item: (item.match_score, item.job.source_status == "verified"), reverse=True)
     year = _graduation_year(profile)
     summary_parts = [profile.target_role or "未设置目标岗位", f"{len(profile.skills)} 项技能"]
     if year:
         summary_parts.append(f"预计 {year} 年毕业")
+    if selected_location:
+        summary_parts.append(f"工作地点：{selected_location}")
     return RecommendationBatch(generated_at=datetime.now(timezone.utc), engine="local-explainable-v1",
-                               profile_summary=" · ".join(summary_parts), jobs=jobs)
+                               profile_summary=" · ".join(summary_parts),
+                               available_locations=available_locations,
+                               selected_location=selected_location, jobs=jobs)
 
 
 def _recommendation_by_id(profile: CandidateProfile, job_id: str) -> JobRecommendation | None:

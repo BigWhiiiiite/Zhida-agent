@@ -1,0 +1,39 @@
+.action-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.action-heading > div {
+  display: flex;
+  gap: 5px;
+}
+
+.action-heading button {
+  border: 1px solid var(--line);
+  background: #fff;
+  color: #52645a;
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 8px;
+}
+
+.action-heading button:last-child {
+  color: #8d5b2b;
+}
+
+.answer-row select {
+  min-height: 36px;
+}
+
+.preflight.pending > div strong {
+  color: #765528;
+}
+
+@media (max-width: 760px) {
+  .action-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

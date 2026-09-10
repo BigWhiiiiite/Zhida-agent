@@ -48,6 +48,8 @@ class RecommendationBatch(BaseModel):
     generated_at: datetime
     engine: str
     profile_summary: str
+    available_locations: list[str] = Field(default_factory=list)
+    selected_location: str = ""
     jobs: list[JobRecommendation]
 
 
@@ -64,4 +66,3 @@ class ApplicationQueueItem(BaseModel):
     created_at: datetime
     updated_at: datetime
     recommendation: JobRecommendation
-

@@ -9,10 +9,16 @@ export type ResumeProfile = {
   education:Education[]; internships:Experience[]; projects:Project[]; skills:string[]; languages:string[]; certificates:string[]; awards:string[]; application_answers:Record<string,string>;
 }
 export type CandidateProfile = ResumeProfile & { id:string; created_at:string|null; updated_at:string|null }
+export type UserAccount = { id:string; email:string; display_name:string; created_at:string }
+export type AuthSession = { user:UserAccount }
 export type Evidence = { id:string; field_path:string; value:unknown; confidence:number; source_text:string; source_page:number|null; status:'pending_review'|'confirmed'|'edited'|'rejected' }
 export type ResumeRecord = { id:string; filename:string; label:string; profile:ResumeProfile; parser:string; status:string; language:string; tags:string[]; target_role:string; is_default:boolean; file_size:number; content_hash:string; error_message:string; evidence:Evidence[]; created_at:string; updated_at:string }
 export type Conflict = { id:string; field_path:string; current_value:unknown; incoming_value:unknown; resume_id:string; resume_label:string; status:string; resolution:unknown; created_at:string }
-export type PageField = { selector:string; label:string; name:string; field_type:string; required:boolean; options:string[]; current_value:string; accept:string }
+export type PageField = {
+  selector:string; label:string; name:string; field_type:string; required:boolean; options:string[];
+  current_value:string; accept:string; role:string; group_label:string; option_label:string;
+  option_value:string; multiple:boolean; readonly:boolean; section:string;
+}
 export type BrowserSnapshot = { session_id:string; url:string; title:string; fields:PageField[] }
 export type WorkflowStage = 'job_detail'|'auth_required'|'verification_required'|'profile_form'|'application_form'|'review'|'unknown'
 export type WorkflowAction = { intent:'start_application'|'manual_login'|'request_phone_code'|'request_email_code'|'enter_verification'|'analyze_form'|'refresh'; label:string; automated:boolean; requires_user:boolean }
@@ -24,5 +30,5 @@ export type PreSubmitCheck = { url:string; ready:boolean; required_total:number;
 export type ExecutionResult = { url:string; completed:number; skipped:number; failed:number; verified:number; unverified:number; results:{selector:string;label:string;status:string;message:string;verified:boolean;actual_value:string}[]; pre_submit:PreSubmitCheck }
 export type JobPosting = { id:string; company:string; title:string; job_code:string; locations:string[]; recruitment_type:string; graduation_window:string; education_requirement:string; description:string; required_skills:string[]; preferred_skills:string[]; role_keywords:string[]; url:string; source_name:string; source_url:string; source_status:'verified'|'verify_on_open'; apply_mode:'direct'|'search'; verified_at:string }
 export type JobRecommendation = { job:JobPosting; match_score:number; matched_skills:string[]; missing_skills:string[]; reasons:string[]; location_match:boolean|null; graduation_match:boolean|null; queue_track:'steady'|'stretch' }
-export type RecommendationBatch = { generated_at:string; engine:string; profile_summary:string; jobs:JobRecommendation[] }
+export type RecommendationBatch = { generated_at:string; engine:string; profile_summary:string; available_locations:string[]; selected_location:string; jobs:JobRecommendation[] }
 export type ApplicationQueueItem = { id:string; job_id:string; resume_id:string; status:'planned'|'in_progress'|'needs_review'; created_at:string; updated_at:string; recommendation:JobRecommendation }

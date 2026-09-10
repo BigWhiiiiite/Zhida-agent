@@ -1,6 +1,8 @@
-import type { ApplicationQueueItem, ApplicationWorkflowState, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, PreSubmitCheck, RecommendationBatch, ResumeProfile, ResumeRecord } from './types'
+import type { ApplicationQueueItem, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, PreSubmitCheck, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
 
-export const API = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api'
+export const API = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/api`
+const nativeFetch=window.fetch.bind(window)
+const fetch=(input:RequestInfo|URL,init:RequestInit={})=>nativeFetch(input,{...init,credentials:'include'})
 
 export class ApiError extends Error{
   status:number; detail:unknown
@@ -14,10 +16,14 @@ async function result<T>(response:Response):Promise<T>{
 }
 
 export const api={
+  me:()=>fetch(`${API}/auth/me`).then(result<UserAccount>),
+  register:(email:string,password:string,display_name:string)=>fetch(`${API}/auth/register`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password,display_name})}).then(result<AuthSession>),
+  login:(email:string,password:string)=>fetch(`${API}/auth/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})}).then(result<AuthSession>),
+  logout:()=>fetch(`${API}/auth/logout`,{method:'POST'}).then(result<void>),
   profile:()=>fetch(`${API}/profile`).then(result<CandidateProfile>),
   saveProfile:(profile:ResumeProfile)=>fetch(`${API}/profile`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(profile)}).then(result<CandidateProfile>),
   saveApplicationAnswer:(question:string,field_name:string,value:string)=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value})}).then(result<CandidateProfile>),
-  recommendations:()=>fetch(`${API}/jobs/recommendations`).then(result<RecommendationBatch>),
+  recommendations:(location='')=>fetch(`${API}/jobs/recommendations${location?`?location=${encodeURIComponent(location)}`:''}`).then(result<RecommendationBatch>),
   jobQueue:()=>fetch(`${API}/jobs/queue`).then(result<ApplicationQueueItem[]>),
   queueJobs:(job_ids:string[],resume_id:string)=>fetch(`${API}/jobs/queue`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids,resume_id})}).then(result<ApplicationQueueItem[]>),
   removeQueuedJob:(id:string)=>fetch(`${API}/jobs/queue/${id}`,{method:'DELETE'}).then(result<void>),

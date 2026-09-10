@@ -18,6 +18,13 @@ class PageField(BaseModel):
     options: list[str] = Field(default_factory=list)
     current_value: str = ""
     accept: str = ""
+    role: str = ""
+    section: str = ""
+    group_label: str = ""
+    option_label: str = ""
+    option_value: str = ""
+    multiple: bool = False
+    readonly: bool = False
 
 
 class BrowserSnapshot(BaseModel):

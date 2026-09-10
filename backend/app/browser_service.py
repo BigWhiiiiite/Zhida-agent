@@ -22,6 +22,13 @@ SENSITIVE_FIELD_HINTS = {
     "gender", "sex", "race", "ethnicity", "disability", "veteran", "consent", "agree", "agreement",
     "privacy", "terms", "legal", "work permit", "right to work",
     "性别", "薪资", "期望薪资", "签证", "担保", "工作许可", "残障", "退伍", "族裔", "种族", "同意", "隐私", "条款", "法律声明",
+    "emergency contact", "next of kin", "guardian", "referee", "recommender",
+    "紧急联系人", "紧急联络人", "家属联系人", "监护人", "推荐人", "证明人",
+}
+
+MANUAL_CONFIRM_FIELD_HINTS = {
+    "是否", "愿意", "调剂", "服从分配", "意向事业群", "感兴趣的事业群", "志愿", "偏好",
+    "would you", "are you willing", "preference", "preferred business", "business group", "relocate",
 }
 
 
@@ -131,30 +138,94 @@ class BrowserDemoService:
             return clean(explicit?.innerText || wrapping?.innerText || labelledBy(el) ||
               el.getAttribute('aria-label') || groupLabel || el.getAttribute('placeholder') || el.getAttribute('name'));
           };
-          const elements = [...document.querySelectorAll('input, select, textarea')]
-            .filter(el => !['hidden','submit','button','image','reset','password'].includes((el.type || '').toLowerCase()))
-            .filter(el => !el.disabled && (el.type === 'file' || el.getClientRects().length > 0));
+          const groupLabelFor = el => {
+            const group = el.closest('.application-question, .application-additional, fieldset, [role="group"], .form-field, .field');
+            return clean(group?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"], label')?.innerText);
+          };
+          const optionLabelFor = el => {
+            const explicit = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
+            return clean(explicit?.innerText || el.closest('label')?.innerText || el.getAttribute('aria-label') || el.value);
+          };
+          const sectionFor = el => {
+            const section = el.closest('fieldset, section, [role="group"], .application-section, .form-section');
+            const heading = section?.querySelector('legend, h1, h2, h3, h4, [role="heading"]');
+            return clean(heading?.innerText);
+          };
+          const candidates = [...document.querySelectorAll(
+            'input, select, textarea, [role="combobox"], [aria-haspopup="listbox"]'
+          )];
+          const elements = [...new Set(candidates)]
+            .filter(el => {
+              const role = (el.getAttribute('role') || '').toLowerCase();
+              const type = (el.type || '').toLowerCase();
+              const customSelect = role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox';
+              if (!customSelect && ['hidden','submit','button','image','reset','password'].includes(type)) return false;
+              if (!customSelect && el.closest('[role="combobox"], [aria-haspopup="listbox"]')) return false;
+              return !el.disabled && (type === 'file' || el.getClientRects().length > 0);
+            });
           return elements.map((el, index) => {
             const marker = el.getAttribute('data-zhida-field') ||
               `zhida-${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`;
             el.setAttribute('data-zhida-field', marker);
             const label = labelFor(el).slice(0, 500);
+            const role = (el.getAttribute('role') || '').toLowerCase();
+            const customSelect = role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox';
+            const fieldType = customSelect ? 'combobox' : (el.type || el.tagName).toLowerCase();
             let options = el.tagName === 'SELECT' ? [...el.options].map(o => clean(o.text)).filter(Boolean) : [];
             if (['radio', 'checkbox'].includes(el.type) && el.name) {
               options = [...document.querySelectorAll(`input[name="${CSS.escape(el.name)}"]`)]
                 .map(item => clean(item.closest('label')?.innerText || item.value)).filter(Boolean);
             }
+            if (customSelect) {
+              const controlled = (el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '')
+                .split(/\\s+/).map(id => document.getElementById(id)).filter(Boolean);
+              const localOptions = controlled.flatMap(root => [...root.querySelectorAll('[role="option"], option')]);
+              options = localOptions.map(item => clean(item.innerText || item.textContent || item.value)).filter(Boolean);
+            }
             return {
               selector: `[data-zhida-field="${marker}"]`, label,
-              name: el.getAttribute('name') || '', field_type: (el.type || el.tagName).toLowerCase(),
+              name: el.getAttribute('name') || el.getAttribute('id') || '', field_type: fieldType,
               required: el.required || el.getAttribute('aria-required') === 'true' || /[*✱]/.test(label), options,
               current_value: el.type === 'file' ? [...(el.files || [])].map(file => file.name).join(', ') :
-                (['checkbox','radio'].includes(el.type) ? String(el.checked) : String(el.value || '')),
-              accept: el.getAttribute('accept') || ''
+                (['checkbox','radio'].includes(el.type) ? String(el.checked) :
+                  clean(el.value || el.getAttribute('aria-valuetext') || (customSelect ? el.innerText : ''))),
+              accept: el.getAttribute('accept') || '', role,
+              group_label: groupLabelFor(el).slice(0, 500),
+              option_label: ['radio','checkbox'].includes(el.type) ? optionLabelFor(el).slice(0, 500) : '',
+              option_value: ['radio','checkbox'].includes(el.type) ? clean(el.value) : '',
+              multiple: Boolean(el.multiple || el.getAttribute('aria-multiselectable') === 'true'),
+              readonly: Boolean(el.readOnly || el.getAttribute('aria-readonly') === 'true'),
+              section: sectionFor(el).slice(0, 500)
             };
           });
         }
         """)
+        # Component libraries often render options only after the combobox opens.
+        # Opening a list is read-only and lets the review UI present the real choices.
+        for item in data:
+            if item.get("field_type") != "combobox" or item.get("options"):
+                continue
+            try:
+                locator = self.page.locator(item["selector"]).first
+                await locator.click(timeout=1800)
+                await self.page.wait_for_timeout(180)
+                item["options"] = await self.page.evaluate("""
+                marker => {
+                  const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                  const el = document.querySelector(`[data-zhida-field="${CSS.escape(marker)}"]`);
+                  const ids = (el?.getAttribute('aria-controls') || el?.getAttribute('aria-owns') || '')
+                    .split(/\\s+/).filter(Boolean);
+                  const controlled = ids.map(id => document.getElementById(id)).filter(Boolean)
+                    .flatMap(root => [...root.querySelectorAll('[role="option"], option')]);
+                  const visible = [...document.querySelectorAll('[role="option"], [role="listbox"] option')]
+                    .filter(option => option.getClientRects().length > 0);
+                  return [...new Set([...controlled, ...visible])]
+                    .map(option => clean(option.innerText || option.textContent || option.value)).filter(Boolean);
+                }
+                """, item["selector"].split('"')[1])
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                item["options"] = item.get("options", [])
         fields = [PageField.model_validate(item) for item in data]
         return BrowserSnapshot(session_id=self.session_id, url=self.page.url, title=await self.page.title(), fields=fields)
 
@@ -173,9 +244,15 @@ class BrowserDemoService:
             return clean(explicit?.innerText || question?.querySelector('.application-label, legend, .question-label')?.innerText ||
               el.closest('label')?.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name);
           };
-          const candidates = [...document.querySelectorAll('input, select, textarea')]
-            .filter(el => !el.disabled && !['hidden','submit','button','image','reset','password'].includes((el.type || '').toLowerCase()))
-            .filter(el => el.type === 'file' || el.getClientRects().length > 0);
+          const candidates = [...new Set(document.querySelectorAll(
+            'input, select, textarea, [role="combobox"], [aria-haspopup="listbox"]'
+          ))].filter(el => {
+            const customSelect = el.getAttribute('role') === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox';
+            const type = (el.type || '').toLowerCase();
+            if (!customSelect && ['hidden','submit','button','image','reset','password'].includes(type)) return false;
+            if (!customSelect && el.closest('[role="combobox"], [aria-haspopup="listbox"]')) return false;
+            return !el.disabled && (type === 'file' || el.getClientRects().length > 0);
+          });
           let filledCount = 0;
           let requiredTotal = 0;
           const missing = [];
@@ -185,12 +262,17 @@ class BrowserDemoService:
             const label = labelFor(el).slice(0, 500);
             const required = el.required || el.getAttribute('aria-required') === 'true' || /[*✱]/.test(label);
             let filled = false;
+            const customSelect = el.getAttribute('role') === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox';
             if (el.type === 'file') filled = Boolean(el.files?.length);
             else if (el.type === 'radio') {
               if (handledRadioNames.has(el.name)) continue;
               handledRadioNames.add(el.name);
               filled = [...document.querySelectorAll(`input[name="${CSS.escape(el.name)}"]`)].some(item => item.checked);
             } else if (el.type === 'checkbox') filled = el.checked;
+            else if (customSelect) {
+              const value = clean(el.value || el.getAttribute('aria-valuetext') || el.innerText);
+              filled = Boolean(value) && !/^(select|choose|请选择|请选择一项|暂未选择)[.\s…]*$/i.test(value);
+            }
             else filled = clean(el.value).length > 0;
             if (filled) filledCount += 1;
             if (required) {
@@ -253,11 +335,14 @@ class BrowserDemoService:
                                                 status="failed", message=str(exc)[:240]))
         for action in request.actions:
             field = fields.get(action.selector)
-            field_description = f"{field.label} {field.name}".lower() if field else ""
+            field_description = " ".join(filter(None, (
+                field.section, field.group_label, field.label, field.name
+            ))).lower() if field else ""
             deterministically_sensitive = any(hint in field_description for hint in SENSITIVE_FIELD_HINTS)
+            deterministically_manual = any(hint in field_description for hint in MANUAL_CONFIRM_FIELD_HINTS)
             compatible = bool(field) and (
-                (action.action == "fill" and field.field_type not in {"checkbox", "radio", "select-one", "select-multiple"})
-                or (action.action == "select" and field.field_type in {"select-one", "select-multiple"})
+                (action.action == "fill" and field.field_type not in {"checkbox", "radio", "select-one", "select-multiple", "combobox"})
+                or (action.action == "select" and field.field_type in {"select-one", "select-multiple", "combobox"})
                 or (action.action == "check" and field.field_type in {"checkbox", "radio"})
             )
             unsafe = (
@@ -267,6 +352,7 @@ class BrowserDemoService:
                 or (action.action in {"fill", "select"} and not str(action.value).strip())
                 or (action.sensitive and not action.user_confirmed)
                 or (deterministically_sensitive and not action.user_confirmed)
+                or (deterministically_manual and not action.user_confirmed)
                 or action.confidence < request.min_confidence
             )
             if unsafe:
@@ -278,10 +364,20 @@ class BrowserDemoService:
                 if action.action == "fill":
                     await locator.fill(str(action.value), timeout=8000)
                 elif action.action == "select":
-                    try:
-                        await locator.select_option(label=str(action.value), timeout=8000)
-                    except Exception:
-                        await locator.select_option(value=str(action.value), timeout=8000)
+                    values = [part.strip() for part in str(action.value).split(",") if part.strip()]
+                    if field.field_type == "combobox":
+                        for value in values[:20]:
+                            await locator.click(timeout=8000)
+                            option = self.page.get_by_role("option", name=value, exact=True)
+                            if not await option.count():
+                                option = self.page.get_by_text(value, exact=True)
+                            await option.first.click(timeout=8000)
+                    else:
+                        labels = values if field.multiple else (values[0] if values else str(action.value))
+                        try:
+                            await locator.select_option(label=labels, timeout=8000)
+                        except Exception:
+                            await locator.select_option(value=labels, timeout=8000)
                 elif action.action == "check":
                     await locator.set_checked(bool(action.value), timeout=8000)
                 if field.field_type in {"checkbox", "radio"}:
@@ -290,10 +386,18 @@ class BrowserDemoService:
                     verified = actual.strip() == expected.strip()
                 elif field.field_type in {"select-one", "select-multiple"}:
                     actual_value = await locator.input_value()
-                    selected_text = (await locator.locator("option:checked").first.text_content() or "").strip()
+                    selected_text = ", ".join(item.strip() for item in
+                                              await locator.locator("option:checked").all_text_contents())
                     actual = selected_text or actual_value
                     expected = str(action.value)
-                    verified = expected.strip() in {actual_value.strip(), selected_text}
+                    expected_values = [part.strip() for part in expected.split(",") if part.strip()]
+                    verified = all(value in {actual_value.strip(), selected_text} or value in selected_text
+                                   for value in expected_values)
+                elif field.field_type == "combobox":
+                    actual = await locator.evaluate(
+                        "el => String(el.value || el.getAttribute('aria-valuetext') || el.innerText || '').trim()")
+                    expected = str(action.value)
+                    verified = all(part.strip() in actual for part in expected.split(",") if part.strip())
                 else:
                     actual = await locator.input_value()
                     expected = str(action.value)
@@ -323,9 +427,17 @@ class BrowserDemoService:
                     result.verified = result.actual_value == str(bool(action.value)).lower()
                 elif field.field_type in {"select-one", "select-multiple"}:
                     actual_value = await locator.input_value()
-                    selected_text = (await locator.locator("option:checked").first.text_content() or "").strip()
+                    selected_text = ", ".join(item.strip() for item in
+                                              await locator.locator("option:checked").all_text_contents())
                     result.actual_value = selected_text or actual_value
-                    result.verified = expected.strip() in {actual_value.strip(), selected_text}
+                    expected_values = [part.strip() for part in expected.split(",") if part.strip()]
+                    result.verified = all(value in {actual_value.strip(), selected_text} or value in selected_text
+                                          for value in expected_values)
+                elif field.field_type == "combobox":
+                    result.actual_value = await locator.evaluate(
+                        "el => String(el.value || el.getAttribute('aria-valuetext') || el.innerText || '').trim()")
+                    result.verified = all(part.strip() in result.actual_value
+                                          for part in expected.split(",") if part.strip())
                 else:
                     result.actual_value = await locator.input_value()
                     result.verified = result.actual_value.strip() == expected.strip()

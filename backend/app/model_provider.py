@@ -89,7 +89,7 @@ def configured_model(model_name: str | None = None, reasoning_effort: str | None
     # this proxy currently accepts `max` as its highest reasoning effort.
     wire_effort = "max" if effort.lower() == "ultra" else effort.lower()
     max_retries = max(0, min(int(os.getenv("APP_MODEL_MAX_RETRIES", "0")), 6))
-    configured_timeout = timeout_seconds if timeout_seconds is not None else float(os.getenv("APP_MODEL_TIMEOUT_SECONDS", "30"))
+    configured_timeout = timeout_seconds if timeout_seconds is not None else float(os.getenv("APP_MODEL_TIMEOUT_SECONDS", "180"))
     timeout = max(10, min(configured_timeout, 300))
     http_client = DefaultAsyncHttpxClient(event_hooks={"response": [normalize_proxy_response]})
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries,

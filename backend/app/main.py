@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response as FastAPIResponse, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
 from .agent import get_resume_extractor
+from .auth_models import AuthSession, LoginRequest, RegisterRequest, UserAccount
+from .auth_service import SESSION_DAYS, login, register, token_hash, user_for_token
 from .application_models import (ApplicationWorkflowState, VerificationCodeRequest,
                                  VerificationRequest, WorkflowAdvanceRequest)
 from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult, FormPlan, PreSubmitCheck
@@ -26,9 +29,11 @@ from .models import (ApplicationAnswerUpdate, CandidateProfile, ConflictResoluti
 from .model_provider import check_model_health
 from .profile_service import (apply_profile_value, build_evidence, detect_language, merge_into_profile,
                               save_application_answer, sync_edited_profile_value)
-from .storage import (create_pending_resume, delete_resume, find_by_hash, get_conflict, get_profile,
+from .storage import (create_pending_resume, current_user_id, delete_resume, delete_session_record,
+                      find_by_hash, get_conflict, get_profile,
                       get_resume, get_resume_internal, initialize, list_conflicts, list_resumes,
-                      mark_resume_failed, mark_resume_parsing, replace_parse_result, resolve_conflict, save_profile,
+                      mark_resume_failed, mark_resume_parsing, replace_parse_result, reset_current_user,
+                      resolve_conflict, save_profile, set_current_user,
                       update_evidence, update_resume)
 
 
@@ -41,6 +46,9 @@ CONTENT_TYPES = {
     ".txt": {"text/plain", "application/octet-stream"},
 }
 MAX_FILE_SIZE = 10 * 1024 * 1024
+SESSION_COOKIE = "zhida_session"
+PUBLIC_API_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login"}
+browser_session_owners: dict[str, str] = {}
 
 
 @asynccontextmanager
@@ -55,8 +63,75 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
+@app.middleware("http")
+async def require_account(request: Request, call_next):
+    if request.method == "OPTIONS" or not request.url.path.startswith("/api/") or request.url.path in PUBLIC_API_PATHS:
+        return await call_next(request)
+    user = user_for_token(request.cookies.get(SESSION_COOKIE, ""))
+    if not user:
+        return JSONResponse({"detail": "请先登录"}, status_code=401)
+    request.state.user = user
+    context_token = set_current_user(user.id)
+    try:
+        return await call_next(request)
+    finally:
+        reset_current_user(context_token)
+
+
+def _set_session_cookie(response: FastAPIResponse, token: str) -> None:
+    secure = os.getenv("APP_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
+    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_DAYS * 24 * 60 * 60,
+                        httponly=True, secure=secure, samesite="lax", path="/")
+
+
+def _require_browser_owner(session_id: str) -> None:
+    if browser_session_owners.get(session_id) != current_user_id():
+        raise HTTPException(404, "浏览器会话不存在")
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]: return {"status": "ok", "product": "Zhida"}
+
+
+@app.post("/api/auth/register", response_model=AuthSession, status_code=201)
+def register_account(payload: RegisterRequest, response: FastAPIResponse) -> AuthSession:
+    try:
+        user, token = register(payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    _set_session_cookie(response, token)
+    return AuthSession(user=user)
+
+
+@app.post("/api/auth/login", response_model=AuthSession)
+def login_account(payload: LoginRequest, response: FastAPIResponse) -> AuthSession:
+    try:
+        user, token = login(payload)
+    except PermissionError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    _set_session_cookie(response, token)
+    return AuthSession(user=user)
+
+
+@app.get("/api/auth/me", response_model=UserAccount)
+def current_account(request: Request) -> UserAccount:
+    return request.state.user
+
+
+@app.post("/api/auth/logout", status_code=204, response_class=Response)
+async def logout_account(request: Request) -> Response:
+    raw_token = request.cookies.get(SESSION_COOKIE, "")
+    if raw_token:
+        delete_session_record(token_hash(raw_token))
+    owned_sessions = [session_id for session_id, user_id in browser_session_owners.items()
+                      if user_id == current_user_id()]
+    if browser_demo.session_id in owned_sessions:
+        await browser_demo.close()
+    for session_id in owned_sessions:
+        browser_session_owners.pop(session_id, None)
+    response = Response(status_code=204)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 @app.post("/api/model/health", response_model=ModelHealth)
@@ -81,8 +156,8 @@ def remember_application_answer(payload: ApplicationAnswerUpdate) -> CandidatePr
 
 
 @app.get("/api/jobs/recommendations", response_model=RecommendationBatch)
-def job_recommendations() -> RecommendationBatch:
-    return recommendation_batch(get_profile())
+def job_recommendations(location: str = "") -> RecommendationBatch:
+    return recommendation_batch(get_profile(), location)
 
 
 @app.get("/api/jobs/queue", response_model=list[ApplicationQueueItem])
@@ -289,7 +364,10 @@ def export_data() -> ExportBundle:
 @app.post("/api/browser/start", response_model=BrowserSnapshot)
 async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
     try:
-        return await browser_demo.start(payload.url)
+        result = await browser_demo.start(payload.url)
+        browser_session_owners.clear()
+        browser_session_owners[result.session_id] = current_user_id()
+        return result
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
@@ -299,6 +377,7 @@ async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
 @app.get("/api/browser/{session_id}/snapshot", response_model=BrowserSnapshot)
 async def browser_snapshot(session_id: str) -> BrowserSnapshot:
     try:
+        _require_browser_owner(session_id)
         return await browser_demo.snapshot_for(session_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -307,6 +386,7 @@ async def browser_snapshot(session_id: str) -> BrowserSnapshot:
 @app.get("/api/browser/{session_id}/workflow", response_model=ApplicationWorkflowState)
 async def browser_workflow(session_id: str) -> ApplicationWorkflowState:
     try:
+        _require_browser_owner(session_id)
         return await browser_demo.workflow_state(session_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -316,6 +396,7 @@ async def browser_workflow(session_id: str) -> ApplicationWorkflowState:
 async def advance_browser_workflow(session_id: str,
                                    payload: WorkflowAdvanceRequest) -> ApplicationWorkflowState:
     try:
+        _require_browser_owner(session_id)
         return await browser_demo.advance_workflow(session_id, payload)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -327,6 +408,7 @@ async def advance_browser_workflow(session_id: str,
 async def request_browser_verification(session_id: str,
                                        payload: VerificationRequest) -> ApplicationWorkflowState:
     try:
+        _require_browser_owner(session_id)
         current = get_profile()
         return await browser_demo.request_code(session_id, payload, current.phone, current.email)
     except LookupError as exc:
@@ -339,6 +421,7 @@ async def request_browser_verification(session_id: str,
 async def enter_browser_verification(session_id: str,
                                      payload: VerificationCodeRequest) -> ApplicationWorkflowState:
     try:
+        _require_browser_owner(session_id)
         return await browser_demo.enter_verification(session_id, payload)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -349,6 +432,7 @@ async def enter_browser_verification(session_id: str,
 @app.post("/api/browser/{session_id}/plan", response_model=FormPlan)
 async def plan_form(session_id: str) -> FormPlan:
     try:
+        _require_browser_owner(session_id)
         snapshot = await browser_demo.snapshot_for(session_id)
         return await create_form_plan(snapshot, get_profile())
     except LookupError as exc:
@@ -360,6 +444,7 @@ async def plan_form(session_id: str) -> FormPlan:
 @app.post("/api/browser/{session_id}/execute", response_model=ExecutionResult)
 async def execute_form_plan(session_id: str, payload: ExecutePlanRequest) -> ExecutionResult:
     try:
+        _require_browser_owner(session_id)
         resume_path: Path | None = None
         if payload.resume_id:
             row = get_resume_internal(payload.resume_id)
@@ -375,6 +460,7 @@ async def execute_form_plan(session_id: str, payload: ExecutePlanRequest) -> Exe
 @app.get("/api/browser/{session_id}/check", response_model=PreSubmitCheck)
 async def check_form_before_submit(session_id: str) -> PreSubmitCheck:
     try:
+        _require_browser_owner(session_id)
         return await browser_demo.pre_submit_check(session_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -382,7 +468,9 @@ async def check_form_before_submit(session_id: str) -> PreSubmitCheck:
 
 @app.delete("/api/browser/{session_id}", status_code=204, response_class=Response)
 async def close_browser(session_id: str) -> Response:
+    _require_browser_owner(session_id)
     if browser_demo.session_id != session_id:
         raise HTTPException(404, "浏览器会话不存在")
     await browser_demo.close()
+    browser_session_owners.pop(session_id, None)
     return Response(status_code=204)
