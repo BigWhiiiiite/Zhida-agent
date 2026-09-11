@@ -14,13 +14,14 @@ from openai import APIConnectionError
 from app import main, storage
 from app.agent import _profile_from_model_text
 from app.browser_models import BrowserSnapshot, PageField
-from app.form_agent import _form_plan_from_model_text, _local_safe_plan
+from app.form_agent import build_form_review, _form_plan_from_model_text, _local_safe_plan, _matching_option
 from app.extractors import extract_text
 from app.model_provider import normalize_proxy_response
 from app.models import CandidateProfile, Education, ModelHealth
 from app.job_recommendations import recommendation_batch
 
 os.environ["APP_AGENT_MODE"] = "rules"
+os.environ["APP_AUTH_REQUIRED"] = "true"
 
 
 async def verify_proxy_normalization() -> None:
@@ -110,6 +111,94 @@ education_plan = _local_safe_plan(
     CandidateProfile(education=[Education(school="Test University", degree="本科")]),
 )
 assert [action.value for action in education_plan.actions] == ["大学本科", "学士"]
+assert _matching_option("male", ["female"]) == ""
+
+semantic_profile = CandidateProfile(
+    gender="男", country_region="中国", location="北京", target_cities=["北京"],
+    education=[Education(school="Test University", degree="本科", location="北京市", current=True)],
+    skills=["Python", "Agent"], languages=["英语"],
+)
+semantic_fields = [
+    PageField(selector="[data-zhida-field=gender-male]", label="男", field_type="radio",
+              group_label="性别", option_label="男", option_value="male", options=["男", "女"], required=True),
+    PageField(selector="[data-zhida-field=gender-female]", label="女", field_type="radio",
+              group_label="性别", option_label="女", option_value="female", options=["男", "女"], required=True),
+    PageField(selector="[data-zhida-field=country]", label="国家/地区", field_type="select-one",
+              options=["中国大陆", "新加坡"], required=True),
+    PageField(selector="[data-zhida-field=current-location]", label="当前所处地", field_type="combobox",
+              options=["北京市", "上海市"], required=True),
+    PageField(selector="[data-zhida-field=work-city]", label="期望工作城市", field_type="combobox",
+              options=["北京", "深圳"], required=True),
+    PageField(selector="[data-zhida-field=interview-city]", label="参加面试城市", field_type="combobox",
+              options=["远程面试"], required=True),
+    PageField(selector="[data-zhida-field=study-location]", label="目前就读地", field_type="combobox",
+              options=["北京市", "上海市"], required=True),
+    PageField(selector="[data-zhida-field=skills]", label="AI应用技能", field_type="select-multiple",
+              options=["Python", "Agent", "Java"], multiple=True),
+    PageField(selector="[data-zhida-field=languages]", label="语言能力", field_type="textarea"),
+]
+semantic_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="semantic", url="https://careers.example/apply", title="Test",
+                    fields=semantic_fields),
+    semantic_profile,
+)
+semantic_actions = {action.selector: action for action in semantic_plan.actions}
+assert semantic_actions["[data-zhida-field=gender-male]"].action == "ask_user"
+assert "主档案记录为“男”" in semantic_actions["[data-zhida-field=gender-male]"].reason
+assert semantic_actions["[data-zhida-field=country]"].value == "中国大陆"
+assert semantic_actions["[data-zhida-field=current-location]"].value == "北京市"
+assert semantic_actions["[data-zhida-field=work-city]"].value == "北京"
+assert semantic_actions["[data-zhida-field=interview-city]"].action == "ask_user"
+assert semantic_actions["[data-zhida-field=study-location]"].value == "北京市"
+assert semantic_actions["[data-zhida-field=skills]"].value == "Python, Agent"
+assert semantic_actions["[data-zhida-field=languages]"].value == "英语"
+
+review_fields = [field.model_copy(deep=True) for field in semantic_fields]
+review_fields[0].current_value = "true"
+review_fields[2].current_value = "中国大陆"
+review_fields[4].current_value = "深圳"
+review_fields[5].current_value = "远程面试"
+review_fields[7].current_value = "Python"
+review_fields[8].current_value = "英语"
+review_snapshot = BrowserSnapshot(
+    session_id="review", url="https://careers.example/apply", title="Test", fields=review_fields,
+)
+review_plan = _local_safe_plan(review_snapshot, semantic_profile)
+review = build_form_review(review_snapshot, review_plan)
+review_by_label = {item.label: item for item in review.comparisons}
+assert review_by_label["性别"].status == "manual_review"
+assert review_by_label["国家/地区"].status == "matched"
+assert review_by_label["当前所处地"].status == "missing"
+assert review_by_label["期望工作城市"].status == "conflict"
+assert review_by_label["参加面试城市"].status == "manual_review"
+assert review_by_label["AI应用技能"].status == "conflict"
+assert review_by_label["语言能力"].status == "matched"
+assert next(action for action in review.plan.actions
+            if action.selector == "[data-zhida-field=country]").action == "skip"
+
+checkbox_fields = [
+    PageField(selector=f"[data-zhida-field=skill-{name.lower()}]", label=name,
+              field_type="checkbox", group_label="AI应用技能", option_label=name,
+              current_value="true" if name == "Python" else "false")
+    for name in ("Python", "Agent", "Java")
+]
+checkbox_snapshot = BrowserSnapshot(
+    session_id="checkbox", url="https://careers.example/apply", title="Test", fields=checkbox_fields,
+)
+checkbox_plan = _local_safe_plan(checkbox_snapshot, semantic_profile)
+assert [action.action for action in checkbox_plan.actions] == ["check", "check", "skip"]
+checkbox_review = build_form_review(checkbox_snapshot, checkbox_plan)
+assert checkbox_review.comparisons[0].status == "conflict"
+assert checkbox_review.comparisons[0].site_value == "Python"
+assert checkbox_review.comparisons[0].expected_value == "Python, Agent"
+
+missing_country_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="country", url="https://careers.example/apply", title="Test",
+                    fields=[semantic_fields[2]]),
+    CandidateProfile(),
+)
+assert missing_country_plan.actions[0].action == "ask_user"
+assert missing_country_plan.actions[0].reason.endswith("请从网页真实选项中选择")
 
 learned_plan = _local_safe_plan(
     BrowserSnapshot(session_id="learned", url="https://careers.example/apply", title="Test", fields=[
@@ -162,6 +251,13 @@ with TemporaryDirectory() as temporary:
 
     with TestClient(main.app) as client:
         assert client.get("/api/health").json()["product"] == "Zhida"
+        assert "/api/jobs/{job_id}/verify" in client.get("/openapi.json").json()["paths"]
+        os.environ["APP_AUTH_REQUIRED"] = "false"
+        local_me = client.get("/api/auth/me")
+        assert local_me.status_code == 200
+        assert local_me.json()["is_local"] is True
+        assert client.get("/api/profile").status_code == 200
+        os.environ["APP_AUTH_REQUIRED"] = "true"
         assert client.get("/api/profile").status_code == 401
         registered = client.post("/api/auth/register", json={
             "email": "alice@example.com", "password": "Alice-pass-2026", "display_name": "Alice",
@@ -237,7 +333,7 @@ with TemporaryDirectory() as temporary:
         recommendations = client.get("/api/jobs/recommendations")
         assert recommendations.status_code == 200
         recommendation_json = recommendations.json()
-        assert recommendation_json["engine"] == "local-explainable-v1"
+        assert recommendation_json["engine"] == "official-verified-local-score-v2"
         assert len(recommendation_json["jobs"]) >= 5
         scores = [item["match_score"] for item in recommendation_json["jobs"]]
         assert scores == sorted(scores, reverse=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -12,18 +13,23 @@ from fastapi import FastAPI, File, HTTPException, Request, Response as FastAPIRe
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+from dotenv import load_dotenv
 
 from .agent import get_resume_extractor
 from .auth_models import AuthSession, LoginRequest, RegisterRequest, UserAccount
-from .auth_service import SESSION_DAYS, login, register, token_hash, user_for_token
-from .application_models import (ApplicationWorkflowState, VerificationCodeRequest,
-                                 VerificationRequest, WorkflowAdvanceRequest)
-from .browser_models import BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult, FormPlan, PreSubmitCheck
+from .auth_service import SESSION_DAYS, local_user, login, register, token_hash, user_for_token
+from .application_models import (ApplicationWorkflowState, RegistrationCredentialsRequest,
+                                 VerificationCodeRequest, VerificationRequest,
+                                 WorkflowAdvanceRequest)
+from .browser_models import (BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult,
+                             ExpandSectionRequest, FormPlan, FormReviewResult,
+                             NativeResumeImportRequest, NativeResumeImportResult, PreSubmitCheck)
 from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
-from .form_agent import create_form_plan
-from .job_models import ApplicationQueueItem, QueueAddRequest, RecommendationBatch
-from .job_recommendations import add_to_queue, queue_items, recommendation_batch, remove_from_queue
+from .form_agent import build_form_review, create_form_plan, create_local_form_plan
+from .job_models import ApplicationQueueItem, JobVerification, QueueAddRequest, RecommendationBatch
+from .job_recommendations import (add_to_queue, queue_items, recommendation_batch,
+                                  remove_from_queue, verify_catalog_job)
 from .models import (ApplicationAnswerUpdate, CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
                      ModelHealth, ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
 from .model_provider import check_model_health
@@ -38,6 +44,7 @@ from .storage import (create_pending_resume, current_user_id, delete_resume, del
 
 
 ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env", override=True)
 UPLOAD_DIR = ROOT / "uploads"
 ALLOWED_SUFFIXES = {".pdf", ".docx", ".txt"}
 CONTENT_TYPES = {
@@ -49,6 +56,19 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 SESSION_COOKIE = "zhida_session"
 PUBLIC_API_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login"}
 browser_session_owners: dict[str, str] = {}
+
+
+def _local_access_allowed(request: Request) -> bool:
+    auth_required = os.getenv("APP_AUTH_REQUIRED", "true").strip().lower() in {"1", "true", "yes"}
+    if auth_required:
+        return False
+    client_host = request.client.host if request.client else ""
+    if client_host == "testclient":
+        return True
+    try:
+        return ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        return client_host == "localhost"
 
 
 @asynccontextmanager
@@ -68,6 +88,8 @@ async def require_account(request: Request, call_next):
     if request.method == "OPTIONS" or not request.url.path.startswith("/api/") or request.url.path in PUBLIC_API_PATHS:
         return await call_next(request)
     user = user_for_token(request.cookies.get(SESSION_COOKIE, ""))
+    if not user and _local_access_allowed(request):
+        user = local_user()
     if not user:
         return JSONResponse({"detail": "请先登录"}, status_code=401)
     request.state.user = user
@@ -163,6 +185,14 @@ def job_recommendations(location: str = "") -> RecommendationBatch:
 @app.get("/api/jobs/queue", response_model=list[ApplicationQueueItem])
 def application_queue() -> list[ApplicationQueueItem]:
     return queue_items(get_profile())
+
+
+@app.post("/api/jobs/{job_id}/verify", response_model=JobVerification)
+async def verify_job_opening(job_id: str) -> JobVerification:
+    try:
+        return await verify_catalog_job(job_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/jobs/queue", response_model=list[ApplicationQueueItem], status_code=201)
@@ -383,6 +413,35 @@ async def browser_snapshot(session_id: str) -> BrowserSnapshot:
         raise HTTPException(404, str(exc)) from exc
 
 
+@app.post("/api/browser/{session_id}/expand", response_model=BrowserSnapshot)
+async def expand_browser_section(session_id: str, payload: ExpandSectionRequest) -> BrowserSnapshot:
+    try:
+        _require_browser_owner(session_id)
+        return await browser_demo.expand_section(session_id, payload.selector)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/browser/{session_id}/native-resume", response_model=NativeResumeImportResult)
+async def import_resume_with_site_parser(session_id: str,
+                                         payload: NativeResumeImportRequest) -> NativeResumeImportResult:
+    try:
+        _require_browser_owner(session_id)
+        row = get_resume_internal(payload.resume_id)
+        if not row:
+            raise HTTPException(404, "选择的简历不存在")
+        candidate = UPLOAD_DIR / Path(row["stored_filename"]).name
+        if not candidate.exists():
+            raise HTTPException(404, "选择的简历原始文件不存在")
+        return await browser_demo.import_resume_with_site_parser(session_id, candidate)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.get("/api/browser/{session_id}/workflow", response_model=ApplicationWorkflowState)
 async def browser_workflow(session_id: str) -> ApplicationWorkflowState:
     try:
@@ -417,6 +476,18 @@ async def request_browser_verification(session_id: str,
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.post("/api/browser/{session_id}/workflow/registration", response_model=ApplicationWorkflowState)
+async def fill_browser_registration(session_id: str,
+                                    payload: RegistrationCredentialsRequest) -> ApplicationWorkflowState:
+    try:
+        _require_browser_owner(session_id)
+        return await browser_demo.fill_registration(session_id, payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.post("/api/browser/{session_id}/workflow/verification", response_model=ApplicationWorkflowState)
 async def enter_browser_verification(session_id: str,
                                      payload: VerificationCodeRequest) -> ApplicationWorkflowState:
@@ -439,6 +510,20 @@ async def plan_form(session_id: str) -> FormPlan:
         raise HTTPException(404, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(502, f"模型分析失败：{exc}") from exc
+
+
+@app.post("/api/browser/{session_id}/review", response_model=FormReviewResult)
+async def review_current_form(session_id: str, use_model: bool = False) -> FormReviewResult:
+    try:
+        _require_browser_owner(session_id)
+        snapshot = await browser_demo.snapshot_for(session_id)
+        plan = (await create_form_plan(snapshot, get_profile()) if use_model
+                else create_local_form_plan(snapshot, get_profile()))
+        return build_form_review(snapshot, plan)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"表单核对失败：{exc}") from exc
 
 
 @app.post("/api/browser/{session_id}/execute", response_model=ExecutionResult)

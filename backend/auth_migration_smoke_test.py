@@ -43,6 +43,14 @@ try:
                          (now, now))
 
         storage.initialize()
+        storage.activate_local_user()
+        local_context = storage.set_current_user(storage.LOCAL_USER_ID)
+        try:
+            assert storage.get_profile().name == "Legacy Candidate"
+            assert [item.id for item in storage.list_resumes()] == ["legacy-resume"]
+        finally:
+            storage.reset_current_user(local_context)
+
         first, _ = register(RegisterRequest(email="first@example.com", password=SecretStr("First-pass-2026")))
         first_context = storage.set_current_user(first.id)
         try:

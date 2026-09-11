@@ -1,18 +1,38 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from .job_models import (ApplicationQueueItem, JobPosting, JobRecommendation,
-                         QueueAddRequest, RecommendationBatch)
+                         JobVerification, QueueAddRequest, RecommendationBatch)
 from .models import CandidateProfile
-from .storage import add_job_queue_entries, delete_job_queue_entry, get_resume, list_job_queue_entries
+from .storage import (add_job_queue_entries, delete_job_queue_entry, get_job_verification,
+                      get_resume, list_job_queue_entries)
 
 
 # This seed catalog keeps the recommendation-to-autofill loop usable while live
 # discovery adapters are being built. Every item retains its official source and
 # verification state; a match score never claims that an opening is still live.
 JOB_CATALOG: tuple[JobPosting, ...] = (
+    JobPosting(
+        id="baidu-j99969-agent-algorithm",
+        company="百度",
+        title="2027AIDU-智能体算法工程师",
+        job_code="J99969",
+        locations=["北京"],
+        graduation_window="2026-09-01 至 2027-08-31",
+        education_requirement="硕士及以上，计算机、人工智能等相关专业",
+        description="设计和研发 AI Agent，覆盖规划、工具调用、反思、多智能体协作、RAG 与评测体系。",
+        required_skills=["Agent", "大语言模型", "Python", "LangChain"],
+        preferred_skills=["AutoGen", "RAG", "ReAct", "评测"],
+        role_keywords=["智能体", "Agent", "算法", "大模型"],
+        url="https://talent.baidu.com/jobs/detail/GRADUATE/4f1cbc80-8332-4a92-b8fa-c0132b17d47e",
+        source_name="百度校园招聘官网",
+        source_url="https://talent.baidu.com/jobs/detail/GRADUATE/4f1cbc80-8332-4a92-b8fa-c0132b17d47e",
+        source_status="verified",
+        apply_mode="direct",
+        verified_at="2026-09-11",
+    ),
     JobPosting(
         id="baidu-j101017-agent-algorithm",
         company="百度",
@@ -30,7 +50,7 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
         source_url="https://talent.baidu.com/jobs/detail/GRADUATE/02f73086-be71-4d09-8d6e-f1c6981b8b48",
         source_status="verified",
         apply_mode="direct",
-        verified_at="2026-09-10",
+        verified_at="2026-09-11",
     ),
     JobPosting(
         id="baidu-j99974-agent-fullstack",
@@ -44,12 +64,12 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
         required_skills=["Agent", "Python", "后端开发", "大语言模型"],
         preferred_skills=["FastAPI", "React", "RAG", "Tool Calling"],
         role_keywords=["Agent", "全栈", "大模型", "应用研发"],
-        url="https://talent.baidu.com/jobs/list?projectType=3&recruitType=GRADUATE",
+        url="https://talent.baidu.com/jobs/detail/GRADUATE/6f9c3a86-6557-409d-8fa7-e6f4c68d6765",
         source_name="百度校园招聘官网",
-        source_url="https://talent.baidu.com/jobs/list?projectType=3&recruitType=GRADUATE",
+        source_url="https://talent.baidu.com/jobs/detail/GRADUATE/6f9c3a86-6557-409d-8fa7-e6f4c68d6765",
         source_status="verified",
-        apply_mode="search",
-        verified_at="2026-09-10",
+        apply_mode="direct",
+        verified_at="2026-09-11",
     ),
     JobPosting(
         id="baidu-j100737-backend",
@@ -126,6 +146,8 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
         apply_mode="search",
     ),
 )
+
+VERIFICATION_TTL = timedelta(hours=6)
 
 
 ALIASES: dict[str, tuple[str, ...]] = {
@@ -219,7 +241,33 @@ def _match_location(profile: CandidateProfile, job: JobPosting, preferred_locati
     return any(target in location or location in target for target in targets for location in locations)
 
 
+def _fresh_verification(record: dict | None) -> bool:
+    if not record:
+        return False
+    try:
+        checked_at = datetime.fromisoformat(str(record["checked_at"]).replace("Z", "+00:00"))
+        if checked_at.tzinfo is None:
+            checked_at = checked_at.replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return False
+    age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
+    return timedelta(0) <= age <= VERIFICATION_TTL
+
+
 def _score(profile: CandidateProfile, job: JobPosting, preferred_location: str = "") -> JobRecommendation:
+    verification = get_job_verification(job.id)
+    if _fresh_verification(verification):
+        job = job.model_copy(update={
+            "live_status": verification["status"],
+            "last_checked_at": verification["checked_at"],
+            "verification_message": verification["message"],
+            "verification_evidence": verification["evidence"],
+        })
+    elif verification:
+        job = job.model_copy(update={
+            "last_checked_at": verification["checked_at"],
+            "verification_message": "上次官网核验已超过 6 小时，请重新核验",
+        })
     corpus = _profile_corpus(profile)
     matched_required = [skill for skill in job.required_skills if _has_skill(skill, corpus)]
     matched_preferred = [skill for skill in job.preferred_skills if _has_skill(skill, corpus)]
@@ -257,10 +305,20 @@ def _score(profile: CandidateProfile, job: JobPosting, preferred_location: str =
 
     algorithm_heavy = "算法" in job.title or "AIDU" in job.title
     track = "stretch" if algorithm_heavy or len(missing) >= 2 else "steady"
+    gate_reasons: list[str] = []
+    if job.live_status != "open":
+        gate_reasons.append("官网尚未实时确认为可投")
+    if graduation_match is not True:
+        gate_reasons.append("毕业时间尚未确认符合届别")
+    if location_match is not True:
+        gate_reasons.append("工作地点尚未确认符合偏好")
+    if re.search(r"实习|intern|social|社招", job.recruitment_type, re.I):
+        gate_reasons.append("不属于正式校招岗位")
     return JobRecommendation(job=job, match_score=score, matched_skills=matched,
                              missing_skills=missing, reasons=reasons,
                              location_match=location_match, graduation_match=graduation_match,
-                             queue_track=track)
+                             queue_track=track, formal_queue_eligible=not gate_reasons,
+                             gate_reasons=gate_reasons)
 
 
 def recommendation_batch(profile: CandidateProfile, preferred_location: str = "") -> RecommendationBatch:
@@ -275,14 +333,15 @@ def recommendation_batch(profile: CandidateProfile, preferred_location: str = ""
     if selected_location:
         recommendations = [item for item in recommendations if item.location_match is True]
     jobs = sorted(recommendations,
-                  key=lambda item: (item.match_score, item.job.source_status == "verified"), reverse=True)
+                  key=lambda item: (item.formal_queue_eligible, item.match_score,
+                                    item.job.source_status == "verified"), reverse=True)
     year = _graduation_year(profile)
     summary_parts = [profile.target_role or "未设置目标岗位", f"{len(profile.skills)} 项技能"]
     if year:
         summary_parts.append(f"预计 {year} 年毕业")
     if selected_location:
         summary_parts.append(f"工作地点：{selected_location}")
-    return RecommendationBatch(generated_at=datetime.now(timezone.utc), engine="local-explainable-v1",
+    return RecommendationBatch(generated_at=datetime.now(timezone.utc), engine="official-verified-local-score-v2",
                                profile_summary=" · ".join(summary_parts),
                                available_locations=available_locations,
                                selected_location=selected_location, jobs=jobs)
@@ -290,6 +349,18 @@ def recommendation_batch(profile: CandidateProfile, preferred_location: str = ""
 
 def _recommendation_by_id(profile: CandidateProfile, job_id: str) -> JobRecommendation | None:
     return next((item for item in recommendation_batch(profile).jobs if item.job.id == job_id), None)
+
+
+def catalog_job(job_id: str) -> JobPosting | None:
+    return next((job for job in JOB_CATALOG if job.id == job_id), None)
+
+
+async def verify_catalog_job(job_id: str) -> JobVerification:
+    job = catalog_job(job_id)
+    if not job:
+        raise LookupError("岗位不存在")
+    from .job_verification import verify_official_job
+    return await verify_official_job(job)
 
 
 def queue_items(profile: CandidateProfile) -> list[ApplicationQueueItem]:

@@ -21,6 +21,7 @@ class UserAccount(BaseModel):
     email: str
     display_name: str = ""
     created_at: datetime
+    is_local: bool = False
 
 
 class AuthSession(BaseModel):

@@ -48,6 +48,7 @@ class Education(BaseModel):
     college: str = ""
     degree: str = ""
     major: str = ""
+    location: str = ""
     start_date: str = ""
     end_date: str = ""
     gpa: str = ""
@@ -65,6 +66,7 @@ class ResumeProfile(BaseModel):
     age: int | None = None
     phone: str = ""
     email: str = ""
+    country_region: str = ""
     qq: str = ""
     wechat: str = ""
     location: str = ""

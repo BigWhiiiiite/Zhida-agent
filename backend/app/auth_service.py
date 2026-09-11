@@ -9,8 +9,9 @@ import sqlite3
 from datetime import datetime, timezone
 
 from .auth_models import LoginRequest, RegisterRequest, UserAccount
-from .storage import (clear_login_failures, create_session_record, create_user_account,
-                      get_user_by_email, get_user_for_session, record_login_failure)
+from .storage import (LOCAL_USER_ID, activate_local_user, clear_login_failures,
+                      create_session_record, create_user_account, get_user_by_email,
+                      get_user_for_session, record_login_failure)
 
 
 SESSION_DAYS = 7
@@ -48,6 +49,17 @@ def _verify_password(password: str, encoded: str) -> bool:
 def _public_user(row: sqlite3.Row | dict[str, str]) -> UserAccount:
     return UserAccount(id=row["id"], email=row["email"], display_name=row["display_name"],
                        created_at=row["created_at"])
+
+
+def local_user() -> UserAccount:
+    activate_local_user()
+    return UserAccount(
+        id=LOCAL_USER_ID,
+        email="local@zhida.invalid",
+        display_name="本机用户",
+        created_at=datetime(1970, 1, 1, tzinfo=timezone.utc),
+        is_local=True,
+    )
 
 
 def _validate_password(password: str) -> None:

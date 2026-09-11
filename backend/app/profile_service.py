@@ -10,7 +10,7 @@ from .storage import create_conflict, get_profile, get_resume, save_profile, upd
 
 SCALAR_FIELDS = [
     "name", "english_name", "gender", "birth_date", "age", "phone", "email", "qq", "wechat",
-    "location", "hometown", "website", "github", "linkedin", "target_role", "available_date",
+    "location", "country_region", "hometown", "website", "github", "linkedin", "target_role", "available_date",
     "internship_duration", "days_per_week", "expected_salary", "remote_preference", "summary",
 ]
 LIST_FIELDS = ["skills", "languages", "certificates", "awards", "target_industries", "target_cities"]
@@ -21,7 +21,7 @@ NON_REUSABLE_ANSWER_HINTS = (
     "veteran", "referral", "available", "availability", "work permit", "right to work",
     "同意", "隐私", "条款", "声明", "工作许可", "签证", "担保", "薪资", "薪酬", "性别",
     "种族", "族裔", "残障", "退伍", "调剂", "内推", "政治面貌", "户口", "婚姻", "身份证",
-    "到岗", "可入职",
+    "到岗", "可入职", "面试城市", "面试地点", "参加面试", "interview city", "interview location",
 )
 
 
@@ -35,6 +35,11 @@ def _answer_profile_field(question: str, field_name: str) -> str:
         (("linkedin",), "linkedin"),
         (("github",), "github"),
         (("portfolio", "personal website", "个人网站", "作品集"), "website"),
+        (("country/region", "country or region", "国家/地区", "所在国家", "国家或地区"), "country_region"),
+        (("current location", "current city", "当前所在地", "当前所处地", "现居地", "居住地"), "location"),
+        (("preferred location", "preferred city", "work city", "期望工作城市", "期望城市", "意向城市"), "target_cities"),
+        (("ai application skill", "ai skills", "technical skills", "专业技能", "技术技能", "ai应用技能"), "skills"),
+        (("language ability", "language skills", "languages", "语言能力", "外语能力"), "languages"),
     )
     return next((field for hints, field in mappings if any(hint in description for hint in hints)), "")
 
@@ -51,7 +56,11 @@ def save_application_answer(question: str, field_name: str, value: str):
     current = ResumeProfile.model_validate(get_profile().model_dump())
     direct_field = _answer_profile_field(cleaned_question, field_name)
     if direct_field:
-        setattr(current, direct_field, cleaned_value)
+        if direct_field in LIST_FIELDS:
+            values = [item.strip() for item in re.split(r"[,，、\n]", cleaned_value) if item.strip()]
+            setattr(current, direct_field, values)
+        else:
+            setattr(current, direct_field, cleaned_value)
     else:
         current.application_answers[cleaned_question] = cleaned_value
     return save_profile(current)

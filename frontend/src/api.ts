@@ -1,4 +1,4 @@
-import type { ApplicationQueueItem, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, PreSubmitCheck, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
+import type { ApplicationQueueItem, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobVerification, NativeResumeImportResult, PreSubmitCheck, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
 
 export const API = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/api`
 const nativeFetch=window.fetch.bind(window)
@@ -24,6 +24,7 @@ export const api={
   saveProfile:(profile:ResumeProfile)=>fetch(`${API}/profile`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(profile)}).then(result<CandidateProfile>),
   saveApplicationAnswer:(question:string,field_name:string,value:string)=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value})}).then(result<CandidateProfile>),
   recommendations:(location='')=>fetch(`${API}/jobs/recommendations${location?`?location=${encodeURIComponent(location)}`:''}`).then(result<RecommendationBatch>),
+  verifyJob:(id:string)=>fetch(`${API}/jobs/${encodeURIComponent(id)}/verify`,{method:'POST'}).then(result<JobVerification>),
   jobQueue:()=>fetch(`${API}/jobs/queue`).then(result<ApplicationQueueItem[]>),
   queueJobs:(job_ids:string[],resume_id:string)=>fetch(`${API}/jobs/queue`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids,resume_id})}).then(result<ApplicationQueueItem[]>),
   removeQueuedJob:(id:string)=>fetch(`${API}/jobs/queue/${id}`,{method:'DELETE'}).then(result<void>),
@@ -38,11 +39,15 @@ export const api={
   resolve:(id:string,choice:'current'|'incoming'|'custom',custom_value?:unknown)=>fetch(`${API}/conflicts/${id}/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice,custom_value})}).then(result<Conflict>),
   startBrowser:(url:string)=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}).then(result<BrowserSnapshot>),
   browserSnapshot:(id:string)=>fetch(`${API}/browser/${id}/snapshot`).then(result<BrowserSnapshot>),
+  expandBrowserSection:(id:string,selector:string)=>fetch(`${API}/browser/${id}/expand`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector})}).then(result<BrowserSnapshot>),
+  importResumeWithSite:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/native-resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id})}).then(result<NativeResumeImportResult>),
   workflowState:(id:string)=>fetch(`${API}/browser/${id}/workflow`).then(result<ApplicationWorkflowState>),
-  advanceWorkflow:(id:string,intent:'start_application'|'refresh')=>fetch(`${API}/browser/${id}/workflow/advance`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({intent})}).then(result<ApplicationWorkflowState>),
-  requestVerificationCode:(id:string,channel:'phone'|'email')=>fetch(`${API}/browser/${id}/workflow/request-code`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel})}).then(result<ApplicationWorkflowState>),
+  advanceWorkflow:(id:string,intent:'start_application'|'create_account'|'continue_application'|'refresh')=>fetch(`${API}/browser/${id}/workflow/advance`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({intent})}).then(result<ApplicationWorkflowState>),
+  fillRegistration:(id:string,email:string,phone:string,password:string)=>fetch(`${API}/browser/${id}/workflow/registration`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,phone,password})}).then(result<ApplicationWorkflowState>),
+  requestVerificationCode:(id:string,channel:'phone'|'email',value='')=>fetch(`${API}/browser/${id}/workflow/request-code`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel,value})}).then(result<ApplicationWorkflowState>),
   enterVerificationCode:(id:string,code:string,submit:boolean)=>fetch(`${API}/browser/${id}/workflow/verification`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,submit})}).then(result<ApplicationWorkflowState>),
   planForm:(id:string)=>fetch(`${API}/browser/${id}/plan`,{method:'POST'}).then(result<FormPlan>),
+  reviewForm:(id:string,useModel=false)=>fetch(`${API}/browser/${id}/review${useModel?'?use_model=true':''}`,{method:'POST'}).then(result<FormReviewResult>),
   executeForm:(id:string,actions:FillAction[],resume_id:string)=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actions,min_confidence:.85,resume_id})}).then(result<ExecutionResult>),
   checkForm:(id:string)=>fetch(`${API}/browser/${id}/check`).then(result<PreSubmitCheck>),
   closeBrowser:(id:string)=>fetch(`${API}/browser/${id}`,{method:'DELETE'}).then(result<void>),

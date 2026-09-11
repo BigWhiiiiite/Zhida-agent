@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 
 SourceStatus = Literal["verified", "verify_on_open"]
+LiveJobStatus = Literal["not_checked", "open", "closed", "manual_gate", "mismatch", "unreachable"]
 ApplyMode = Literal["direct", "search"]
 QueueTrack = Literal["steady", "stretch"]
 QueueStatus = Literal["planned", "in_progress", "needs_review"]
@@ -31,6 +32,10 @@ class JobPosting(BaseModel):
     source_status: SourceStatus = "verify_on_open"
     apply_mode: ApplyMode = "direct"
     verified_at: str = ""
+    live_status: LiveJobStatus = "not_checked"
+    last_checked_at: str = ""
+    verification_message: str = ""
+    verification_evidence: list[str] = Field(default_factory=list)
 
 
 class JobRecommendation(BaseModel):
@@ -42,6 +47,8 @@ class JobRecommendation(BaseModel):
     location_match: bool | None = None
     graduation_match: bool | None = None
     queue_track: QueueTrack = "steady"
+    formal_queue_eligible: bool = False
+    gate_reasons: list[str] = Field(default_factory=list)
 
 
 class RecommendationBatch(BaseModel):
@@ -66,3 +73,16 @@ class ApplicationQueueItem(BaseModel):
     created_at: datetime
     updated_at: datetime
     recommendation: JobRecommendation
+
+
+class JobVerification(BaseModel):
+    job_id: str
+    status: LiveJobStatus
+    checked_at: datetime
+    official_url: str
+    final_url: str = ""
+    http_status: int | None = None
+    page_title: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    message: str
+    can_proceed: bool = False

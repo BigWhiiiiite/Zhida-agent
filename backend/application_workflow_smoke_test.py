@@ -7,7 +7,8 @@ import os
 
 from playwright.async_api import async_playwright
 
-from app.ats_adapters import (fill_verification_code, inspect_application_page,
+from app.ats_adapters import (continue_application, create_account, fill_registration_info,
+                              fill_verification_code, inspect_application_page,
                               request_verification_code, start_application)
 
 
@@ -73,6 +74,66 @@ async def main() -> None:
         await page.set_content('<label>图形验证<input name="captcha"></label>')
         state = await inspect_application_page(page, "captcha")
         assert state.stage != "verification_required"
+
+        await page.set_content("""
+        <main>
+          <h1>Create account</h1>
+          <label>Email<input type="email" name="email" required></label>
+          <label>Phone<input type="tel" name="mobile"></label>
+          <label>Password<input type="password" name="password" required></label>
+          <label>Confirm password<input type="password" name="confirm_password" required></label>
+          <label><input type="checkbox" required>I agree to the privacy terms</label>
+          <button onclick="document.body.dataset.created='yes'">Create account</button>
+        </main>
+        """)
+        state = await inspect_application_page(page, "register")
+        assert state.stage == "registration_required" and state.requires_consent
+        assert set(state.registration_identifiers) == {"email", "phone"}
+        await fill_registration_info(page, "candidate@example.com", "13800138000", "SafePass123!")
+        assert await page.locator('input[name="email"]').input_value() == "candidate@example.com"
+        assert await page.locator('input[name="confirm_password"]').input_value() == "SafePass123!"
+        try:
+            await create_account(page)
+            raise AssertionError("unchecked consent must block account creation")
+        except ValueError as exc:
+            assert "隐私协议" in str(exc)
+        await page.locator('input[type="checkbox"]').check()
+        await create_account(page)
+        assert await page.locator("body").get_attribute("data-created") == "yes"
+
+        await page.set_content("""
+        <main><h1>Create account</h1>
+          <label>Email<input type="email" name="email" required></label>
+          <button onclick="document.body.dataset.created='magic-link'">Create account</button>
+        </main>
+        """)
+        state = await inspect_application_page(page, "passwordless-register")
+        assert state.stage == "registration_required" and not state.registration_requires_password
+        await fill_registration_info(page, "candidate@example.com", "", "")
+        await create_account(page)
+        assert await page.locator("body").get_attribute("data-created") == "magic-link"
+
+        await page.set_content("""
+        <main><p>Step 1 of 2</p>
+          <label>Name<input name="name" required value="李春博"></label>
+          <button onclick="document.body.dataset.next='yes'">Save and continue</button>
+        </main>
+        """)
+        state = await inspect_application_page(page, "steps")
+        assert state.stage == "application_form" and state.safe_next_present
+        assert (state.page_step_current, state.page_step_total) == (1, 2)
+        await continue_application(page)
+        assert await page.locator("body").get_attribute("data-next") == "yes"
+
+        await page.set_content('<button onclick="document.body.dataset.final=\'yes\'">提交申请</button>')
+        state = await inspect_application_page(page, "final")
+        assert state.stage == "review" and state.final_submit_present and not state.safe_next_present
+        try:
+            await continue_application(page)
+            raise AssertionError("final submit must never be clicked")
+        except ValueError as exc:
+            assert "最终提交" in str(exc)
+        assert await page.locator("body").get_attribute("data-final") is None
         await browser.close()
     print("Application workflow smoke test passed")
 

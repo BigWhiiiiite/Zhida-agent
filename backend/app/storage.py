@@ -14,6 +14,7 @@ from .models import CandidateProfile, FieldEvidence, ProfileConflict, ResumeProf
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "resumes.db"
+LOCAL_USER_ID = "local-development-user"
 _CURRENT_USER_ID: ContextVar[str] = ContextVar("zhida_current_user_id", default="")
 
 
@@ -129,6 +130,14 @@ def initialize() -> None:
                 UNIQUE(user_id, job_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS job_verifications (
+                job_id TEXT PRIMARY KEY, status TEXT NOT NULL, checked_at TEXT NOT NULL,
+                official_url TEXT NOT NULL, final_url TEXT NOT NULL DEFAULT '',
+                http_status INTEGER, page_title TEXT NOT NULL DEFAULT '',
+                evidence_json TEXT NOT NULL DEFAULT '[]', message TEXT NOT NULL DEFAULT ''
+            )
+        """)
         _add_missing_columns(conn, "application_queue", {"user_id": "TEXT NOT NULL DEFAULT ''"})
         _migrate_application_queue(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes(user_id, updated_at)")
@@ -145,15 +154,47 @@ def create_user_account(email: str, display_name: str, password_hash: str) -> sq
         conn.execute("""INSERT INTO users
             (id, email, display_name, password_hash, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)""", (user_id, email, display_name, password_hash, now, now))
-        legacy_profile = conn.execute("SELECT id FROM candidate_profiles WHERE user_id='' LIMIT 1").fetchone()
-        if first_user and legacy_profile:
-            for table in ("candidate_profiles", "resumes", "conflicts", "application_queue"):
-                conn.execute(f"UPDATE {table} SET user_id=? WHERE user_id=''", (user_id,))
+        claimable_profile = conn.execute(
+            """SELECT id FROM candidate_profiles WHERE user_id IN ('', ?)
+               ORDER BY CASE WHEN user_id=? THEN 0 ELSE 1 END LIMIT 1""",
+            (LOCAL_USER_ID, LOCAL_USER_ID),
+        ).fetchone()
+        if first_user and claimable_profile:
+            conn.execute("DELETE FROM candidate_profiles WHERE user_id IN ('', ?) AND id!=?",
+                         (LOCAL_USER_ID, claimable_profile["id"]))
+            conn.execute("UPDATE candidate_profiles SET user_id=? WHERE id=?",
+                         (user_id, claimable_profile["id"]))
+            for table in ("resumes", "conflicts", "application_queue"):
+                conn.execute(f"UPDATE {table} SET user_id=? WHERE user_id IN ('', ?)",
+                             (user_id, LOCAL_USER_ID))
         else:
             conn.execute("""INSERT INTO candidate_profiles (id, user_id, profile_json, created_at, updated_at)
                             VALUES (?, ?, ?, ?, ?)""",
                          (user_id, user_id, ResumeProfile().model_dump_json(), now, now))
         return conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+
+
+def activate_local_user() -> None:
+    """Claim pre-auth data for the local workspace without creating login credentials."""
+    now = _now()
+    with _connection() as conn:
+        local_profile = conn.execute(
+            "SELECT id FROM candidate_profiles WHERE user_id=? LIMIT 1", (LOCAL_USER_ID,)
+        ).fetchone()
+        if not local_profile:
+            legacy_profile = conn.execute(
+                "SELECT id FROM candidate_profiles WHERE user_id='' LIMIT 1"
+            ).fetchone()
+            if legacy_profile:
+                conn.execute("UPDATE candidate_profiles SET user_id=? WHERE id=?",
+                             (LOCAL_USER_ID, legacy_profile["id"]))
+            else:
+                conn.execute("""INSERT INTO candidate_profiles
+                    (id, user_id, profile_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)""",
+                    (LOCAL_USER_ID, LOCAL_USER_ID, ResumeProfile().model_dump_json(), now, now))
+        for table in ("resumes", "conflicts", "application_queue"):
+            conn.execute(f"UPDATE {table} SET user_id=? WHERE user_id=''", (LOCAL_USER_ID,))
 
 
 def get_user_by_email(email: str) -> sqlite3.Row | None:
@@ -456,3 +497,34 @@ def delete_job_queue_entry(queue_id: str) -> bool:
     with _connection() as conn:
         cursor = conn.execute("DELETE FROM application_queue WHERE id=? AND user_id=?", (queue_id, user_id))
     return cursor.rowcount > 0
+
+
+def save_job_verification(record: dict[str, Any]) -> None:
+    with _connection() as conn:
+        conn.execute("""INSERT INTO job_verifications
+            (job_id, status, checked_at, official_url, final_url, http_status,
+             page_title, evidence_json, message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+              status=excluded.status, checked_at=excluded.checked_at,
+              official_url=excluded.official_url, final_url=excluded.final_url,
+              http_status=excluded.http_status, page_title=excluded.page_title,
+              evidence_json=excluded.evidence_json, message=excluded.message""", (
+                record["job_id"], record["status"], record["checked_at"],
+                record["official_url"], record.get("final_url", ""), record.get("http_status"),
+                record.get("page_title", ""),
+                json.dumps(record.get("evidence", []), ensure_ascii=False), record.get("message", ""),
+            ))
+
+
+def get_job_verification(job_id: str) -> dict[str, Any] | None:
+    try:
+        with _connection() as conn:
+            row = conn.execute("SELECT * FROM job_verifications WHERE job_id=?", (job_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    result = dict(row)
+    result["evidence"] = json.loads(result.pop("evidence_json") or "[]")
+    return result

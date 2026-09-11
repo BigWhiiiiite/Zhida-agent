@@ -48,6 +48,7 @@
 .account-chip strong { color: #fff; font-size: 10px; }
 .account-chip small { color: #8ea196; font-size: 8px; margin-top: 2px; }
 .account-chip button { border: 0; background: transparent; color: #9db1a6; padding: 5px; }
+.account-chip.local { grid-template-columns: 32px 1fr; }
 
 @media (max-width: 800px) {
   .auth-shell { grid-template-columns: 1fr; gap: 30px; }

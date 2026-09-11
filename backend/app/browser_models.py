@@ -9,6 +9,14 @@ class BrowserStart(BaseModel):
     url: str
 
 
+class ExpandSectionRequest(BaseModel):
+    selector: str = Field(min_length=1, max_length=1000)
+
+
+class NativeResumeImportRequest(BaseModel):
+    resume_id: str = Field(min_length=1, max_length=200)
+
+
 class PageField(BaseModel):
     selector: str
     label: str = ""
@@ -54,6 +62,46 @@ class FormPlan(BaseModel):
     site_type: str = "generic"
     actions: list[FillAction] = Field(default_factory=list)
     missing_questions: list[str] = Field(default_factory=list)
+
+
+class FieldComparison(BaseModel):
+    key: str
+    selector: str
+    label: str
+    field_type: str
+    required: bool = False
+    options: list[str] = Field(default_factory=list)
+    site_value: str = ""
+    expected_value: str = ""
+    value_source: str = ""
+    status: Literal["matched", "missing", "conflict", "manual_review", "unmapped", "option_unavailable"]
+    recommendation: str = ""
+
+
+class ComparisonSummary(BaseModel):
+    matched: int = 0
+    missing: int = 0
+    conflict: int = 0
+    manual_review: int = 0
+    unmapped: int = 0
+    option_unavailable: int = 0
+
+
+class FormReviewResult(BaseModel):
+    snapshot: BrowserSnapshot
+    plan: FormPlan
+    comparisons: list[FieldComparison] = Field(default_factory=list)
+    summary: ComparisonSummary = Field(default_factory=ComparisonSummary)
+
+
+class NativeResumeImportResult(BaseModel):
+    snapshot: BrowserSnapshot
+    uploaded_file: str
+    trigger_clicked: bool = False
+    trigger_label: str = ""
+    changed_fields: int = 0
+    status: Literal["parsed", "uploaded", "needs_user_action"] = "uploaded"
+    message: str = ""
 
 
 class ExecutePlanRequest(BaseModel):
