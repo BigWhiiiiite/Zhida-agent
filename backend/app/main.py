@@ -27,7 +27,9 @@ from .browser_models import (BrowserSnapshot, BrowserStart, ExecutePlanRequest, 
 from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
 from .form_agent import build_form_review, create_form_plan, create_local_form_plan
-from .job_models import ApplicationQueueItem, JobVerification, QueueAddRequest, RecommendationBatch
+from .job_discovery import official_job_sources, sync_official_source
+from .job_models import (ApplicationQueueItem, JobDiscoveryResult, JobVerification,
+                         OfficialJobSource, QueueAddRequest, RecommendationBatch)
 from .job_recommendations import (add_to_queue, queue_items, recommendation_batch,
                                   remove_from_queue, verify_catalog_job)
 from .models import (ApplicationAnswerUpdate, CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
@@ -185,6 +187,19 @@ def job_recommendations(location: str = "") -> RecommendationBatch:
 @app.get("/api/jobs/queue", response_model=list[ApplicationQueueItem])
 def application_queue() -> list[ApplicationQueueItem]:
     return queue_items(get_profile())
+
+
+@app.get("/api/jobs/sources", response_model=list[OfficialJobSource])
+def job_sources() -> list[OfficialJobSource]:
+    return official_job_sources()
+
+
+@app.post("/api/jobs/sources/{source_id}/sync", response_model=JobDiscoveryResult)
+async def sync_job_source(source_id: str) -> JobDiscoveryResult:
+    try:
+        return await sync_official_source(source_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/jobs/{job_id}/verify", response_model=JobVerification)

@@ -11,6 +11,7 @@ LiveJobStatus = Literal["not_checked", "open", "closed", "manual_gate", "mismatc
 ApplyMode = Literal["direct", "search"]
 QueueTrack = Literal["steady", "stretch"]
 QueueStatus = Literal["planned", "in_progress", "needs_review"]
+DiscoverySyncStatus = Literal["never", "success", "partial", "failed"]
 
 
 class JobPosting(BaseModel):
@@ -36,6 +37,11 @@ class JobPosting(BaseModel):
     last_checked_at: str = ""
     verification_message: str = ""
     verification_evidence: list[str] = Field(default_factory=list)
+    discovery_source: str = ""
+    discovered_at: str = ""
+    source_updated_at: str = ""
+    discovery_scope: str = ""
+    discovery_evidence: list[str] = Field(default_factory=list)
 
 
 class JobRecommendation(BaseModel):
@@ -86,3 +92,34 @@ class JobVerification(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     message: str
     can_proceed: bool = False
+
+
+class OfficialJobSource(BaseModel):
+    id: str
+    name: str
+    company: str
+    official_url: str
+    enabled: bool = True
+    coverage: str
+    last_status: DiscoverySyncStatus = "never"
+    last_completed_at: str = ""
+    last_message: str = "尚未同步"
+    jobs_seen: int = 0
+    total_available: int | None = None
+    partial: bool = True
+
+
+class JobDiscoveryResult(BaseModel):
+    source_id: str
+    source_name: str
+    status: DiscoverySyncStatus
+    started_at: datetime
+    completed_at: datetime
+    jobs_seen: int = 0
+    created: int = 0
+    updated: int = 0
+    skipped: int = 0
+    total_available: int | None = None
+    partial: bool = True
+    message: str
+    jobs: list[JobPosting] = Field(default_factory=list)

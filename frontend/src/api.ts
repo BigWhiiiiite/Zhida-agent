@@ -1,4 +1,4 @@
-import type { ApplicationQueueItem, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobVerification, NativeResumeImportResult, PreSubmitCheck, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
+import type { ApplicationQueueItem, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobDiscoveryResult, JobVerification, NativeResumeImportResult, OfficialJobSource, PreSubmitCheck, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
 
 export const API = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/api`
 const nativeFetch=window.fetch.bind(window)
@@ -24,6 +24,8 @@ export const api={
   saveProfile:(profile:ResumeProfile)=>fetch(`${API}/profile`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(profile)}).then(result<CandidateProfile>),
   saveApplicationAnswer:(question:string,field_name:string,value:string)=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value})}).then(result<CandidateProfile>),
   recommendations:(location='')=>fetch(`${API}/jobs/recommendations${location?`?location=${encodeURIComponent(location)}`:''}`).then(result<RecommendationBatch>),
+  jobSources:()=>fetch(`${API}/jobs/sources`).then(result<OfficialJobSource[]>),
+  syncJobSource:(id:string)=>fetch(`${API}/jobs/sources/${encodeURIComponent(id)}/sync`,{method:'POST'}).then(result<JobDiscoveryResult>),
   verifyJob:(id:string)=>fetch(`${API}/jobs/${encodeURIComponent(id)}/verify`,{method:'POST'}).then(result<JobVerification>),
   jobQueue:()=>fetch(`${API}/jobs/queue`).then(result<ApplicationQueueItem[]>),
   queueJobs:(job_ids:string[],resume_id:string)=>fetch(`${API}/jobs/queue`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids,resume_id})}).then(result<ApplicationQueueItem[]>),

@@ -252,6 +252,8 @@ with TemporaryDirectory() as temporary:
     with TestClient(main.app) as client:
         assert client.get("/api/health").json()["product"] == "Zhida"
         assert "/api/jobs/{job_id}/verify" in client.get("/openapi.json").json()["paths"]
+        assert "/api/jobs/sources" in client.get("/openapi.json").json()["paths"]
+        assert "/api/jobs/sources/{source_id}/sync" in client.get("/openapi.json").json()["paths"]
         os.environ["APP_AUTH_REQUIRED"] = "false"
         local_me = client.get("/api/auth/me")
         assert local_me.status_code == 200
@@ -333,7 +335,7 @@ with TemporaryDirectory() as temporary:
         recommendations = client.get("/api/jobs/recommendations")
         assert recommendations.status_code == 200
         recommendation_json = recommendations.json()
-        assert recommendation_json["engine"] == "official-verified-local-score-v2"
+        assert recommendation_json["engine"] == "official-discovery-verified-local-score-v3"
         assert len(recommendation_json["jobs"]) >= 5
         scores = [item["match_score"] for item in recommendation_json["jobs"]]
         assert scores == sorted(scores, reverse=True)

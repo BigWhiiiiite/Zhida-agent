@@ -22,14 +22,29 @@
 .profile-warning strong { font-size: 11px; }
 .profile-warning small { font-size: 9px; margin-top: 3px; }
 .recommendation-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 15px; }
-.recommendation-filters { display: flex; align-items: center; gap: 8px; }
+.recommendation-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .recommendation-filters label { display: flex; flex-direction: column; gap: 4px; }
 .recommendation-filters label > span { color: var(--muted); font-size: 8px; font-weight: 700; }
-.recommendation-filters select, .queue-resume select {
+.recommendation-filters select, .recommendation-filters input, .queue-resume select {
   border: 1px solid var(--line); background: #fff; color: #263a30;
   border-radius: 8px; padding: 9px 10px; font-size: 10px;
 }
+.recommendation-filters input { min-width: 180px; }
+.source-sync-strip { display: grid; gap: 7px; margin-top: 13px; }
+.source-sync-strip > div {
+  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px;
+  border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px; background: #f8faf7;
+}
+.source-sync-strip > div > svg { color: #557464; }
+.source-sync-strip span, .source-sync-strip strong, .source-sync-strip small { display: block; }
+.source-sync-strip strong { font-size: 9px; }
+.source-sync-strip small { color: var(--muted); font-size: 8px; margin-top: 2px; }
+.source-sync-strip em { font-size: 8px; font-style: normal; color: #68766e; }
+.source-sync-strip .partial { border-color: #dfc997; background: #fffaf0; }
+.source-sync-strip .failed { border-color: #e6c7c3; background: #fff3f1; }
+.source-sync-strip .success { border-color: #bdd8bb; background: #f0f7ed; }
 .job-empty { grid-column: 1 / -1; min-height: 210px; }
+.load-more { display: flex; justify-content: center; width: 100%; margin-top: 12px; }
 .batch-bar {
   display: flex; align-items: center; gap: 12px; background: #f4f7f1;
   border-radius: 10px; padding: 10px 12px; margin-top: 18px;
@@ -65,6 +80,11 @@
 .score.medium { background: #fff0d5; color: #93621a; }
 .score.low { background: #f3e5e2; color: #8d5049; }
 .job-description { font-size: 10px; line-height: 1.65; color: #56645c; margin: 13px 0; }
+.discovery-meta {
+  display: flex; align-items: flex-start; gap: 5px; margin: -5px 0 11px; color: #6d7b73;
+}
+.discovery-meta svg { flex: 0 0 auto; }
+.discovery-meta span { font-size: 8px; line-height: 1.45; }
 .match-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; border-top: 1px solid #edf0ec; padding-top: 11px; }
 .match-columns > div > span { display: block; font-size: 8px; color: #87928c; margin-bottom: 5px; }
 .skill-tags { display: flex; gap: 4px; flex-wrap: wrap; }

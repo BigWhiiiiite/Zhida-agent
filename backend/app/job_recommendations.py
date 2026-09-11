@@ -3,11 +3,13 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, timedelta, timezone
 
+from pydantic import ValidationError
+
 from .job_models import (ApplicationQueueItem, JobPosting, JobRecommendation,
                          JobVerification, QueueAddRequest, RecommendationBatch)
 from .models import CandidateProfile
 from .storage import (add_job_queue_entries, delete_job_queue_entry, get_job_verification,
-                      get_resume, list_job_queue_entries)
+                      get_resume, list_discovered_jobs, list_job_queue_entries)
 
 
 # This seed catalog keeps the recommendation-to-autofill loop usable while live
@@ -150,6 +152,37 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
 VERIFICATION_TTL = timedelta(hours=6)
 
 
+def all_jobs() -> tuple[JobPosting, ...]:
+    """Merge curated metadata with official discoveries without duplicating job codes."""
+    jobs = list(JOB_CATALOG)
+    positions = {
+        (job.company.casefold(), job.job_code.casefold()): index
+        for index, job in enumerate(jobs) if job.job_code
+    }
+    for payload in list_discovered_jobs():
+        try:
+            discovered = JobPosting.model_validate(payload)
+        except ValidationError:
+            continue
+        key = (discovered.company.casefold(), discovered.job_code.casefold())
+        if discovered.job_code and key in positions:
+            index = positions[key]
+            curated = jobs[index]
+            jobs[index] = curated.model_copy(update={
+                "url": discovered.url,
+                "source_url": discovered.source_url,
+                "discovery_source": discovered.discovery_source,
+                "discovered_at": discovered.discovered_at,
+                "source_updated_at": discovered.source_updated_at,
+                "discovery_scope": discovered.discovery_scope,
+                "discovery_evidence": discovered.discovery_evidence,
+            })
+            continue
+        positions[key] = len(jobs)
+        jobs.append(discovered)
+    return tuple(jobs)
+
+
 ALIASES: dict[str, tuple[str, ...]] = {
     "Agent": ("agent", "智能体", "multi-agent", "multi agent", "agent workflow"),
     "大语言模型": ("大语言模型", "大模型", "llm", "aigc"),
@@ -256,7 +289,8 @@ def _fresh_verification(record: dict | None) -> bool:
 
 def _score(profile: CandidateProfile, job: JobPosting, preferred_location: str = "") -> JobRecommendation:
     verification = get_job_verification(job.id)
-    if _fresh_verification(verification):
+    if (_fresh_verification(verification)
+            and verification.get("official_url") == job.source_url):
         job = job.model_copy(update={
             "live_status": verification["status"],
             "last_checked_at": verification["checked_at"],
@@ -322,14 +356,15 @@ def _score(profile: CandidateProfile, job: JobPosting, preferred_location: str =
 
 
 def recommendation_batch(profile: CandidateProfile, preferred_location: str = "") -> RecommendationBatch:
+    catalog = all_jobs()
     available_locations = list(dict.fromkeys(
-        location for job in JOB_CATALOG for location in job.locations if location.strip()
+        location for job in catalog for location in job.locations if location.strip()
     ))
     selected_location = next(
         (location for location in available_locations
          if _normalize_location(location) == _normalize_location(preferred_location)), ""
     ) if preferred_location.strip() else ""
-    recommendations = [_score(profile, job, selected_location) for job in JOB_CATALOG]
+    recommendations = [_score(profile, job, selected_location) for job in catalog]
     if selected_location:
         recommendations = [item for item in recommendations if item.location_match is True]
     jobs = sorted(recommendations,
@@ -341,7 +376,7 @@ def recommendation_batch(profile: CandidateProfile, preferred_location: str = ""
         summary_parts.append(f"预计 {year} 年毕业")
     if selected_location:
         summary_parts.append(f"工作地点：{selected_location}")
-    return RecommendationBatch(generated_at=datetime.now(timezone.utc), engine="official-verified-local-score-v2",
+    return RecommendationBatch(generated_at=datetime.now(timezone.utc), engine="official-discovery-verified-local-score-v3",
                                profile_summary=" · ".join(summary_parts),
                                available_locations=available_locations,
                                selected_location=selected_location, jobs=jobs)
@@ -352,7 +387,7 @@ def _recommendation_by_id(profile: CandidateProfile, job_id: str) -> JobRecommen
 
 
 def catalog_job(job_id: str) -> JobPosting | None:
-    return next((job for job in JOB_CATALOG if job.id == job_id), None)
+    return next((job for job in all_jobs() if job.id == job_id), None)
 
 
 async def verify_catalog_job(job_id: str) -> JobVerification:
@@ -373,7 +408,7 @@ def queue_items(profile: CandidateProfile) -> list[ApplicationQueueItem]:
 
 
 def add_to_queue(profile: CandidateProfile, payload: QueueAddRequest) -> list[ApplicationQueueItem]:
-    known = {job.id for job in JOB_CATALOG}
+    known = {job.id for job in all_jobs()}
     unknown = [job_id for job_id in payload.job_ids if job_id not in known]
     if unknown:
         raise ValueError(f"岗位不存在：{', '.join(unknown)}")

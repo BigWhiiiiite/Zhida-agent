@@ -138,11 +138,26 @@ def initialize() -> None:
                 evidence_json TEXT NOT NULL DEFAULT '[]', message TEXT NOT NULL DEFAULT ''
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS discovered_jobs (
+                job_id TEXT PRIMARY KEY, source_id TEXT NOT NULL, job_json TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS job_source_runs (
+                source_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                started_at TEXT NOT NULL, completed_at TEXT NOT NULL,
+                jobs_seen INTEGER NOT NULL DEFAULT 0, total_available INTEGER,
+                partial INTEGER NOT NULL DEFAULT 1, message TEXT NOT NULL DEFAULT ''
+            )
+        """)
         _add_missing_columns(conn, "application_queue", {"user_id": "TEXT NOT NULL DEFAULT ''"})
         _migrate_application_queue(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes(user_id, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conflicts_user ON conflicts(user_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_discovered_jobs_source ON discovered_jobs(source_id, last_seen_at)")
         conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_user
                         ON candidate_profiles(user_id) WHERE user_id != ''""")
 
@@ -527,4 +542,76 @@ def get_job_verification(job_id: str) -> dict[str, Any] | None:
         return None
     result = dict(row)
     result["evidence"] = json.loads(result.pop("evidence_json") or "[]")
+    return result
+
+
+def save_discovered_jobs(source_id: str, jobs: list[dict[str, Any]], seen_at: str) -> tuple[int, int]:
+    created = updated = 0
+    with _connection() as conn:
+        for job in jobs:
+            existing = conn.execute(
+                "SELECT 1 FROM discovered_jobs WHERE job_id=?", (job["id"],)
+            ).fetchone()
+            conn.execute("""INSERT INTO discovered_jobs
+                (job_id, source_id, job_json, first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                  source_id=excluded.source_id, job_json=excluded.job_json,
+                  last_seen_at=excluded.last_seen_at""", (
+                    job["id"], source_id, json.dumps(job, ensure_ascii=False), seen_at, seen_at,
+                ))
+            if existing:
+                updated += 1
+            else:
+                created += 1
+    return created, updated
+
+
+def list_discovered_jobs() -> list[dict[str, Any]]:
+    try:
+        with _connection() as conn:
+            rows = conn.execute(
+                "SELECT job_json FROM discovered_jobs ORDER BY last_seen_at DESC"
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            result.append(json.loads(row["job_json"]))
+        except (TypeError, json.JSONDecodeError):
+            continue
+    return result
+
+
+def save_job_source_run(record: dict[str, Any]) -> None:
+    with _connection() as conn:
+        conn.execute("""INSERT INTO job_source_runs
+            (source_id, status, started_at, completed_at, jobs_seen,
+             total_available, partial, message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_id) DO UPDATE SET
+              status=excluded.status, started_at=excluded.started_at,
+              completed_at=excluded.completed_at, jobs_seen=excluded.jobs_seen,
+              total_available=excluded.total_available, partial=excluded.partial,
+              message=excluded.message""", (
+                record["source_id"], record["status"], record["started_at"],
+                record["completed_at"], record.get("jobs_seen", 0),
+                record.get("total_available"), int(bool(record.get("partial", True))),
+                record.get("message", ""),
+            ))
+
+
+def get_job_source_run(source_id: str) -> dict[str, Any] | None:
+    try:
+        with _connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM job_source_runs WHERE source_id=?", (source_id,)
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    result = dict(row)
+    result["partial"] = bool(result["partial"])
     return result
