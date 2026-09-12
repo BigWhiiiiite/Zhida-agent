@@ -126,6 +126,8 @@ def initialize() -> None:
             CREATE TABLE IF NOT EXISTS application_queue (
                 id TEXT PRIMARY KEY, user_id TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL,
                 resume_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned',
+                notes TEXT NOT NULL DEFAULT '', application_id TEXT NOT NULL DEFAULT '',
+                status_changed_at TEXT NOT NULL DEFAULT '', submitted_at TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 UNIQUE(user_id, job_id)
             )
@@ -154,6 +156,14 @@ def initialize() -> None:
         """)
         _add_missing_columns(conn, "application_queue", {"user_id": "TEXT NOT NULL DEFAULT ''"})
         _migrate_application_queue(conn)
+        _add_missing_columns(conn, "application_queue", {
+            "notes": "TEXT NOT NULL DEFAULT ''",
+            "application_id": "TEXT NOT NULL DEFAULT ''",
+            "status_changed_at": "TEXT NOT NULL DEFAULT ''",
+            "submitted_at": "TEXT",
+        })
+        conn.execute("""UPDATE application_queue SET status_changed_at=updated_at
+                        WHERE status_changed_at=''""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes(user_id, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conflicts_user ON conflicts(user_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at)")
@@ -494,9 +504,10 @@ def add_job_queue_entries(job_ids: list[str], resume_id: str = "") -> None:
                                 WHERE user_id=? AND job_id=?""", (resume_id, now, user_id, job_id))
             else:
                 conn.execute("""INSERT INTO application_queue
-                    (id, user_id, job_id, resume_id, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'planned', ?, ?)""",
-                    (str(uuid4()), user_id, job_id, resume_id, now, now))
+                    (id, user_id, job_id, resume_id, status, status_changed_at,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'planned', ?, ?, ?)""",
+                    (str(uuid4()), user_id, job_id, resume_id, now, now, now))
 
 
 def list_job_queue_entries() -> list[dict[str, str]]:
@@ -512,6 +523,28 @@ def delete_job_queue_entry(queue_id: str) -> bool:
     with _connection() as conn:
         cursor = conn.execute("DELETE FROM application_queue WHERE id=? AND user_id=?", (queue_id, user_id))
     return cursor.rowcount > 0
+
+
+def update_job_queue_entry(queue_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
+    user_id, now = current_user_id(), _now()
+    allowed = {"status", "notes", "application_id", "submitted_at", "status_changed_at"}
+    updates = {key: value for key, value in changes.items() if key in allowed}
+    updates["updated_at"] = now
+    if not updates:
+        return None
+    assignments = ", ".join(f"{key}=?" for key in updates)
+    with _connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE application_queue SET {assignments} WHERE id=? AND user_id=?",
+            (*updates.values(), queue_id, user_id),
+        )
+        if not cursor.rowcount:
+            return None
+        row = conn.execute(
+            "SELECT * FROM application_queue WHERE id=? AND user_id=?",
+            (queue_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def save_job_verification(record: dict[str, Any]) -> None:

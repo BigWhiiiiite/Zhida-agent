@@ -21,6 +21,24 @@
 .profile-warning strong, .profile-warning small { display: block; }
 .profile-warning strong { font-size: 11px; }
 .profile-warning small { font-size: 9px; margin-top: 3px; }
+.readiness-card {
+  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 18px;
+  border-color: #bad6b9; background: linear-gradient(135deg, #f1f8ee, #fbfdf9);
+}
+.readiness-card.blocked { border-color: #e5c9a4; background: linear-gradient(135deg, #fff8eb, #fffdf9); }
+.readiness-score { display: grid; grid-template-columns: auto auto; align-items: center; gap: 3px 8px; color: #376345; }
+.readiness-score strong { font-size: 23px; line-height: 1; }
+.readiness-score span { grid-column: 1 / -1; font-size: 8px; color: var(--muted); }
+.readiness-body h3 { font-size: 11px; margin: 0 0 3px; }
+.readiness-body p, .readiness-body small { display: block; font-size: 8px; line-height: 1.55; margin: 0; }
+.readiness-body small { color: #806738; margin-top: 3px; }
+.readiness-body .model-health { margin-top: 5px; color: #7c642e; }
+.readiness-body .model-health.ok { color: #327044; }
+.readiness-body .model-health.unavailable, .readiness-body .model-health.misconfigured { color: #934b44; }
+.readiness-stats { display: flex; align-items: center; gap: 13px; }
+.readiness-stats span { color: var(--muted); font-size: 8px; text-align: center; }
+.readiness-stats strong { display: block; color: #324b3b; font-size: 13px; }
+.readiness-stats button { white-space: nowrap; }
 .recommendation-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 15px; }
 .recommendation-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .recommendation-filters label { display: flex; flex-direction: column; gap: 4px; }
@@ -121,16 +139,27 @@
 .job-card footer .secondary, .job-card footer .primary { font-size: 9px; padding: 7px 8px; }
 .queue-list { display: flex; flex-direction: column; gap: 8px; margin-top: 17px; }
 .queue-list article {
-  display: grid; grid-template-columns: 36px 1fr auto auto; gap: 10px; align-items: center;
+  display: grid; grid-template-columns: 36px minmax(180px, 1fr) auto; gap: 10px; align-items: center;
   border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
 }
+.queue-list article.queue-ready_to_submit { border-color: #d8b969; background: #fffdf7; }
+.queue-list article.queue-submitted, .queue-list article.queue-interview, .queue-list article.queue-offer { border-color: #b9d7bd; background: #f6fbf5; }
 .queue-company {
   width: 34px; height: 34px; border-radius: 9px; background: #e7f0df;
   color: #2d5b3e; display: grid; place-items: center; font-size: 13px; font-weight: 700;
 }
-.queue-list strong, .queue-list span { display: block; }
+.queue-list strong, .queue-list span, .queue-list small { display: block; }
 .queue-list strong { font-size: 11px; }
 .queue-list span { font-size: 8px; color: var(--muted); margin-top: 3px; }
+.queue-list small { color: #51725d; font-size: 8px; margin-top: 3px; }
+.queue-controls { display: flex; align-items: center; gap: 6px; }
+.queue-controls select, .queue-details input {
+  border: 1px solid var(--line); background: #fff; border-radius: 8px;
+  color: #2d4035; font-size: 9px; padding: 8px 9px;
+}
+.queue-details { grid-column: 2 / 4; display: grid; grid-template-columns: minmax(150px, .35fr) 1fr; gap: 8px; }
+.queue-details label span { margin: 0 0 3px; font-size: 8px; }
+.queue-details input { width: 100%; box-sizing: border-box; }
 .queue-remove {
   border: 1px solid #e6cfcc; background: #fff; color: #a44843;
   border-radius: 8px; padding: 8px; display: grid; place-items: center;
@@ -152,6 +181,8 @@
 }
 
 @media (max-width: 760px) {
+  .readiness-card { grid-template-columns: 1fr; }
+  .readiness-stats { justify-content: flex-start; }
   .recommendation-hero, .recommendation-toolbar { align-items: flex-start; flex-direction: column; }
   .recommendation-stats { text-align: left; }
   .recommendation-filters, .batch-bar { width: 100%; flex-wrap: wrap; }
@@ -162,7 +193,8 @@
   .job-card-top .score { grid-column: 3; grid-row: 2; width: auto; height: auto; border-radius: 8px; padding: 5px; display: flex; gap: 4px; }
   .match-columns { grid-template-columns: 1fr; }
   .job-card footer > div:last-child > * { flex: 1; justify-content: center; }
-  .queue-list article { grid-template-columns: 36px 1fr auto; }
-  .queue-list article > .secondary { grid-column: 2 / 4; justify-content: center; }
-  .queue-remove { grid-column: 3; grid-row: 1; }
+  .queue-list article { grid-template-columns: 36px 1fr; }
+  .queue-controls, .queue-details { grid-column: 1 / -1; }
+  .queue-controls { flex-wrap: wrap; }
+  .queue-details { grid-template-columns: 1fr; }
 }

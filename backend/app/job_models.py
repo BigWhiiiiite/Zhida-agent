@@ -10,7 +10,10 @@ SourceStatus = Literal["verified", "verify_on_open"]
 LiveJobStatus = Literal["not_checked", "open", "closed", "manual_gate", "mismatch", "unreachable"]
 ApplyMode = Literal["direct", "search"]
 QueueTrack = Literal["steady", "stretch"]
-QueueStatus = Literal["planned", "in_progress", "needs_review"]
+QueueStatus = Literal[
+    "planned", "in_progress", "needs_review", "ready_to_submit",
+    "submitted", "interview", "offer", "rejected", "withdrawn",
+]
 DiscoverySyncStatus = Literal["never", "success", "partial", "failed"]
 
 
@@ -76,9 +79,34 @@ class ApplicationQueueItem(BaseModel):
     job_id: str
     resume_id: str = ""
     status: QueueStatus = "planned"
+    notes: str = ""
+    application_id: str = ""
+    status_changed_at: datetime
+    submitted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     recommendation: JobRecommendation
+
+
+class ApplicationQueueUpdate(BaseModel):
+    status: QueueStatus | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+    application_id: str | None = Field(default=None, max_length=200)
+    candidate_confirmed: bool = False
+
+
+class ApplicationReadiness(BaseModel):
+    ready: bool
+    score: int = Field(ge=0, le=100)
+    blockers: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    resume_count: int = 0
+    default_resume_id: str = ""
+    pending_resume_fields: int = 0
+    pending_conflicts: int = 0
+    queued_jobs: int = 0
+    official_sources_ready: int = 0
+    official_sources_total: int = 0
 
 
 class JobVerification(BaseModel):

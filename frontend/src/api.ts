@@ -1,4 +1,4 @@
-import type { ApplicationQueueItem, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobDiscoveryResult, JobVerification, NativeResumeImportResult, OfficialJobSource, PreSubmitCheck, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
+import type { ApplicationQueueItem, ApplicationReadiness, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobDiscoveryResult, JobVerification, ModelHealth, NativeResumeImportResult, OfficialJobSource, PreSubmitCheck, QueueStatus, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
 
 export const API = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/api`
 const nativeFetch=window.fetch.bind(window)
@@ -27,8 +27,11 @@ export const api={
   jobSources:()=>fetch(`${API}/jobs/sources`).then(result<OfficialJobSource[]>),
   syncJobSource:(id:string)=>fetch(`${API}/jobs/sources/${encodeURIComponent(id)}/sync`,{method:'POST'}).then(result<JobDiscoveryResult>),
   verifyJob:(id:string)=>fetch(`${API}/jobs/${encodeURIComponent(id)}/verify`,{method:'POST'}).then(result<JobVerification>),
+  readiness:()=>fetch(`${API}/readiness`).then(result<ApplicationReadiness>),
+  modelHealth:()=>fetch(`${API}/model/health`,{method:'POST'}).then(result<ModelHealth>),
   jobQueue:()=>fetch(`${API}/jobs/queue`).then(result<ApplicationQueueItem[]>),
   queueJobs:(job_ids:string[],resume_id:string)=>fetch(`${API}/jobs/queue`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids,resume_id})}).then(result<ApplicationQueueItem[]>),
+  updateQueuedJob:(id:string,patch:{status?:QueueStatus;notes?:string;application_id?:string;candidate_confirmed?:boolean})=>fetch(`${API}/jobs/queue/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(result<ApplicationQueueItem>),
   removeQueuedJob:(id:string)=>fetch(`${API}/jobs/queue/${id}`,{method:'DELETE'}).then(result<void>),
   list:()=>fetch(`${API}/resumes`).then(result<ResumeRecord[]>),
   upload:(file:File)=>{const data=new FormData();data.append('file',file);return fetch(`${API}/resumes`,{method:'POST',body:data}).then(result<ResumeRecord>)},

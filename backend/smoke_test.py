@@ -356,6 +356,34 @@ with TemporaryDirectory() as temporary:
         assert queued.json()[0]["resume_id"] == first_json["id"]
         queue_id = queued.json()[0]["id"]
         assert client.get("/api/jobs/queue").json()[0]["recommendation"]["reasons"]
+        readiness = client.get("/api/readiness")
+        assert readiness.status_code == 200 and not readiness.json()["ready"]
+        assert readiness.json()["resume_count"] == 1
+        assert "主档案缺少教育经历" in readiness.json()["blockers"]
+        unconfirmed = client.patch(
+            f"/api/jobs/queue/{queue_id}", json={"status": "submitted"}
+        )
+        assert unconfirmed.status_code == 422
+        progressing = client.patch(f"/api/jobs/queue/{queue_id}", json={
+            "status": "in_progress", "notes": "等待补充开放题",
+        })
+        assert progressing.status_code == 200
+        assert progressing.json()["status"] == "in_progress"
+        assert progressing.json()["notes"] == "等待补充开放题"
+        submitted = client.patch(f"/api/jobs/queue/{queue_id}", json={
+            "status": "submitted", "application_id": "APP-2026-001",
+            "candidate_confirmed": True,
+        })
+        assert submitted.status_code == 200
+        assert submitted.json()["submitted_at"] and submitted.json()["application_id"] == "APP-2026-001"
+        exported_queue = client.get("/api/jobs/queue-export.csv")
+        assert exported_queue.status_code == 200
+        assert "text/csv" in exported_queue.headers["content-type"]
+        assert "APP-2026-001" in exported_queue.content.decode("utf-8-sig")
+        protected_delete = client.delete(f"/api/jobs/queue/{queue_id}")
+        assert protected_delete.status_code == 409
+        withdrawn = client.patch(f"/api/jobs/queue/{queue_id}", json={"status": "withdrawn"})
+        assert withdrawn.status_code == 200 and withdrawn.json()["status"] == "withdrawn"
         assert client.delete(f"/api/jobs/queue/{queue_id}").status_code == 204
         assert client.get("/api/jobs/queue").json() == []
         unknown_job = client.post("/api/jobs/queue", json={"job_ids": ["not-a-job"], "resume_id": ""})

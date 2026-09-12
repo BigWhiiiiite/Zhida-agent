@@ -5,11 +5,14 @@ from datetime import date, datetime, timedelta, timezone
 
 from pydantic import ValidationError
 
-from .job_models import (ApplicationQueueItem, JobPosting, JobRecommendation,
+from .job_discovery import official_job_sources
+from .job_models import (ApplicationQueueItem, ApplicationQueueUpdate,
+                         ApplicationReadiness, JobPosting, JobRecommendation,
                          JobVerification, QueueAddRequest, RecommendationBatch)
 from .models import CandidateProfile
 from .storage import (add_job_queue_entries, delete_job_queue_entry, get_job_verification,
-                      get_resume, list_discovered_jobs, list_job_queue_entries)
+                      get_resume, list_conflicts, list_discovered_jobs,
+                      list_job_queue_entries, list_resumes, update_job_queue_entry)
 
 
 # This seed catalog keeps the recommendation-to-autofill loop usable while live
@@ -418,5 +421,81 @@ def add_to_queue(profile: CandidateProfile, payload: QueueAddRequest) -> list[Ap
     return queue_items(profile)
 
 
-def remove_from_queue(queue_id: str) -> bool:
+def remove_from_queue(profile: CandidateProfile, queue_id: str) -> bool:
+    current = next((item for item in queue_items(profile) if item.id == queue_id), None)
+    if not current:
+        return False
+    if current.status in {"submitted", "interview", "offer"}:
+        raise ValueError("正式投递记录不能直接删除，请先将状态改为已撤回")
     return delete_job_queue_entry(queue_id)
+
+
+def update_queue_item(profile: CandidateProfile, queue_id: str,
+                      payload: ApplicationQueueUpdate) -> ApplicationQueueItem:
+    current = next((item for item in queue_items(profile) if item.id == queue_id), None)
+    if not current:
+        raise LookupError("候选投递记录不存在")
+    changes = payload.model_dump(exclude_none=True, exclude={"candidate_confirmed"})
+    next_status = payload.status
+    externally_confirmed = {"submitted", "interview", "offer"}
+    if next_status in externally_confirmed and not payload.candidate_confirmed:
+        raise ValueError("该状态必须由候选人确认后记录")
+    if next_status and next_status != current.status:
+        now = datetime.now(timezone.utc).isoformat()
+        changes["status_changed_at"] = now
+        if next_status == "submitted" and not current.submitted_at:
+            changes["submitted_at"] = now
+    if payload.notes is not None:
+        changes["notes"] = payload.notes.strip()
+    if payload.application_id is not None:
+        changes["application_id"] = payload.application_id.strip()
+    if not update_job_queue_entry(queue_id, changes):
+        raise LookupError("候选投递记录不存在")
+    updated = next((item for item in queue_items(profile) if item.id == queue_id), None)
+    if not updated:
+        raise LookupError("候选投递记录不存在")
+    return updated
+
+
+def application_readiness(profile: CandidateProfile) -> ApplicationReadiness:
+    resumes = [item for item in list_resumes() if item.status != "failed"]
+    pending_resume_fields = sum(
+        1 for resume in resumes for evidence in resume.evidence
+        if evidence.status == "pending_review"
+    )
+    pending_conflicts = len(list_conflicts())
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not profile.name.strip():
+        blockers.append("主档案缺少姓名")
+    if not (profile.phone.strip() or profile.email.strip()):
+        blockers.append("主档案至少需要手机号或邮箱")
+    if not profile.education:
+        blockers.append("主档案缺少教育经历")
+    if not resumes:
+        blockers.append("没有可用简历文件")
+    if not profile.target_role.strip():
+        warnings.append("尚未设置目标岗位，推荐准确度会降低")
+    if not profile.target_cities:
+        warnings.append("尚未设置目标工作地点")
+    if not profile.skills:
+        warnings.append("尚未确认技能关键词")
+    default_resume = next((item for item in resumes if item.is_default), None)
+    if resumes and not default_resume:
+        warnings.append("尚未设置默认投递简历")
+    if pending_resume_fields:
+        warnings.append(f"仍有 {pending_resume_fields} 个简历字段待确认")
+    if pending_conflicts:
+        warnings.append(f"仍有 {pending_conflicts} 个简历冲突待处理")
+    sources = official_job_sources()
+    ready_sources = [source for source in sources if source.last_status == "success"]
+    if not ready_sources:
+        warnings.append("官方岗位源尚未完成一次全量同步")
+    score = max(0, min(100, 100 - 20 * len(blockers) - 5 * len(warnings)))
+    return ApplicationReadiness(
+        ready=not blockers, score=score, blockers=blockers, warnings=warnings,
+        resume_count=len(resumes), default_resume_id=default_resume.id if default_resume else "",
+        pending_resume_fields=pending_resume_fields, pending_conflicts=pending_conflicts,
+        queued_jobs=len(list_job_queue_entries()), official_sources_ready=len(ready_sources),
+        official_sources_total=len(sources),
+    )

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import os
+import csv
+import io
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,10 +30,12 @@ from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
 from .form_agent import build_form_review, create_form_plan, create_local_form_plan
 from .job_discovery import official_job_sources, sync_official_source
-from .job_models import (ApplicationQueueItem, JobDiscoveryResult, JobVerification,
+from .job_models import (ApplicationQueueItem, ApplicationQueueUpdate,
+                         ApplicationReadiness, JobDiscoveryResult, JobVerification,
                          OfficialJobSource, QueueAddRequest, RecommendationBatch)
-from .job_recommendations import (add_to_queue, queue_items, recommendation_batch,
-                                  remove_from_queue, verify_catalog_job)
+from .job_recommendations import (add_to_queue, application_readiness, queue_items,
+                                  recommendation_batch, remove_from_queue,
+                                  update_queue_item, verify_catalog_job)
 from .models import (ApplicationAnswerUpdate, CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
                      ModelHealth, ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
 from .model_provider import check_model_health
@@ -189,6 +193,11 @@ def application_queue() -> list[ApplicationQueueItem]:
     return queue_items(get_profile())
 
 
+@app.get("/api/readiness", response_model=ApplicationReadiness)
+def readiness() -> ApplicationReadiness:
+    return application_readiness(get_profile())
+
+
 @app.get("/api/jobs/sources", response_model=list[OfficialJobSource])
 def job_sources() -> list[OfficialJobSource]:
     return official_job_sources()
@@ -220,10 +229,51 @@ def add_application_queue(payload: QueueAddRequest) -> list[ApplicationQueueItem
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.patch("/api/jobs/queue/{queue_id}", response_model=ApplicationQueueItem)
+def update_application_queue(queue_id: str,
+                             payload: ApplicationQueueUpdate) -> ApplicationQueueItem:
+    try:
+        return update_queue_item(get_profile(), queue_id, payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/jobs/queue-export.csv")
+def export_application_queue() -> Response:
+    status_labels = {
+        "planned": "计划中", "in_progress": "填写中", "needs_review": "待复核",
+        "ready_to_submit": "待提交", "submitted": "已投递", "interview": "面试中",
+        "offer": "Offer", "rejected": "未通过", "withdrawn": "已撤回",
+    }
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["公司", "岗位", "职位编号", "地点", "状态", "匹配分", "申请编号",
+                     "所用简历", "加入时间", "投递时间", "备注", "官方链接"])
+    for item in queue_items(get_profile()):
+        job = item.recommendation.job
+        writer.writerow([
+            job.company, job.title, job.job_code, " / ".join(job.locations),
+            status_labels[item.status], item.recommendation.match_score,
+            item.application_id, item.resume_id, item.created_at.isoformat(),
+            item.submitted_at.isoformat() if item.submitted_at else "",
+            item.notes, job.source_url,
+        ])
+    content = ("\ufeff" + output.getvalue()).encode("utf-8")
+    return Response(
+        content=content, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=zhida-applications.csv"},
+    )
+
+
 @app.delete("/api/jobs/queue/{queue_id}", status_code=204, response_class=Response)
 def remove_application_queue(queue_id: str) -> Response:
-    if not remove_from_queue(queue_id):
-        raise HTTPException(404, "投递清单项目不存在")
+    try:
+        if not remove_from_queue(get_profile(), queue_id):
+            raise HTTPException(404, "投递清单项目不存在")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return Response(status_code=204)
 
 
