@@ -31,6 +31,8 @@ class ApplicationWorkflowState(BaseModel):
     message: str = ""
     job_title: str = ""
     job_id: str = ""
+    authenticated: bool = False
+    authentication_evidence: list[str] = Field(default_factory=list)
     authentication_methods: list[str] = Field(default_factory=list)
     requires_consent: bool = False
     verification_channel: Literal["sms", "email", "unknown", ""] = ""

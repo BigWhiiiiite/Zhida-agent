@@ -47,6 +47,49 @@ async def main() -> None:
         assert state.stage == "auth_required" and state.requires_consent
         assert {"QQ", "微信"}.issubset(state.authentication_methods)
 
+        await page.unroute_all()
+        async def moka_route(route) -> None:
+            await route.fulfill(status=200, content_type="text/html", body="""
+            <html><head><meta charset="utf-8"><title>Moka Campus</title></head><body><main>
+              <h1>AI Agent 应用开发工程师</h1>
+              <button type="button" onclick="document.body.dataset.started='yes'">立即申请</button>
+              <div style="position:fixed;inset:0;z-index:2"></div>
+            </main></body></html>
+            """)
+
+        await page.route("**/*", moka_route)
+        await page.goto("https://app.mokahr.com/campus-recruitment/bjhl/102145#/job/69089e0c-5dda-45f9-98fb-268b48fb79c4")
+        await page.evaluate("localStorage.setItem('mokaAccessToken', 'test-only-token')")
+        state = await inspect_application_page(page, "moka")
+        assert state.adapter == "moka-campus" and state.stage == "job_detail", state.model_dump()
+        assert state.authenticated and state.authentication_evidence == ["Moka 本机登录凭据"]
+        assert state.job_id == "69089e0c-5dda-45f9-98fb-268b48fb79c4"
+        await start_application(page)
+        assert await page.locator("body").get_attribute("data-started") == "yes"
+        await page.evaluate("""
+        () => {
+          localStorage.removeItem('mokaAccessToken');
+          document.querySelector('main').insertAdjacentHTML('beforeend', `
+            <label>手机号<input name="mobile"></label>
+            <button type="button">获取验证码</button>
+            <label>验证码<input name="smsCode" autocomplete="one-time-code"></label>
+          `);
+        }
+        """)
+        state = await inspect_application_page(page, "moka-login")
+        assert state.stage == "verification_required" and state.verification_channel == "sms", state.model_dump()
+        await page.set_content("""
+        <html><head><meta charset="utf-8"><title>Moka Application</title></head><body>
+          <label>姓名<input name="name" value="Test Candidate"></label>
+          <label>邮箱<input type="email" name="email"></label>
+          <label>学校<input name="school"></label>
+          <button type="button">下一步</button>
+        </body></html>
+        """)
+        state = await inspect_application_page(page, "moka-application")
+        assert state.stage == "application_form" and state.authenticated, state.model_dump()
+        assert state.authentication_evidence == ["已进入 Moka 申请表单"]
+
         async def generic_route(route) -> None:
             await route.fulfill(status=200, content_type="text/html", body="""
             <html><head><meta charset="utf-8"><title>Generic ATS</title></head><body>

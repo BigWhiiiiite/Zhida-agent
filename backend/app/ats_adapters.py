@@ -3,16 +3,20 @@ from __future__ import annotations
 import re
 from urllib.parse import parse_qs, urlparse
 
-from playwright.async_api import Locator, Page
+from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
 from .application_models import ApplicationWorkflowState, WorkflowAction
 
 
 FINAL_SUBMIT = re.compile(r"^(submit application|confirm application|确认投递|提交申请|提交简历|确认提交)$", re.I)
-APPLY_START = re.compile(r"^(apply now|apply for this job|start application|立即投递|投递简历|申请职位)$", re.I)
+APPLY_START = re.compile(
+    r"^(apply now|apply for this job|start application|立即投递|投递简历|申请职位|"
+    r"立即申请|马上申请|去申请|申请)$", re.I,
+)
 VERIFY_BUTTON = re.compile(r"^(验证|确定|继续|下一步|登录|verify|continue|next|sign in)$", re.I)
 REGISTER_BUTTON = re.compile(
-    r"^(create account|sign up|register|create my account|创建账号|创建账户|注册|立即注册|注册并登录)$", re.I,
+    r"^(create account|sign up|register|create my account|创建账号|创建账户|注册|立即注册|注册并登录|"
+    r"登录\s*[/／或]\s*注册|注册\s*[/／或]\s*登录)$", re.I,
 )
 SAFE_NEXT = re.compile(
     r"^(next|continue|save and continue|save & continue|next step|下一步|继续|保存并继续|保存并下一步|下一页)$", re.I,
@@ -54,6 +58,8 @@ def adapter_name(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
     if host == "join.qq.com" or host.endswith(".join.qq.com"):
         return "tencent-campus"
+    if host == "app.mokahr.com" or host.endswith(".mokahr.com"):
+        return "moka-campus"
     if "lever.co" in host:
         return "lever"
     if "greenhouse.io" in host:
@@ -78,13 +84,24 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
           autocomplete: el.getAttribute('autocomplete') || '', checked: Boolean(el.checked)};
       });
       const bodyText = clean(document.body?.innerText).slice(0, 20000);
-      const titleNode = document.querySelector('h1, .post_title, .post-name, [class*="post-title" i], [class*="job-title" i]');
-      return {body_text: bodyText, buttons, inputs, job_title: clean(titleNode?.innerText)};
+      const titleNode = document.querySelector('h1, .post_title, .post-name, .job-name, [class*="post-title" i], [class*="job-title" i], [class*="position-name" i]');
+      const storageKeys = [];
+      for (const storage of [window.localStorage, window.sessionStorage]) {
+        try {
+          for (let index = 0; index < storage.length; index += 1) {
+            const key = storage.key(index) || '';
+            if (key && storage.getItem(key)) storageKeys.push(key);
+          }
+        }
+        catch (_) {}
+      }
+      return {body_text: bodyText, buttons, inputs, job_title: clean(titleNode?.innerText), storage_keys: storageKeys};
     }
     """)
     url = page.url
     adapter = adapter_name(url)
     parsed = urlparse(url)
+    cookie_names = [item["name"] for item in await page.context.cookies([url]) if item.get("value")]
     text = data["body_text"]
     buttons: list[str] = data["buttons"]
     inputs: list[dict] = data["inputs"]
@@ -93,7 +110,9 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
         f"{item['autocomplete']} {item['label']} {item['name']}", re.I)), None)
     password = any(item["type"] == "password" for item in inputs)
     register_button = next((button for button in buttons if REGISTER_BUTTON.match(button)), "")
-    login_button = any(re.match(r"^(登录|sign in|log in)$", button, re.I) for button in buttons)
+    login_button = any(re.match(
+        r"^(登录|sign in|log in|登录\s*[/／或]\s*注册|注册\s*[/／或]\s*登录)$", button, re.I,
+    ) for button in buttons)
     password_inputs = [item for item in inputs if item["type"] == "password"]
     registration_password = len(password_inputs) >= 2 or any(re.search(
         r"new-password|confirm|确认|再次", f"{item['autocomplete']} {item['label']} {item['name']}", re.I
@@ -116,6 +135,22 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
         ("LinkedIn", r"LinkedIn"), ("Google", r"Google"),
         ("手机验证码", r"手机|短信"), ("邮箱验证码", r"邮箱|email"),
     ) if re.search(pattern, text, re.I)]
+    authentication_evidence = [
+        button for button in buttons
+        if re.search(r"^(个人中心|我的申请|我的投递|投递记录|申请记录|我的简历|账号设置|退出登录|退出)$", button, re.I)
+    ]
+    if adapter == "moka-campus" and any(re.search(
+        r"access.?token|auth.?token|candidate.?token|login.?token|(?:^|[_-])token(?:$|[_-])", key, re.I,
+    ) for key in [*data.get("storage_keys", []), *cookie_names]):
+        authentication_evidence.append("Moka 本机登录凭据")
+    moka_application_fields = sum(bool(re.search(
+        r"姓名|手机|电话|邮箱|学校|学历|专业|简历|name|mobile|phone|email|school|degree|resume",
+        f"{item['type']} {item['label']} {item['name']} {item['autocomplete']}", re.I,
+    )) for item in inputs)
+    if (adapter == "moka-campus" and moka_application_fields >= 2 and not otp and not password and
+            not login_button and not registration_page):
+        authentication_evidence.append("已进入 Moka 申请表单")
+    authenticated = bool(authentication_evidence)
     final_submit = any(FINAL_SUBMIT.match(button) for button in buttons)
     safe_next_label = next((button for button in buttons
                             if SAFE_NEXT.match(button) and not FINAL_SUBMIT.match(button)), "")
@@ -128,6 +163,7 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
     step_current, step_total = _step_progress(text)
 
     apply_start_present = any(APPLY_START.match(button) for button in buttons)
+    moka_job_route = adapter == "moka-campus" and bool(re.search(r"(?:^|/)job/[^/?#]+", parsed.fragment, re.I))
     if JOB_CLOSED.search(text):
         stage, message = "unknown", "官方页面显示该职位已关闭或下线，已禁止进入申请。"
         actions = [WorkflowAction(intent="refresh", label="重新核验岗位", automated=True,
@@ -144,7 +180,7 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
         message = "腾讯校招使用 QQ/微信等社交账号登录，不是手机号注册。请在独立 Chrome 中亲自同意隐私政策并完成授权。"
         actions = [WorkflowAction(intent="manual_login", label="在 Chrome 中完成授权", requires_user=True),
                    WorkflowAction(intent="refresh", label="我已完成登录", automated=True)]
-    elif registration_page:
+    elif registration_page and not authenticated:
         stage = "registration_required"
         message = "已识别创建账号页面。可以填入联系方式和一次性密码；隐私协议由你亲自确认，账号密码不会写入智达数据库。"
         actions = [WorkflowAction(intent="fill_registration", label="填入注册信息", automated=True,
@@ -165,8 +201,17 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
         actions = [WorkflowAction(intent=request_intent, label="获取验证码", automated=True),
                    WorkflowAction(intent="enter_verification", label="输入验证码并继续", automated=True,
                                   requires_user=True)]
-    elif password or (login_button and not apply_start_present):
+    elif (password or (login_button and not apply_start_present)) and not authenticated:
         stage, message = "auth_required", "页面需要用户登录或注册。"
+        actions = [WorkflowAction(intent="manual_login", label="在 Chrome 中完成登录", requires_user=True),
+                   WorkflowAction(intent="refresh", label="我已完成登录", automated=True)]
+    elif moka_job_route and apply_start_present:
+        stage = "job_detail"
+        message = ("已识别 Moka 登录状态和职位申请入口，可进入申请表单。" if authenticated else
+                   "已识别 Moka 职位详情；进入申请后如需登录，请在职达专用 Chrome 中完成。")
+        actions = [WorkflowAction(intent="start_application", label="进入 Moka 申请流程", automated=True)]
+    elif moka_job_route and login_button and not authenticated:
+        stage, message = "auth_required", "Moka 当前仍显示登录入口，请在职达专用 Chrome 中完成登录。"
         actions = [WorkflowAction(intent="manual_login", label="在 Chrome 中完成登录", requires_user=True),
                    WorkflowAction(intent="refresh", label="我已完成登录", automated=True)]
     elif apply_start_present:
@@ -185,13 +230,19 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
             actions.append(WorkflowAction(intent="continue_application",
                                           label=f"检查当前页后点击“{safe_next_label}”", automated=True))
     else:
-        stage, message = "unknown", "暂时无法判定当前页面阶段，可在 Chrome 中导航后重新识别。"
+        stage = "unknown"
+        message = ("已识别登录状态，但当前页还没有出现申请表单；请等待页面加载或进入具体申请页。"
+                   if authenticated else "暂时无法判定当前页面阶段，可在 Chrome 中导航后重新识别。")
         actions = [WorkflowAction(intent="refresh", label="重新识别当前页", automated=True)]
 
     job_id = parse_qs(parsed.query).get("postid", [""])[0]
+    if not job_id and adapter == "moka-campus":
+        match = re.search(r"(?:^|/)job/([^/?#]+)", parsed.fragment, re.I)
+        job_id = match.group(1) if match else ""
     return ApplicationWorkflowState(
         session_id=session_id, url=url, title=await page.title(), adapter=adapter, stage=stage,
         message=message, job_title=data["job_title"], job_id=job_id,
+        authenticated=authenticated, authentication_evidence=list(dict.fromkeys(authentication_evidence)),
         authentication_methods=methods, requires_consent=unchecked_consent,
         verification_channel=("email" if otp and re.search(r"email|邮箱", f"{otp['label']} {otp['name']}", re.I)
                               else "sms" if otp else ""),
@@ -208,16 +259,29 @@ async def start_application(page: Page) -> None:
     if state.stage != "job_detail":
         raise ValueError("只能从已识别的职位详情页进入申请流程")
     candidates = page.locator("button, a, [role=button]")
+    click_errors: list[str] = []
     for index in range(await candidates.count()):
         item = candidates.nth(index)
         if not await item.is_visible():
             continue
-        text = (await item.inner_text()).strip()
+        text = re.sub(r"\s+", " ", (await item.inner_text()).strip())
         if APPLY_START.match(text):
-            await item.click()
-            await page.wait_for_timeout(1200)
+            try:
+                await item.click(timeout=4000)
+            except PlaywrightTimeoutError as exc:
+                # Some Moka job pages render an overlapping recommendation panel over the
+                # visible apply button. The text has already passed the strict allow-list,
+                # so a DOM click is still a bounded navigation action, never a submit action.
+                click_errors.append(str(exc).splitlines()[0])
+                try:
+                    await item.evaluate("element => element.click()")
+                except Exception as fallback_exc:
+                    click_errors.append(str(fallback_exc).splitlines()[0])
+                    continue
+            await page.wait_for_timeout(1500)
             return
-    raise LookupError("未找到可安全点击的“开始申请”按钮")
+    detail = f"（{click_errors[-1]}）" if click_errors else ""
+    raise LookupError(f"未找到可安全点击的“开始申请”按钮{detail}")
 
 
 async def fill_verification_code(page: Page, code: str, submit: bool) -> None:

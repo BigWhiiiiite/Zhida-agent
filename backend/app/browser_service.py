@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 import re
@@ -127,6 +128,18 @@ class BrowserDemoService:
         self.session_id: str | None = None
 
     @staticmethod
+    def profile_directory(user_id: str) -> Path:
+        default_root = Path(__file__).resolve().parents[1] / "data" / "browser_profiles"
+        root = Path(os.getenv("APP_BROWSER_PROFILE_DIR", str(default_root))).expanduser().resolve()
+        profile_key = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
+        return root / profile_key
+
+    @staticmethod
+    def _enabled(name: str, default: bool) -> bool:
+        fallback = "true" if default else "false"
+        return os.getenv(name, fallback).strip().lower() in {"1", "true", "yes"}
+
+    @staticmethod
     def _validate_url(url: str) -> str:
         parsed = urlparse(url.strip())
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -143,21 +156,39 @@ class BrowserDemoService:
             raise ValueError("无法解析这个网站地址") from exc
         return url.strip()
 
-    async def start(self, url: str) -> BrowserSnapshot:
+    async def start(self, url: str, user_id: str = "local") -> BrowserSnapshot:
         url = self._validate_url(url)
         await self.close()
         self.playwright = await async_playwright().start()
         try:
             channel = os.getenv("APP_BROWSER_CHANNEL", "chrome")
-            self.browser = await self.playwright.chromium.launch(channel=channel, headless=False)
+            headless = self._enabled("APP_BROWSER_HEADLESS", False)
+            if self._enabled("APP_BROWSER_PERSISTENT", True):
+                profile_dir = self.profile_directory(user_id)
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    profile_dir.chmod(0o700)
+                except OSError:
+                    pass
+                self.context = await self.playwright.chromium.launch_persistent_context(
+                    str(profile_dir), channel=channel, headless=headless,
+                    viewport={"width": 1280, "height": 850}, locale="zh-CN",
+                )
+                self.browser = self.context.browser
+            else:
+                self.browser = await self.playwright.chromium.launch(channel=channel, headless=headless)
+                self.context = await self.browser.new_context(
+                    viewport={"width": 1280, "height": 850}, locale="zh-CN",
+                )
         except Exception as exc:
             await self.close()
             raise RuntimeError("无法启动浏览器，请确认已安装 Chrome，或运行 playwright install chromium 并设置 APP_BROWSER_CHANNEL=chromium") from exc
-        self.context = await self.browser.new_context(viewport={"width": 1280, "height": 850})
-        self.page = await self.context.new_page()
+        pages = [page for page in self.context.pages if not page.is_closed()]
+        self.page = pages[0] if pages else await self.context.new_page()
         self.session_id = str(uuid4())
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await self.page.wait_for_timeout(500)
             return await self.snapshot()
         except Exception:
             await self.close()
@@ -877,11 +908,20 @@ class BrowserDemoService:
 
     async def close(self) -> None:
         if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
+            try:
+                await self.context.close()
+            except Exception:
+                pass
+        if self.browser and self.browser.is_connected():
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
         if self.playwright:
-            await self.playwright.stop()
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
         self.playwright = None; self.browser = None; self.context = None; self.page = None; self.session_id = None
 
 

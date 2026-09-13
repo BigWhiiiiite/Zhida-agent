@@ -459,7 +459,7 @@ def export_data() -> ExportBundle:
 @app.post("/api/browser/start", response_model=BrowserSnapshot)
 async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
     try:
-        result = await browser_demo.start(payload.url)
+        result = await browser_demo.start(payload.url, current_user_id())
         browser_session_owners.clear()
         browser_session_owners[result.session_id] = current_user_id()
         return result
@@ -526,6 +526,8 @@ async def advance_browser_workflow(session_id: str,
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"网页操作失败：{str(exc)[:240]}") from exc
 
 
 @app.post("/api/browser/{session_id}/workflow/request-code", response_model=ApplicationWorkflowState)
