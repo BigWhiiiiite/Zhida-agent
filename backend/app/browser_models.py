@@ -20,6 +20,10 @@ class NativeResumeImportRequest(BaseModel):
 class PageField(BaseModel):
     selector: str
     label: str = ""
+    label_source: str = "unknown"
+    context: str = ""
+    placeholder: str = ""
+    ordinal: int = 0
     name: str = ""
     field_type: str = "text"
     required: bool = False

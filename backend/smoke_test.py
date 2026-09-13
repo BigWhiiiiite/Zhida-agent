@@ -153,6 +153,17 @@ assert semantic_actions["[data-zhida-field=study-location]"].value == "北京市
 assert semantic_actions["[data-zhida-field=skills]"].value == "Python, Agent"
 assert semantic_actions["[data-zhida-field=languages]"].value == "英语"
 
+context_only_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="context-only", url="https://careers.example/apply", title="Test", fields=[
+        PageField(selector="[data-zhida-field=context-country]", label="未识别字段 1",
+                  label_source="generated", context="国家/地区 请选择", field_type="combobox",
+                  options=["中国大陆", "新加坡"], required=True),
+    ]),
+    semantic_profile,
+)
+assert context_only_plan.actions[0].action == "select"
+assert context_only_plan.actions[0].value == "中国大陆"
+
 review_fields = [field.model_copy(deep=True) for field in semantic_fields]
 review_fields[0].current_value = "true"
 review_fields[2].current_value = "中国大陆"

@@ -45,6 +45,7 @@ export const api={
   startBrowser:(url:string)=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}).then(result<BrowserSnapshot>),
   browserSnapshot:(id:string)=>fetch(`${API}/browser/${id}/snapshot`).then(result<BrowserSnapshot>),
   expandBrowserSection:(id:string,selector:string)=>fetch(`${API}/browser/${id}/expand`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector})}).then(result<BrowserSnapshot>),
+  inspectBrowserField:(id:string,selector:string)=>fetch(`${API}/browser/${id}/field/inspect`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector})}).then(result<FormReviewResult>),
   importResumeWithSite:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/native-resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id})}).then(result<NativeResumeImportResult>),
   workflowState:(id:string)=>fetch(`${API}/browser/${id}/workflow`).then(result<ApplicationWorkflowState>),
   advanceWorkflow:(id:string,intent:'start_application'|'create_account'|'continue_application'|'refresh')=>fetch(`${API}/browser/${id}/workflow/advance`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({intent})}).then(result<ApplicationWorkflowState>),

@@ -489,6 +489,21 @@ async def expand_browser_section(session_id: str, payload: ExpandSectionRequest)
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.post("/api/browser/{session_id}/field/inspect", response_model=FormReviewResult)
+async def inspect_browser_field(session_id: str, payload: ExpandSectionRequest) -> FormReviewResult:
+    try:
+        _require_browser_owner(session_id)
+        snapshot = await browser_demo.inspect_field(session_id, payload.selector)
+        plan = create_local_form_plan(snapshot, get_profile())
+        return build_form_review(snapshot, plan)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"定位并读取字段失败：{str(exc)[:240]}") from exc
+
+
 @app.post("/api/browser/{session_id}/native-resume", response_model=NativeResumeImportResult)
 async def import_resume_with_site_parser(session_id: str,
                                          payload: NativeResumeImportRequest) -> NativeResumeImportResult:

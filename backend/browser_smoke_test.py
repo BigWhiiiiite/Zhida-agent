@@ -60,6 +60,18 @@ HTML = """
     </div>
   </div>
   <label>语言能力<textarea name="languages"></textarea></label>
+  <div class="moka-dynamic-question">
+    <div>补充问题：是否接受轮岗</div>
+    <div class="select-shell">
+      <button id="rotation-control" type="button" role="combobox" aria-controls="rotation-options"
+        data-open-count="0"
+        onclick="const count=Number(this.dataset.openCount)+1;this.dataset.openCount=String(count);if(count>3)document.getElementById('rotation-options').hidden=false">请选择</button>
+    </div>
+    <div id="rotation-options" role="listbox" hidden>
+      <button type="button" role="option">是</button><button type="button" role="option">否</button>
+    </div>
+  </div>
+  <div><input name="field_7f3a91" placeholder="请输入"></div>
   <section class="application-section">
     <h3>证书</h3>
     <button id="add-certificate" type="button"
@@ -119,6 +131,17 @@ async def main() -> None:
             skills = by_name["ai_skills"]
             assert skills.field_type == "combobox" and skills.multiple
             assert skills.options == ["Python", "Agent", "Java"], skills.model_dump()
+            rotation = next(field for field in snapshot.fields if field.name == "rotation-control")
+            assert rotation.label.startswith("补充问题：是否接受轮岗"), rotation.model_dump()
+            assert rotation.label_source == "nearby"
+            opaque = by_name["field_7f3a91"]
+            assert opaque.label.startswith("未识别字段 "), opaque.model_dump()
+            assert opaque.label_source == "generated"
+            refreshed = await service.inspect_field("browser-smoke", rotation.selector)
+            refreshed_rotation = next(field for field in refreshed.fields if field.name == "rotation-control")
+            assert refreshed_rotation.options == ["是", "否"], refreshed_rotation.model_dump()
+            outline = await page.locator(rotation.selector).evaluate("el => el.style.outline")
+            assert "solid" in outline and ("217" in outline or "d99025" in outline), outline
 
             resume = Path(temporary) / "resume.txt"
             resume.write_text("Test Candidate", encoding="utf-8")

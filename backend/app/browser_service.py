@@ -44,6 +44,14 @@ OPTION_PLACEHOLDERS = {
     "", "select", "selectone", "choose", "chooseone", "pleasechoose", "请选择", "请选择一项",
     "暂未选择", "未选择", "点击选择", "搜索并选择",
 }
+UNHELPFUL_FIELD_LABEL = re.compile(
+    r"^(?:请输入|请填写|请选择|选择|select|choose|input|field|question)(?:一项|内容|信息|答案|one)?[.\s…:：-]*$",
+    re.I,
+)
+OPAQUE_FIELD_NAME = re.compile(
+    r"^(?:field|question|input|select|item|value|answer)?[-_.\[\]0-9a-f]{5,}$",
+    re.I,
+)
 OPTION_ALIASES = (
     {"男", "male", "man"}, {"女", "female", "woman"},
     {"中国", "中国大陆", "中华人民共和国", "china", "mainlandchina", "chn"},
@@ -99,8 +107,65 @@ def _selected_values_match(expected: list[str], actual: str) -> bool:
 
 def _field_identity(field: PageField) -> str:
     return _normalized_option(" ".join(filter(None, (
-        field.section, field.group_label, field.label, field.name, field.field_type,
+        field.section, field.group_label, field.label, field.context, field.name, field.field_type,
     ))))
+
+
+def _clean_metadata(value: object, limit: int) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def _useful_field_label(value: str) -> bool:
+    normalized = value.strip()
+    return bool(normalized and not UNHELPFUL_FIELD_LABEL.fullmatch(normalized))
+
+
+def _context_label(value: str) -> str:
+    text = _clean_metadata(value, 600)
+    if not text:
+        return ""
+    text = re.sub(
+        r"(?:请输入|请填写|请选择|选择一项|select one|please choose)[.\s…:：-]*$", "", text,
+        flags=re.I,
+    ).strip()
+    if len(text) <= 180:
+        return text
+    parts = [item.strip() for item in re.split(r"[。！？!?；;]", text) if item.strip()]
+    return next((item for item in parts if 2 <= len(item) <= 180), text[:177] + "…")
+
+
+def _finalize_field_metadata(items: list[dict[str, object]]) -> None:
+    """Guarantee a user-facing title while retaining the raw DOM name for execution."""
+    for index, item in enumerate(items, start=1):
+        item["ordinal"] = index
+        item["context"] = _clean_metadata(item.get("context"), 600)
+        item["placeholder"] = _clean_metadata(item.get("placeholder"), 300)
+        label = _clean_metadata(item.get("label"), 500)
+        source = _clean_metadata(item.get("label_source"), 40) or "unknown"
+        if source == "placeholder":
+            label = re.sub(r"^(?:请输入|请填写|请选择|选择)\s*", "", label, flags=re.I).strip(" .…:：-")
+        if not _useful_field_label(label):
+            candidates = (
+                (_clean_metadata(item.get("group_label"), 500), "nearby"),
+                (_context_label(str(item.get("context") or "")), "context"),
+                (re.sub(r"^(?:请输入|请填写|请选择|选择)\s*", "",
+                        _clean_metadata(item.get("placeholder"), 300), flags=re.I).strip(" .…:：-"),
+                 "placeholder"),
+            )
+            label, source = next(
+                ((candidate, candidate_source) for candidate, candidate_source in candidates
+                 if _useful_field_label(candidate)),
+                ("", "unknown"),
+            )
+        name = _clean_metadata(item.get("name"), 500)
+        if not label and name and not OPAQUE_FIELD_NAME.fullmatch(name):
+            label = re.sub(r"[_-]+", " ", name).strip()
+            source = "name"
+        if not label:
+            label = f"未识别字段 {index}"
+            source = "generated"
+        item["label"] = label
+        item["label_source"] = source
 
 
 def _meaningful_value(field: PageField) -> str:
@@ -286,43 +351,95 @@ class BrowserDemoService:
             '[class*="cascader-picker"]', '[class*="picker-input"]'
           ].join(', ');
           const customSelector = '[role="combobox"], [aria-haspopup="listbox"], ' + customWrapperSelector;
+          const controlSelector = 'input, select, textarea, [role="radio"], [role="checkbox"], [role="combobox"], [aria-haspopup="listbox"]';
           const fieldContainer = el => el.closest([
             '.application-question', '.application-additional', 'fieldset', '[role="radiogroup"]', '[role="group"]',
             '.form-field', '.field', '.ant-form-item', '.arco-form-item', '.el-form-item',
-            '[class*="form-item"]', '[class*="formItem"]', '[data-qa*="question"]'
+            '.form-group', '.atsx-form-item', '[class*="form-item"]', '[class*="formItem"]',
+            '[class*="form_item"]', '[class*="question-item"]', '[class*="questionItem"]',
+            '[data-qa*="question"]', '[data-field]'
           ].join(', '));
+          const semanticContainer = el => {
+            const known = fieldContainer(el);
+            if (known) return known;
+            let node = el.parentElement;
+            for (let depth = 0; node && depth < 8 && node !== document.body; depth += 1, node = node.parentElement) {
+              const text = labelText(node);
+              const controls = node.querySelectorAll(controlSelector).length;
+              if (text && text.length <= 500 && controls <= 4) return node;
+            }
+            return null;
+          };
+          const inputFor = el => el.matches('input, select, textarea') ? el : el.querySelector('input, select, textarea');
           const labelledBy = el => clean((el.getAttribute('aria-labelledby') || '').split(/\\s+/)
             .map(id => document.getElementById(id)?.innerText || '').join(' '));
           const nearbyLabel = el => {
-            const container = fieldContainer(el);
+            const container = semanticContainer(el);
             if (!container) return '';
             const selector = [
               'legend', '.application-label', '.question-label', '[data-qa="question-label"]',
               '.ant-form-item-label', '.arco-form-label-item', '.el-form-item__label',
-              '[class*="form-label"]', '[class*="field-label"]', '[class*="item-label"]'
+              '[class*="form-label"]', '[class*="field-label"]', '[class*="item-label"]',
+              '[class*="formLabel"]', '[class*="fieldLabel"]', '[class*="questionTitle"]'
             ].join(', ');
             return [...container.querySelectorAll(selector)]
-              .map(item => clean(item.innerText || item.textContent))
+              .map(item => labelText(item))
               .find(value => value && value.length <= 300) || '';
           };
-          const labelFor = el => {
-            const explicit = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
-            const wrapping = el.closest('label');
-            const question = fieldContainer(el);
+          const precedingLabel = el => {
+            let node = el;
+            for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+              let sibling = node.previousElementSibling;
+              while (sibling) {
+                const text = labelText(sibling);
+                const siblingControls = sibling.querySelectorAll(controlSelector).length;
+                if (!siblingControls && text && text.length <= 300) return text;
+                sibling = sibling.previousElementSibling;
+              }
+            }
+            return '';
+          };
+          const contextFor = el => {
+            const preferred = semanticContainer(el);
+            const text = labelText(preferred);
+            if (text && text.length <= 600) return text;
+            let node = el.parentElement;
+            for (let depth = 0; node && depth < 7 && node !== document.body; depth += 1, node = node.parentElement) {
+              const candidate = labelText(node);
+              const controls = node.querySelectorAll(controlSelector).length;
+              if (candidate && candidate.length <= 600 && controls <= 6) return candidate;
+            }
+            return '';
+          };
+          const labelInfoFor = el => {
+            const input = inputFor(el);
+            const target = input || el;
+            const explicit = target.id ? document.querySelector(`label[for="${CSS.escape(target.id)}"]`) : null;
+            const wrapping = target.closest('label') || el.closest('label');
+            const question = semanticContainer(el);
             const questionLabel = question?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"]');
             const optionLabel = labelText(explicit) || labelText(wrapping);
             const groupLabel = clean(questionLabel?.innerText || nearbyLabel(el));
-            const internalName = (el.getAttribute('name') || '').includes('[');
-            if ((internalName || ['radio', 'checkbox', 'file'].includes(el.type)) && groupLabel) {
-              return clean(groupLabel === optionLabel ? groupLabel : `${groupLabel}${optionLabel ? ` — ${optionLabel}` : ''}`);
+            const internalName = (target.getAttribute('name') || '').includes('[');
+            if ((internalName || ['radio', 'checkbox', 'file'].includes(target.type)) && groupLabel) {
+              return {text: clean(groupLabel === optionLabel ? groupLabel : `${groupLabel}${optionLabel ? ` — ${optionLabel}` : ''}`), source: 'nearby'};
             }
-            return clean(labelText(explicit) || labelText(wrapping) || labelledBy(el) ||
-              el.getAttribute('aria-label') || groupLabel || nearbyLabel(el) ||
-              el.getAttribute('placeholder') || el.getAttribute('name'));
+            const candidates = [
+              [labelText(explicit), 'explicit'], [labelText(wrapping), 'explicit'],
+              [labelledBy(target) || labelledBy(el), 'aria'],
+              [target.getAttribute('aria-label') || el.getAttribute('aria-label'), 'aria'],
+              [groupLabel || nearbyLabel(el), 'nearby'], [precedingLabel(el), 'nearby'],
+              [target.getAttribute('data-label') || el.getAttribute('data-label'), 'attribute'],
+              [target.getAttribute('title') || el.getAttribute('title'), 'attribute'],
+              [target.getAttribute('placeholder') || el.getAttribute('placeholder'), 'placeholder'],
+              [target.getAttribute('name') || el.getAttribute('name'), 'name'],
+            ];
+            const candidate = candidates.find(([value]) => clean(value));
+            return {text: clean(candidate?.[0]), source: candidate?.[1] || 'unknown'};
           };
           const groupLabelFor = el => {
-            const group = fieldContainer(el);
-            return clean(group?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"], .ant-form-item-label, .arco-form-label-item, .el-form-item__label, [class*="form-label"], [class*="field-label"]')?.innerText || nearbyLabel(el));
+            const group = semanticContainer(el);
+            return clean(group?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"], .ant-form-item-label, .arco-form-label-item, .el-form-item__label, [class*="form-label"], [class*="field-label"], [class*="formLabel"], [class*="fieldLabel"], [class*="questionTitle"]')?.innerText || nearbyLabel(el));
           };
           const optionLabelFor = el => {
             const explicit = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
@@ -362,7 +479,11 @@ class BrowserDemoService:
             const marker = el.getAttribute('data-zhida-field') ||
               `zhida-${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`;
             el.setAttribute('data-zhida-field', marker);
-            const label = labelFor(el).slice(0, 500);
+            const labelInfo = labelInfoFor(el);
+            const label = labelInfo.text.slice(0, 500);
+            const input = inputFor(el);
+            const context = contextFor(el).slice(0, 600);
+            const placeholderText = clean(input?.getAttribute('placeholder') || el.getAttribute('placeholder')).slice(0, 300);
             const role = (el.getAttribute('role') || '').toLowerCase();
             const customSelect = role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox' || el.matches(customSelector);
             const fieldType = customSelect ? 'combobox' : (['radio', 'checkbox'].includes(role) ? role : (el.type || el.tagName).toLowerCase());
@@ -383,7 +504,8 @@ class BrowserDemoService:
               .map(item => clean(item.innerText || item.textContent)).filter(value => value && !placeholder(value)) : [];
             const customValue = selectedItems.join(', ') || clean(el.getAttribute('aria-valuetext') || el.querySelector('input')?.value || el.innerText);
             return {
-              selector: `[data-zhida-field="${marker}"]`, label,
+              selector: `[data-zhida-field="${marker}"]`, label, label_source: labelInfo.source,
+              context, placeholder: placeholderText, ordinal: index + 1,
               name: el.getAttribute('name') || el.querySelector('input')?.getAttribute('name') || el.getAttribute('id') || '', field_type: fieldType,
               required: el.required || el.querySelector('input')?.required || el.getAttribute('aria-required') === 'true' || /[*✱]/.test(label), options,
               current_value: el.type === 'file' ? [...(el.files || [])].map(file => file.name).join(', ') :
@@ -427,6 +549,7 @@ class BrowserDemoService:
             button.setAttribute('data-zhida-field', marker);
             expanders.push({
               selector: `[data-zhida-field="${marker}"]`, label: semanticLabel,
+              label_source: 'explicit', context: semanticLabel, placeholder: '', ordinal: fields.length + expanders.length + 1,
               name: button.getAttribute('name') || button.getAttribute('id') || '',
               field_type: 'section-button', required: false, options: [], current_value: '',
               accept: '', role: 'button', group_label: heading, option_label: '',
@@ -468,12 +591,56 @@ class BrowserDemoService:
                 await self.page.keyboard.press("Escape")
             except Exception:
                 item["options"] = item.get("options", [])
+        _finalize_field_metadata(data)
         fields = [PageField.model_validate(item) for item in data]
         return BrowserSnapshot(session_id=self.session_id, url=self.page.url, title=await self.page.title(), fields=fields)
 
     async def snapshot_for(self, session_id: str) -> BrowserSnapshot:
         self._require(session_id)
         return await self.snapshot()
+
+    async def inspect_field(self, session_id: str, selector: str) -> BrowserSnapshot:
+        """Bring one collected field into view and retry read-only option discovery."""
+        page = self._require(session_id)
+        before = await self.snapshot()
+        field = next((item for item in before.fields if item.selector == selector), None)
+        if not field:
+            raise LookupError("字段已经变化，请重新分析当前页面")
+        if field.field_type in {"file", "section-button"}:
+            raise ValueError("这个控件不支持定位读取，请使用对应的上传或展开按钮")
+        locator = page.locator(selector).first
+        if not await locator.count():
+            raise LookupError("字段已经变化，请重新分析当前页面")
+        await page.bring_to_front()
+        await locator.scroll_into_view_if_needed(timeout=5000)
+        await locator.evaluate("""
+        el => {
+          const oldOutline = el.style.outline;
+          const oldOffset = el.style.outlineOffset;
+          const oldBackground = el.style.backgroundColor;
+          el.style.outline = '3px solid #d99025';
+          el.style.outlineOffset = '4px';
+          el.style.backgroundColor = 'rgba(255, 243, 205, .45)';
+          setTimeout(() => {
+            if (!el.isConnected) return;
+            el.style.outline = oldOutline;
+            el.style.outlineOffset = oldOffset;
+            el.style.backgroundColor = oldBackground;
+          }, 6000);
+        }
+        """)
+        if field.field_type == "combobox":
+            try:
+                await locator.click(timeout=3000)
+                await page.wait_for_timeout(450)
+            except Exception:
+                pass
+        refreshed = await self.snapshot()
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return refreshed
 
     async def expand_section(self, session_id: str, selector: str) -> BrowserSnapshot:
         page = self._require(session_id)
@@ -649,7 +816,9 @@ class BrowserDemoService:
             file_uploads: fileUploads, submit_labels: submitLabels};
         }
         """)
-        missing = [RequiredFieldIssue.model_validate(item) for item in data["required_missing"]]
+        missing_rows = data["required_missing"]
+        _finalize_field_metadata(missing_rows)
+        missing = [RequiredFieldIssue.model_validate(item) for item in missing_rows]
         return PreSubmitCheck(url=page.url, ready=not missing and not data["validation_errors"] and not data["human_challenges"],
                               required_total=data["required_total"], filled_count=data["filled_count"],
                               required_missing=missing, validation_errors=data["validation_errors"],

@@ -30,6 +30,7 @@ SYSTEM_PROMPT = """
 10. 不得输出页面未提供的 selector。
 11. 必须识别字段的信息主体。紧急联系人、家属、监护人、推荐人等第三方信息不得使用候选人本人的姓名、电话或邮箱。
 12. 是/否、是否接受调剂、意向事业群、工作偏好等需要候选人决策的字段，没有已确认答案时必须 ask_user。
+13. label_source、context、placeholder 是网页采集证据。字段标题不清楚时可以依据这些证据理解问题，但不得脱离网页原文猜造问题。
 """
 
 
@@ -108,7 +109,9 @@ def _normalized(value: str) -> str:
 
 
 def _field_text(field: PageField) -> str:
-    return " ".join(filter(None, (field.section, field.group_label, field.label, field.name))).casefold()
+    return " ".join(filter(None, (
+        field.section, field.group_label, field.label, field.context, field.placeholder, field.name,
+    ))).casefold()
 
 
 def _is_third_party(field: PageField) -> bool:
