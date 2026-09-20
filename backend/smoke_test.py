@@ -13,15 +13,22 @@ from openai import APIConnectionError
 
 from app import main, storage
 from app.agent import _profile_from_model_text
+from app.ats_field_profiles import field_profile_for_url
 from app.browser_models import BrowserSnapshot, PageField
-from app.form_agent import build_form_review, _form_plan_from_model_text, _local_safe_plan, _matching_option
+from app.browser_service import _finalize_choice_metadata
+from app.field_semantics import enrich_fields, option_fingerprint
+from app.form_agent import build_form_review, _form_plan_from_model_text, _form_prompt, _local_safe_plan, _matching_option
 from app.extractors import extract_text
 from app.model_provider import normalize_proxy_response
-from app.models import CandidateProfile, Education, ModelHealth
+from app.models import ApplicationAnswerMemory, CandidateProfile, Education, Experience, ModelHealth
 from app.job_recommendations import recommendation_batch
 
 os.environ["APP_AGENT_MODE"] = "rules"
 os.environ["APP_AUTH_REQUIRED"] = "true"
+
+assert field_profile_for_url("https://join.qq.com/apply")["name"] == "tencent-campus"
+assert field_profile_for_url("https://app.mokahr.com/campus-recruitment/demo")["name"] == "moka-campus"
+assert field_profile_for_url("https://jobs.example.com/apply")["name"] == "generic-semantic"
 
 
 async def verify_proxy_normalization() -> None:
@@ -101,6 +108,32 @@ remembered_decision = _local_safe_plan(
 assert [action.action for action in remembered_decision.actions] == ["skip", "check"]
 assert remembered_decision.actions[1].user_confirmed
 
+opaque_choice_rows = [
+    {"selector": "[data-zhida-field=opaque-yes]", "label": "是", "label_source": "aria",
+     "context": "是 是", "ordinal": 8, "name": "", "field_type": "radio", "required": True,
+     "options": ["是", "否"], "group_label": "是", "option_label": "是", "option_value": "yes",
+     "control_group_key": "opaque-group"},
+    {"selector": "[data-zhida-field=opaque-no]", "label": "否", "label_source": "aria",
+     "context": "否 否", "ordinal": 9, "name": "", "field_type": "radio", "required": True,
+     "options": ["是", "否"], "group_label": "否", "option_label": "否", "option_value": "no",
+     "control_group_key": "opaque-group"},
+]
+_finalize_choice_metadata(opaque_choice_rows)
+assert len({row["group_label"] for row in opaque_choice_rows}) == 1
+assert opaque_choice_rows[0]["group_label"].startswith("未识别的是/否问题")
+opaque_choice_plan = _local_safe_plan(
+    (opaque_choice_snapshot := BrowserSnapshot(
+        session_id="opaque-choice", url="https://join.qq.com/apply", title="Test",
+        fields=[PageField.model_validate(row) for row in opaque_choice_rows],
+    )),
+    CandidateProfile(application_answers={opaque_choice_rows[0]["group_label"]: "否"}),
+)
+assert [action.action for action in opaque_choice_plan.actions] == ["ask_user", "ask_user"]
+assert all("阻止" in action.reason for action in opaque_choice_plan.actions)
+opaque_choice_review = build_form_review(opaque_choice_snapshot, opaque_choice_plan)
+assert len(opaque_choice_review.comparisons) == 1
+assert opaque_choice_review.comparisons[0].options == ["是", "否"]
+
 education_plan = _local_safe_plan(
     BrowserSnapshot(session_id="education", url="https://careers.example/apply", title="Test", fields=[
         PageField(selector="[data-zhida-field=level]", label="最高学历", field_type="select-one",
@@ -113,8 +146,144 @@ education_plan = _local_safe_plan(
 assert [action.value for action in education_plan.actions] == ["大学本科", "学士"]
 assert _matching_option("male", ["female"]) == ""
 
+multi_education_profile = CandidateProfile(education=[
+    Education(school="示例硕士大学", college="示例研究生学院", degree="硕士", major="机器学习"),
+    Education(school="示例本科大学", college="示例本科软件学院", degree="本科", major="计算机科学与技术"),
+])
+scoped_education_fields = enrich_fields([
+    PageField(selector="[data-zhida-field=master-school]", label="院校名称", section="硕士教育经历",
+              container_key="master-block", required=True),
+    PageField(selector="[data-zhida-field=master-college]", label="学院名称", section="硕士教育经历",
+              container_key="master-block", required=True),
+    PageField(selector="[data-zhida-field=bachelor-school]", label="院校名称", section="本科教育经历",
+              container_key="bachelor-block", required=True),
+    PageField(selector="[data-zhida-field=bachelor-college]", label="学院名称", section="本科教育经历",
+              container_key="bachelor-block", required=True),
+], "https://careers.example/apply")
+scoped_education_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="education-scoped", url="https://careers.example/apply", title="Test",
+                    fields=scoped_education_fields),
+    multi_education_profile,
+)
+scoped_values = {action.selector: action.value for action in scoped_education_plan.actions}
+assert scoped_values["[data-zhida-field=master-school]"] == "示例硕士大学"
+assert scoped_values["[data-zhida-field=master-college]"] == "示例研究生学院"
+assert scoped_values["[data-zhida-field=bachelor-school]"] == "示例本科大学"
+assert scoped_values["[data-zhida-field=bachelor-college]"] == "示例本科软件学院"
+assert all("已将本组锁定" in action.reason for action in scoped_education_plan.actions)
+
+ambiguous_education_fields = enrich_fields([
+    PageField(selector="[data-zhida-field=unknown-school]", label="院校名称", section="教育经历",
+              container_key="unknown-block", required=True),
+    PageField(selector="[data-zhida-field=unknown-college]", label="学院名称", section="教育经历",
+              container_key="unknown-block", required=True),
+], "https://careers.example/apply")
+ambiguous_education_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="education-ambiguous", url="https://careers.example/apply", title="Test",
+                    fields=ambiguous_education_fields),
+    multi_education_profile,
+)
+assert all(action.action == "ask_user" for action in ambiguous_education_plan.actions)
+assert all("不能在以下记录中猜测" in action.reason for action in ambiguous_education_plan.actions)
+
+mixed_site_fields = [
+    field.model_copy(update={"current_value": value})
+    for field, value in zip(ambiguous_education_fields, ["示例硕士大学", "示例本科软件学院"])
+]
+mixed_site_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="education-mixed", url="https://careers.example/apply", title="Test",
+                    fields=mixed_site_fields), multi_education_profile,
+)
+assert all(action.action == "ask_user" for action in mixed_site_plan.actions)
+assert all("串填风险" in action.reason for action in mixed_site_plan.actions)
+
+remembered_education_profile = multi_education_profile.model_copy(deep=True)
+remembered_education_profile.application_answer_memory = [ApplicationAnswerMemory(
+    id="education-memory", question="院校名称", normalized_question="院校名称",
+    semantic_key="education.school", entity_scope="education:unspecified",
+    field_signature=ambiguous_education_fields[0].field_signature, field_type="text",
+    value="示例硕士大学", source_host="careers.example", confirmed_count=1,
+    updated_at="2026-09-14T00:00:00Z",
+)]
+remembered_education_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="education-memory", url="https://careers.example/apply", title="Test",
+                    fields=ambiguous_education_fields), remembered_education_profile,
+)
+assert remembered_education_plan.actions[0].action == "fill"
+assert remembered_education_plan.actions[0].value == "示例硕士大学"
+assert "复用你在" in remembered_education_plan.actions[0].reason
+assert remembered_education_plan.actions[1].action == "ask_user"
+
+remembered_field = enrich_fields([
+    PageField(selector="[data-zhida-field=rotation]", label="是否接受轮岗", field_type="select-one",
+              options=["是", "否"], required=True),
+], "https://careers.example/apply")[0]
+remembered_profile = CandidateProfile(application_answer_memory=[ApplicationAnswerMemory(
+    id="memory-1", question="是否接受轮岗", normalized_question="是否接受轮岗",
+    semantic_key=remembered_field.semantic_key, entity_scope=remembered_field.entity_scope,
+    field_signature=remembered_field.field_signature, field_type=remembered_field.field_type,
+    option_fingerprint="67ca096d7b92c097", value="否", source_host="careers.example",
+    confirmed_count=2, updated_at="2026-09-14T00:00:00Z",
+)])
+# Use the actual fingerprint so the saved option set must remain compatible.
+remembered_profile.application_answer_memory[0].option_fingerprint = option_fingerprint(remembered_field.options)
+remembered_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="remembered", url="https://careers.example/apply", title="Test",
+                    fields=[remembered_field]), remembered_profile,
+)
+assert remembered_plan.actions[0].action == "select"
+assert remembered_plan.actions[0].value == "否"
+assert "已确认 2 次" in remembered_plan.actions[0].reason
+changed_options_field = remembered_field.model_copy(update={"options": ["接受", "不接受"]})
+changed_options_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="changed-options", url="https://careers.example/apply", title="Test",
+                    fields=[changed_options_field]), remembered_profile,
+)
+assert changed_options_plan.actions[0].action == "ask_user"
+assert "选项" in changed_options_plan.actions[0].reason
+
+legacy_sensitive_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="legacy-sensitive", url="https://careers.example/apply", title="Test", fields=[
+        PageField(selector="[data-zhida-field=id-number]", label="证件号码（用于实名认证）",
+                  label_source="explicit", required=True),
+    ]),
+    CandidateProfile(application_answers={"证件号码（用于实名认证）": "should-not-be-reused"}),
+)
+assert legacy_sensitive_plan.actions[0].action == "ask_user"
+assert legacy_sensitive_plan.actions[0].sensitive
+assert not legacy_sensitive_plan.actions[0].value
+safe_model_prompt = _form_prompt(
+    BrowserSnapshot(session_id="prompt", url="https://careers.example/apply", title="Test", fields=[]),
+    CandidateProfile(
+        application_answers={"技术社区": "GitHub", "证件号码": "secret-id-value"},
+        application_answer_memory=[ApplicationAnswerMemory(
+            id="secret-memory", question="普通问题", normalized_question="普通问题",
+            value="memory-only-value", updated_at="2026-09-14T00:00:00Z",
+        )],
+    ),
+)
+assert "GitHub" in safe_model_prompt
+assert "secret-id-value" not in safe_model_prompt
+assert "memory-only-value" not in safe_model_prompt
+
+ambiguous_experience_plan = _local_safe_plan(
+    BrowserSnapshot(session_id="experience-ambiguous", url="https://careers.example/apply", title="Test", fields=[
+        PageField(selector="[data-zhida-field=intern-company]", label="请输入实习公司",
+                  label_source="explicit"),
+    ]),
+    CandidateProfile(
+        internships=[Experience(organization="示例研发机构", role="Agent 实习生"),
+                     Experience(organization="示例科技公司", role="AI 实习生")],
+        application_answers={"请输入实习公司": "示例研发机构"},
+    ),
+)
+assert ambiguous_experience_plan.actions[0].action == "ask_user"
+assert "不能在以下记录中猜测" in ambiguous_experience_plan.actions[0].reason
+
 semantic_profile = CandidateProfile(
     gender="男", country_region="中国", location="北京", target_cities=["北京"],
+    preferred_business_groups=["TEG"], interview_preferences=["远程面试"],
+    willing_to_relocate="否",
     education=[Education(school="Test University", degree="本科", location="北京市", current=True)],
     skills=["Python", "Agent"], languages=["英语"],
 )
@@ -136,6 +305,14 @@ semantic_fields = [
     PageField(selector="[data-zhida-field=skills]", label="AI应用技能", field_type="select-multiple",
               options=["Python", "Agent", "Java"], multiple=True),
     PageField(selector="[data-zhida-field=languages]", label="语言能力", field_type="textarea"),
+    PageField(selector="[data-zhida-field=business-group]", label="感兴趣的事业群",
+              field_type="combobox", options=["TEG", "WXG"], required=True),
+    PageField(selector="[data-zhida-field=relocation-yes]", label="是", field_type="radio",
+              group_label="除上述选择外，是否还接受其他城市分配", option_label="是",
+              option_value="yes", options=["是", "否"], required=True, control_group_key="relocation"),
+    PageField(selector="[data-zhida-field=relocation-no]", label="否", field_type="radio",
+              group_label="除上述选择外，是否还接受其他城市分配", option_label="否",
+              option_value="no", options=["是", "否"], required=True, control_group_key="relocation"),
 ]
 semantic_plan = _local_safe_plan(
     BrowserSnapshot(session_id="semantic", url="https://careers.example/apply", title="Test",
@@ -143,15 +320,20 @@ semantic_plan = _local_safe_plan(
     semantic_profile,
 )
 semantic_actions = {action.selector: action for action in semantic_plan.actions}
-assert semantic_actions["[data-zhida-field=gender-male]"].action == "ask_user"
-assert "主档案记录为“男”" in semantic_actions["[data-zhida-field=gender-male]"].reason
+assert semantic_actions["[data-zhida-field=gender-male]"].action == "check"
+assert semantic_actions["[data-zhida-field=gender-male]"].value is True
+assert semantic_actions["[data-zhida-field=gender-female]"].action == "skip"
 assert semantic_actions["[data-zhida-field=country]"].value == "中国大陆"
 assert semantic_actions["[data-zhida-field=current-location]"].value == "北京市"
 assert semantic_actions["[data-zhida-field=work-city]"].value == "北京"
-assert semantic_actions["[data-zhida-field=interview-city]"].action == "ask_user"
+assert semantic_actions["[data-zhida-field=interview-city]"].action == "select"
+assert semantic_actions["[data-zhida-field=interview-city]"].value == "远程面试"
 assert semantic_actions["[data-zhida-field=study-location]"].value == "北京市"
 assert semantic_actions["[data-zhida-field=skills]"].value == "Python, Agent"
 assert semantic_actions["[data-zhida-field=languages]"].value == "英语"
+assert semantic_actions["[data-zhida-field=business-group]"].value == "TEG"
+assert semantic_actions["[data-zhida-field=relocation-yes]"].action == "skip"
+assert semantic_actions["[data-zhida-field=relocation-no]"].action == "check"
 
 context_only_plan = _local_safe_plan(
     BrowserSnapshot(session_id="context-only", url="https://careers.example/apply", title="Test", fields=[
@@ -177,11 +359,11 @@ review_snapshot = BrowserSnapshot(
 review_plan = _local_safe_plan(review_snapshot, semantic_profile)
 review = build_form_review(review_snapshot, review_plan)
 review_by_label = {item.label: item for item in review.comparisons}
-assert review_by_label["性别"].status == "manual_review"
+assert review_by_label["性别"].status == "matched"
 assert review_by_label["国家/地区"].status == "matched"
 assert review_by_label["当前所处地"].status == "missing"
 assert review_by_label["期望工作城市"].status == "conflict"
-assert review_by_label["参加面试城市"].status == "manual_review"
+assert review_by_label["参加面试城市"].status == "matched"
 assert review_by_label["AI应用技能"].status == "conflict"
 assert review_by_label["语言能力"].status == "matched"
 assert next(action for action in review.plan.actions
@@ -301,13 +483,31 @@ with TemporaryDirectory() as temporary:
         assert remembered_qq.json()["qq"] == "12345678"
         remembered_custom = client.post("/api/profile/application-answer", json={
             "question": "你最常参与的技术社区", "field_name": "community", "value": "GitHub",
+            "semantic_key": "application.custom", "entity_scope": "application",
+            "field_signature": "test-community-signature", "field_type": "text",
+            "source_url": "https://careers.example/apply",
         })
         assert remembered_custom.status_code == 200
         assert remembered_custom.json()["application_answers"]["你最常参与的技术社区"] == "GitHub"
+        assert remembered_custom.json()["application_answer_memory"][0]["field_signature"] == "test-community-signature"
+        assert remembered_custom.json()["application_answer_memory"][0]["source_host"] == "careers.example"
+        remembered_preference = client.post("/api/profile/application-answer", json={
+            "question": "感兴趣的事业群", "field_name": "business_group", "value": "TEG, CSIG",
+            "semantic_key": "preference.business_group", "entity_scope": "preference",
+            "field_signature": "test-business-group", "field_type": "select-multiple",
+            "options": ["TEG", "CSIG", "WXG"], "source_url": "https://join.qq.com/apply",
+        })
+        assert remembered_preference.status_code == 200, remembered_preference.text
+        assert remembered_preference.json()["preferred_business_groups"] == ["TEG", "CSIG"]
         rejected_sensitive = client.post("/api/profile/application-answer", json={
             "question": "是否同意隐私条款", "field_name": "consent", "value": "是",
         })
         assert rejected_sensitive.status_code == 422
+        rejected_identity = client.post("/api/profile/application-answer", json={
+            "question": "证件号码（用于实名认证）", "field_name": "identity_number",
+            "value": "should-not-be-stored",
+        })
+        assert rejected_identity.status_code == 422
 
         first_text = (
             "姓名：李春博\n性别：男\n年龄：24\n邮箱：first@example.com\n"
@@ -346,12 +546,32 @@ with TemporaryDirectory() as temporary:
         recommendations = client.get("/api/jobs/recommendations")
         assert recommendations.status_code == 200
         recommendation_json = recommendations.json()
-        assert recommendation_json["engine"] == "official-discovery-verified-local-score-v3"
+        assert recommendation_json["engine"] == "official-source-adapters-local-retrieval-v4"
         assert len(recommendation_json["jobs"]) >= 5
         scores = [item["match_score"] for item in recommendation_json["jobs"]]
         assert scores == sorted(scores, reverse=True)
         assert all(item["reasons"] for item in recommendation_json["jobs"])
         assert all(item["job"]["source_url"].startswith("https://") for item in recommendation_json["jobs"])
+        assert all(item["job"]["company_size"] in {"large", "growth", "startup", "unknown"}
+                   for item in recommendation_json["jobs"])
+
+        source_list = client.get("/api/jobs/sources")
+        assert source_list.status_code == 200 and len(source_list.json()) >= 4
+        custom_source = client.post("/api/jobs/sources", json={
+            "company": "API Test Startup", "official_url": "https://jobs.ashbyhq.com/api-test-startup",
+            "adapter": "auto", "company_size": "startup",
+        })
+        assert custom_source.status_code == 201, custom_source.text
+        custom_source_json = custom_source.json()
+        assert custom_source_json["adapter"] == "ashby" and custom_source_json["user_added"]
+        cached_search = client.post("/api/jobs/search", json={
+            "query": "Agent", "location": "", "company_sizes": [], "sync_sources": False,
+        })
+        assert cached_search.status_code == 200, cached_search.text
+        assert cached_search.json()["query"] == "Agent"
+        assert cached_search.json()["synced_sources"] >= 4
+        assert client.delete(f"/api/jobs/sources/{custom_source_json['id']}").status_code == 204
+        assert client.delete("/api/jobs/sources/baidu-campus").status_code == 409
 
         shenzhen_recommendations = client.get("/api/jobs/recommendations", params={"location": "深圳"})
         assert shenzhen_recommendations.status_code == 200
@@ -381,12 +601,22 @@ with TemporaryDirectory() as temporary:
         assert progressing.status_code == 200
         assert progressing.json()["status"] == "in_progress"
         assert progressing.json()["notes"] == "等待补充开放题"
+        assert progressing.json()["assistance_started_at"]
+        assert progressing.json()["confirmation_pending"] is True
+        not_submitted = client.patch(f"/api/jobs/queue/{queue_id}", json={
+            "status": "needs_review", "candidate_confirmed": True,
+        })
+        assert not_submitted.status_code == 200
+        assert not_submitted.json()["confirmation_pending"] is False
+        progressing = client.patch(f"/api/jobs/queue/{queue_id}", json={"status": "in_progress"})
+        assert progressing.status_code == 200 and progressing.json()["confirmation_pending"] is True
         submitted = client.patch(f"/api/jobs/queue/{queue_id}", json={
             "status": "submitted", "application_id": "APP-2026-001",
             "candidate_confirmed": True,
         })
         assert submitted.status_code == 200
         assert submitted.json()["submitted_at"] and submitted.json()["application_id"] == "APP-2026-001"
+        assert submitted.json()["confirmation_pending"] is False
         exported_queue = client.get("/api/jobs/queue-export.csv")
         assert exported_queue.status_code == 200
         assert "text/csv" in exported_queue.headers["content-type"]

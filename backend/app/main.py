@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import os
@@ -20,22 +21,30 @@ from dotenv import load_dotenv
 from .agent import get_resume_extractor
 from .auth_models import AuthSession, LoginRequest, RegisterRequest, UserAccount
 from .auth_service import SESSION_DAYS, local_user, login, register, token_hash, user_for_token
-from .application_models import (ApplicationWorkflowState, RegistrationCredentialsRequest,
-                                 VerificationCodeRequest, VerificationRequest,
-                                 WorkflowAdvanceRequest)
+from .application_agent import decide_application_step
+from .application_models import (ApplicationAgentCheckpoint, ApplicationAgentStepRequest,
+                                 ApplicationAgentTurn, ApplicationWorkflowState,
+                                 RegistrationCredentialsRequest, VerificationCodeRequest,
+                                 VerificationRequest, WorkflowAdvanceRequest)
 from .browser_models import (BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult,
                              ExpandSectionRequest, FormPlan, FormReviewResult,
                              NativeResumeImportRequest, NativeResumeImportResult, PreSubmitCheck)
 from .browser_service import browser_demo
 from .extractors import extract_text, preview_html
 from .form_agent import build_form_review, create_form_plan, create_local_form_plan
-from .job_discovery import official_job_sources, sync_official_source
+from .job_discovery import (official_job_sources, register_job_source,
+                            remove_job_source, sync_official_source)
 from .job_models import (ApplicationQueueItem, ApplicationQueueUpdate,
-                         ApplicationReadiness, JobDiscoveryResult, JobVerification,
-                         OfficialJobSource, QueueAddRequest, RecommendationBatch)
+                         ApplicationReadiness, JobDiscoveryResult, JobEvidenceExplanation, JobVerification,
+                         JobSourceCreate, OfficialJobSource, QueueAddRequest,
+                         RagRecommendationRequest, RecommendationBatch, SmartJobSearchRequest,
+                         SmartJobSearchResult)
 from .job_recommendations import (add_to_queue, application_readiness, queue_items,
+                                  catalog_job, rag_recommendation_batch,
                                   recommendation_batch, remove_from_queue,
-                                  update_queue_item, verify_catalog_job)
+                                  smart_job_search, update_queue_item,
+                                  verify_catalog_job)
+from .job_rag import explain_evidence_matches
 from .models import (ApplicationAnswerUpdate, CandidateProfile, ConflictResolution, ExportBundle, FieldEvidence,
                      ModelHealth, ProfileConflict, ResumeProfile, ResumeRecord, ResumeUpdate, ReviewUpdate)
 from .model_provider import check_model_health
@@ -45,7 +54,7 @@ from .storage import (create_pending_resume, current_user_id, delete_resume, del
                       find_by_hash, get_conflict, get_profile,
                       get_resume, get_resume_internal, initialize, list_conflicts, list_resumes,
                       mark_resume_failed, mark_resume_parsing, replace_parse_result, reset_current_user,
-                      resolve_conflict, save_profile, set_current_user,
+                      resolve_conflict, save_application_agent_checkpoint, save_profile, set_current_user,
                       update_evidence, update_resume)
 
 
@@ -80,6 +89,7 @@ def _local_access_allowed(request: Request) -> bool:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize(); UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    app.state.browser_operation_lock = asyncio.Lock()
     yield
     await browser_demo.close()
 
@@ -101,6 +111,11 @@ async def require_account(request: Request, call_next):
     request.state.user = user
     context_token = set_current_user(user.id)
     try:
+        if request.url.path == "/api/browser" or request.url.path.startswith("/api/browser/"):
+            # The current service owns one active browser. Background inspection
+            # also opens menus, so serialize it with filling and navigation.
+            async with app.state.browser_operation_lock:
+                return await call_next(request)
         return await call_next(request)
     finally:
         reset_current_user(context_token)
@@ -178,7 +193,12 @@ def update_profile(payload: ResumeProfile) -> CandidateProfile: return save_prof
 @app.post("/api/profile/application-answer", response_model=CandidateProfile)
 def remember_application_answer(payload: ApplicationAnswerUpdate) -> CandidateProfile:
     try:
-        return save_application_answer(payload.question, payload.field_name, payload.value)
+        return save_application_answer(
+            payload.question, payload.field_name, payload.value,
+            semantic_key=payload.semantic_key, entity_scope=payload.entity_scope,
+            field_signature=payload.field_signature, field_type=payload.field_type,
+            options=payload.options, source_url=payload.source_url,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -186,6 +206,25 @@ def remember_application_answer(payload: ApplicationAnswerUpdate) -> CandidatePr
 @app.get("/api/jobs/recommendations", response_model=RecommendationBatch)
 def job_recommendations(location: str = "") -> RecommendationBatch:
     return recommendation_batch(get_profile(), location)
+
+
+@app.post("/api/jobs/recommendations/rag", response_model=RecommendationBatch)
+def rag_job_recommendations(payload: RagRecommendationRequest) -> RecommendationBatch:
+    return rag_recommendation_batch(
+        get_profile(), payload.location, payload.query, payload.company_sizes,
+    )
+
+
+@app.post("/api/jobs/{job_id}/explain", response_model=JobEvidenceExplanation)
+async def explain_job_recommendation(job_id: str) -> JobEvidenceExplanation:
+    job = catalog_job(job_id)
+    if not job:
+        raise HTTPException(404, "岗位不存在")
+    batch = rag_recommendation_batch(get_profile(), query=job.title)
+    item = next((candidate for candidate in batch.jobs if candidate.job.id == job_id), None)
+    if item is None:
+        raise HTTPException(404, "岗位暂不在当前推荐列表")
+    return await explain_evidence_matches(item)
 
 
 @app.get("/api/jobs/queue", response_model=list[ApplicationQueueItem])
@@ -203,12 +242,35 @@ def job_sources() -> list[OfficialJobSource]:
     return official_job_sources()
 
 
+@app.post("/api/jobs/sources", response_model=OfficialJobSource, status_code=201)
+def add_job_source(payload: JobSourceCreate) -> OfficialJobSource:
+    try:
+        return register_job_source(payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/jobs/sources/{source_id}", status_code=204, response_class=Response)
+def delete_job_source(source_id: str) -> Response:
+    try:
+        if not remove_job_source(source_id):
+            raise HTTPException(404, "招聘来源不存在")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return Response(status_code=204)
+
+
 @app.post("/api/jobs/sources/{source_id}/sync", response_model=JobDiscoveryResult)
 async def sync_job_source(source_id: str) -> JobDiscoveryResult:
     try:
         return await sync_official_source(source_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/jobs/search", response_model=SmartJobSearchResult)
+async def search_official_jobs(payload: SmartJobSearchRequest) -> SmartJobSearchResult:
+    return await smart_job_search(get_profile(), payload)
 
 
 @app.post("/api/jobs/{job_id}/verify", response_model=JobVerification)
@@ -250,13 +312,14 @@ def export_application_queue() -> Response:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["公司", "岗位", "职位编号", "地点", "状态", "匹配分", "申请编号",
-                     "所用简历", "加入时间", "投递时间", "备注", "官方链接"])
+                     "所用简历", "加入时间", "AI辅助开始时间", "投递时间", "备注", "官方链接"])
     for item in queue_items(get_profile()):
         job = item.recommendation.job
         writer.writerow([
             job.company, job.title, job.job_code, " / ".join(job.locations),
             status_labels[item.status], item.recommendation.match_score,
             item.application_id, item.resume_id, item.created_at.isoformat(),
+            item.assistance_started_at.isoformat() if item.assistance_started_at else "",
             item.submitted_at.isoformat() if item.submitted_at else "",
             item.notes, job.source_url,
         ])
@@ -529,6 +592,131 @@ async def browser_workflow(session_id: str) -> ApplicationWorkflowState:
         return await browser_demo.workflow_state(session_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+def _agent_checkpoint_status(workflow: ApplicationWorkflowState,
+                             requires_user: bool) -> str:
+    if workflow.stage == "review" or workflow.final_submit_present:
+        return "review"
+    return "waiting_user" if requires_user else "active"
+
+
+def _selected_resume_path(resume_id: str) -> Path | None:
+    if not resume_id:
+        return None
+    row = get_resume_internal(resume_id)
+    if not row:
+        raise HTTPException(404, "选择的简历不存在")
+    candidate = UPLOAD_DIR / Path(row["stored_filename"]).name
+    if not candidate.exists():
+        raise HTTPException(404, "选择的简历原始文件不存在")
+    return candidate
+
+
+async def _assess_application_agent(session_id: str,
+                                    event_action: str = "assess") -> ApplicationAgentTurn:
+    _require_browser_owner(session_id)
+    snapshot = await browser_demo.snapshot_for(session_id)
+    workflow = await browser_demo.workflow_state(session_id)
+    check = (await browser_demo.pre_submit_check(session_id)
+             if workflow.stage in {"profile_form", "application_form", "review"} else None)
+    decision = await decide_application_step(workflow, snapshot, get_profile(), check)
+    saved = save_application_agent_checkpoint(
+        session_id, _agent_checkpoint_status(workflow, decision.requires_user),
+        workflow.stage, snapshot.url, snapshot.title, event_action, decision.summary,
+    )
+    return ApplicationAgentTurn(
+        decision=decision, workflow=workflow, snapshot=snapshot,
+        pre_submit=check, checkpoint=ApplicationAgentCheckpoint.model_validate(saved),
+    )
+
+
+@app.post("/api/browser/{session_id}/agent/assess", response_model=ApplicationAgentTurn)
+async def assess_application_agent(session_id: str) -> ApplicationAgentTurn:
+    try:
+        return await _assess_application_agent(session_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"流程 Agent 评估失败：{str(exc)[:240]}") from exc
+
+
+@app.post("/api/browser/{session_id}/agent/step", response_model=ApplicationAgentTurn)
+async def run_application_agent_step(session_id: str,
+                                     payload: ApplicationAgentStepRequest) -> ApplicationAgentTurn:
+    """Execute one bounded, reversible application step and then checkpoint it."""
+    try:
+        _require_browser_owner(session_id)
+        snapshot = await browser_demo.snapshot_for(session_id)
+        workflow = await browser_demo.workflow_state(session_id)
+        check = (await browser_demo.pre_submit_check(session_id)
+                 if workflow.stage in {"profile_form", "application_form", "review"} else None)
+        decision = await decide_application_step(workflow, snapshot, get_profile(), check)
+        action = decision.next_action
+        review = None
+        execution = None
+        action_taken = ""
+
+        if decision.can_execute and action == "start_application":
+            workflow = await browser_demo.advance_workflow(
+                session_id, WorkflowAdvanceRequest(intent="start_application")
+            )
+            action_taken = action
+        elif decision.can_execute and action == "analyze_and_fill":
+            snapshot = await browser_demo.snapshot_for(session_id)
+            plan = await create_form_plan(snapshot, get_profile())
+            review = build_form_review(snapshot, plan)
+            execution = await browser_demo.execute(
+                session_id,
+                ExecutePlanRequest(actions=plan.actions, min_confidence=.85,
+                                   resume_id=payload.resume_id),
+                _selected_resume_path(payload.resume_id),
+            )
+            check = execution.pre_submit
+            action_taken = action
+        elif decision.can_execute and action == "continue_application":
+            # Recheck immediately before navigation; the page may have changed
+            # since the model saw it. The service also enforces this boundary.
+            check = await browser_demo.pre_submit_check(session_id)
+            if not check.ready:
+                raise ValueError("当前页检查结果已经变化，不能继续到下一页")
+            workflow = await browser_demo.advance_workflow(
+                session_id, WorkflowAdvanceRequest(intent="continue_application")
+            )
+            check = None
+            action_taken = action
+        elif decision.can_execute and action == "refresh":
+            workflow = await browser_demo.workflow_state(session_id)
+            action_taken = action
+
+        snapshot = await browser_demo.snapshot_for(session_id)
+        workflow = await browser_demo.workflow_state(session_id)
+        check = (await browser_demo.pre_submit_check(session_id)
+                 if workflow.stage in {"profile_form", "application_form", "review"} else None)
+        result_summary = (f"已执行：{decision.next_label}" if action_taken
+                          else f"等待用户：{decision.next_label}")
+        # Return a decision for the new page, not the stale pre-navigation plan.
+        decision = await decide_application_step(workflow, snapshot, get_profile(), check, use_model=False)
+        status = _agent_checkpoint_status(workflow, decision.requires_user)
+        saved = save_application_agent_checkpoint(
+            session_id, status, workflow.stage, snapshot.url, snapshot.title,
+            action_taken or action, result_summary,
+        )
+        return ApplicationAgentTurn(
+            decision=decision, workflow=workflow, snapshot=snapshot,
+            action_taken=action_taken, review=review, execution=execution,
+            pre_submit=check, checkpoint=ApplicationAgentCheckpoint.model_validate(saved),
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"流程 Agent 执行失败：{str(exc)[:240]}") from exc
 
 
 @app.post("/api/browser/{session_id}/workflow/advance", response_model=ApplicationWorkflowState)

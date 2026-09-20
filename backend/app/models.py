@@ -48,6 +48,12 @@ class Education(BaseModel):
     college: str = ""
     degree: str = ""
     major: str = ""
+    study_mode: str = ""
+    academic_system: str = ""
+    student_id: str = ""
+    advisor: str = ""
+    laboratory: str = ""
+    research_direction: str = ""
     location: str = ""
     start_date: str = ""
     end_date: str = ""
@@ -56,6 +62,23 @@ class Education(BaseModel):
     courses: list[str] = Field(default_factory=list)
     description: str = ""
     current: bool = False
+
+
+class ApplicationAnswerMemory(BaseModel):
+    """A user-confirmed answer tied to a stable semantic field identity."""
+
+    id: str
+    question: str
+    normalized_question: str
+    semantic_key: str = "application.custom"
+    entity_scope: str = "application"
+    field_signature: str = ""
+    field_type: str = "text"
+    option_fingerprint: str = ""
+    value: str
+    source_host: str = ""
+    confirmed_count: int = Field(default=1, ge=1)
+    updated_at: datetime
 
 
 class ResumeProfile(BaseModel):
@@ -67,16 +90,26 @@ class ResumeProfile(BaseModel):
     phone: str = ""
     email: str = ""
     country_region: str = ""
+    nationality: str = ""
+    ethnicity: str = ""
+    political_status: str = ""
+    marital_status: str = ""
     qq: str = ""
     wechat: str = ""
     location: str = ""
     hometown: str = ""
+    hukou_location: str = ""
+    address: str = ""
     website: str = ""
     github: str = ""
     linkedin: str = ""
     target_role: str = ""
     target_industries: list[str] = Field(default_factory=list)
     target_cities: list[str] = Field(default_factory=list)
+    preferred_business_groups: list[str] = Field(default_factory=list)
+    interview_preferences: list[str] = Field(default_factory=list)
+    willing_to_relocate: str = ""
+    campus_candidate_type: str = ""
     available_date: str = ""
     internship_duration: str = ""
     days_per_week: str = ""
@@ -91,6 +124,7 @@ class ResumeProfile(BaseModel):
     certificates: list[str] = Field(default_factory=list)
     awards: list[str] = Field(default_factory=list)
     application_answers: dict[str, str] = Field(default_factory=dict)
+    application_answer_memory: list[ApplicationAnswerMemory] = Field(default_factory=list)
 
 
 class CandidateProfile(ResumeProfile):
@@ -103,6 +137,12 @@ class ApplicationAnswerUpdate(BaseModel):
     question: str = Field(min_length=1, max_length=500)
     field_name: str = Field(default="", max_length=500)
     value: str = Field(min_length=1, max_length=5000)
+    semantic_key: str = Field(default="", max_length=100)
+    entity_scope: str = Field(default="", max_length=120)
+    field_signature: str = Field(default="", max_length=100)
+    field_type: str = Field(default="text", max_length=60)
+    options: list[str] = Field(default_factory=list, max_length=200)
+    source_url: str = Field(default="", max_length=2000)
 
 
 class FieldEvidence(BaseModel):

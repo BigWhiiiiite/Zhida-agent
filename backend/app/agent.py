@@ -123,6 +123,9 @@ class AgentsSDKExtractor(ResumeExtractor):
             output_type=ResumeProfile,
             instructions=(
                 "你是严谨的中英文求职简历解析 Agent。将每段教育、实习和项目分别拆成独立记录。"
+                "学校、学院/院系、专业、学历、培养方式、导师等必须保持在原文同一段教育记录内，"
+                "禁止把本科的学校与硕士的学院、专业或学位混合。"
+                "求职偏好、事业群、调剂意愿、面试方式只能在简历原文明确出现时提取。"
                 "只提取原文明确出现的信息，不猜测性别、年龄、日期、成果或敏感信息。"
                 "保留量化成果和技术栈；无法识别时使用空值，不得编造。"
             ),
@@ -144,6 +147,7 @@ class AgentsSDKExtractor(ResumeExtractor):
             model_settings=settings,
             instructions=(
                 "你是严谨的中英文简历解析器。只提取原文明确出现的信息，不得猜测或编造。"
+                "多段教育经历必须保持各自的学校、学院、专业、学历和时间，禁止跨记录混合。"
                 "只输出一个 JSON 对象，不要 Markdown、代码围栏、解释或中文字段名。"
                 "字段名和数据类型必须严格符合用户消息中提供的 JSON Schema；缺失字段使用 schema 默认值。"
             ),

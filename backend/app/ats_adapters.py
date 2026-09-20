@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlparse
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
 from .application_models import ApplicationWorkflowState, WorkflowAction
+from .ats_registry import resolve_site_route, route_for_page
 
 
 FINAL_SUBMIT = re.compile(r"^(submit application|confirm application|确认投递|提交申请|提交简历|确认提交)$", re.I)
@@ -55,18 +56,7 @@ async def _input_description(item: Locator) -> str:
 
 
 def adapter_name(url: str) -> str:
-    host = (urlparse(url).hostname or "").lower()
-    if host == "join.qq.com" or host.endswith(".join.qq.com"):
-        return "tencent-campus"
-    if host == "app.mokahr.com" or host.endswith(".mokahr.com"):
-        return "moka-campus"
-    if "lever.co" in host:
-        return "lever"
-    if "greenhouse.io" in host:
-        return "greenhouse"
-    if "myworkdayjobs.com" in host:
-        return "workday"
-    return "generic"
+    return resolve_site_route(url).adapter
 
 
 async def inspect_application_page(page: Page, session_id: str) -> ApplicationWorkflowState:
@@ -99,7 +89,8 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
     }
     """)
     url = page.url
-    adapter = adapter_name(url)
+    site_route = await route_for_page(page)
+    adapter = site_route.adapter
     parsed = urlparse(url)
     cookie_names = [item["name"] for item in await page.context.cookies([url]) if item.get("value")]
     text = data["body_text"]
@@ -240,7 +231,8 @@ async def inspect_application_page(page: Page, session_id: str) -> ApplicationWo
         match = re.search(r"(?:^|/)job/([^/?#]+)", parsed.fragment, re.I)
         job_id = match.group(1) if match else ""
     return ApplicationWorkflowState(
-        session_id=session_id, url=url, title=await page.title(), adapter=adapter, stage=stage,
+        session_id=session_id, url=url, title=await page.title(), adapter=adapter,
+        site_route=site_route, stage=stage,
         message=message, job_title=data["job_title"], job_id=job_id,
         authenticated=authenticated, authentication_evidence=list(dict.fromkeys(authentication_evidence)),
         authentication_methods=methods, requires_consent=unchecked_consent,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -7,8 +8,10 @@ from pydantic import ValidationError
 
 from .job_discovery import official_job_sources
 from .job_models import (ApplicationQueueItem, ApplicationQueueUpdate,
-                         ApplicationReadiness, JobPosting, JobRecommendation,
-                         JobVerification, QueueAddRequest, RecommendationBatch)
+                         ApplicationReadiness, CompanySize, JobPosting,
+                         JobRecommendation, JobSearchSourceSummary,
+                         JobVerification, QueueAddRequest, RecommendationBatch,
+                         SmartJobSearchRequest, SmartJobSearchResult)
 from .models import CandidateProfile
 from .storage import (add_job_queue_entries, delete_job_queue_entry, get_job_verification,
                       get_resume, list_conflicts, list_discovered_jobs,
@@ -22,6 +25,7 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
     JobPosting(
         id="baidu-j99969-agent-algorithm",
         company="百度",
+        company_size="large",
         title="2027AIDU-智能体算法工程师",
         job_code="J99969",
         locations=["北京"],
@@ -41,6 +45,7 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
     JobPosting(
         id="baidu-j101017-agent-algorithm",
         company="百度",
+        company_size="large",
         title="北京-智能体算法工程师",
         job_code="J101017",
         locations=["北京"],
@@ -60,6 +65,7 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
     JobPosting(
         id="baidu-j99974-agent-fullstack",
         company="百度",
+        company_size="large",
         title="2027AIDU-Agent应用全栈工程师",
         job_code="J99974",
         locations=["北京"],
@@ -79,6 +85,7 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
     JobPosting(
         id="baidu-j100737-backend",
         company="百度",
+        company_size="large",
         title="北京-后端开发工程师",
         job_code="J100737",
         locations=["北京"],
@@ -98,6 +105,7 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
     JobPosting(
         id="baidu-j101055-ai-test",
         company="百度",
+        company_size="large",
         title="北京-AI测试开发工程师",
         job_code="J101055",
         locations=["北京"],
@@ -117,6 +125,7 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
     JobPosting(
         id="tencent-1282707395466077184",
         company="腾讯",
+        company_size="large",
         title="Agent 开发方向校招岗位",
         job_code="1282707395466077184",
         locations=["深圳"],
@@ -135,6 +144,7 @@ JOB_CATALOG: tuple[JobPosting, ...] = (
     JobPosting(
         id="bytedance-frontier-ai-entry",
         company="字节跳动",
+        company_size="large",
         title="前沿技术领域人才校招（Agent/大模型岗位入口）",
         job_code="project-entry",
         locations=["北京", "上海", "深圳", "杭州"],
@@ -162,7 +172,8 @@ def all_jobs() -> tuple[JobPosting, ...]:
         (job.company.casefold(), job.job_code.casefold()): index
         for index, job in enumerate(jobs) if job.job_code
     }
-    for payload in list_discovered_jobs():
+    allowed_source_ids = {source.id for source in official_job_sources()}
+    for payload in list_discovered_jobs(allowed_source_ids):
         try:
             discovered = JobPosting.model_validate(payload)
         except ValidationError:
@@ -358,8 +369,33 @@ def _score(profile: CandidateProfile, job: JobPosting, preferred_location: str =
                              gate_reasons=gate_reasons)
 
 
-def recommendation_batch(profile: CandidateProfile, preferred_location: str = "") -> RecommendationBatch:
-    catalog = all_jobs()
+def _query_tokens(query: str) -> list[str]:
+    normalized = re.sub(r"[,，/、;；|]+", " ", query.casefold()).strip()
+    tokens = re.findall(r"[a-z][a-z0-9+#.\-]{1,}|[\u4e00-\u9fff]{2,}", normalized)
+    return list(dict.fromkeys(tokens))[:12]
+
+
+def _job_matches_query(job: JobPosting, query: str) -> bool:
+    tokens = _query_tokens(query)
+    if not tokens:
+        return True
+    primary = " ".join([job.company, job.title, job.job_code]).casefold()
+    if any(token in primary for token in tokens):
+        return True
+    # A single broad skill such as "Agent" often appears in company boilerplate.
+    # Require two separate signals before admitting description-only matches.
+    secondary = " ".join([
+        job.description, *job.required_skills, *job.preferred_skills, *job.role_keywords,
+    ]).casefold()
+    return len(tokens) >= 2 and sum(token in secondary for token in tokens) >= 2
+
+
+def recommendation_batch(profile: CandidateProfile, preferred_location: str = "",
+                         query: str = "", company_sizes: list[CompanySize] | None = None
+                         ) -> RecommendationBatch:
+    catalog = tuple(job for job in all_jobs()
+                    if _job_matches_query(job, query)
+                    and (not company_sizes or job.company_size in company_sizes))
     available_locations = list(dict.fromkeys(
         location for job in catalog for location in job.locations if location.strip()
     ))
@@ -379,10 +415,56 @@ def recommendation_batch(profile: CandidateProfile, preferred_location: str = ""
         summary_parts.append(f"预计 {year} 年毕业")
     if selected_location:
         summary_parts.append(f"工作地点：{selected_location}")
-    return RecommendationBatch(generated_at=datetime.now(timezone.utc), engine="official-discovery-verified-local-score-v3",
+    return RecommendationBatch(generated_at=datetime.now(timezone.utc), engine="official-source-adapters-local-retrieval-v4",
                                profile_summary=" · ".join(summary_parts),
                                available_locations=available_locations,
                                selected_location=selected_location, jobs=jobs)
+
+
+def rag_recommendation_batch(profile: CandidateProfile, preferred_location: str = "",
+                             query: str = "", company_sizes: list[CompanySize] | None = None
+                             ) -> RecommendationBatch:
+    from .job_rag import enrich_recommendation_batch
+
+    baseline = recommendation_batch(profile, preferred_location, query, company_sizes)
+    return enrich_recommendation_batch(baseline, profile, ALIASES)
+
+
+async def smart_job_search(profile: CandidateProfile,
+                           payload: SmartJobSearchRequest) -> SmartJobSearchResult:
+    """Refresh official sources, then retrieve and score their normalized jobs."""
+    from .job_discovery import sync_official_source
+
+    query = payload.query.strip() or profile.target_role.strip() or " ".join(profile.skills[:4])
+    sources = [source for source in official_job_sources() if source.enabled][:payload.max_sources]
+    summaries: list[JobSearchSourceSummary] = []
+    if payload.sync_sources:
+        semaphore = asyncio.Semaphore(3)
+
+        async def sync(source_id: str):
+            async with semaphore:
+                return await sync_official_source(source_id)
+
+        results = await asyncio.gather(*(sync(source.id) for source in sources))
+        summaries = [JobSearchSourceSummary(
+            source_id=result.source_id, source_name=result.source_name, status=result.status,
+            jobs_seen=result.jobs_seen, message=result.message,
+        ) for result in results]
+    else:
+        summaries = [JobSearchSourceSummary(
+            source_id=source.id, source_name=source.name, status=source.last_status,
+            jobs_seen=source.jobs_seen, message=source.last_message,
+        ) for source in sources]
+    batch = recommendation_batch(
+        profile, payload.location, query=query, company_sizes=payload.company_sizes,
+    )
+    successful = sum(item.status in {"success", "partial"} for item in summaries)
+    failed = sum(item.status == "failed" for item in summaries)
+    return SmartJobSearchResult(
+        query=query, generated_at=datetime.now(timezone.utc), synced_sources=len(summaries),
+        successful_sources=successful, failed_sources=failed,
+        discovered_jobs=sum(item.jobs_seen for item in summaries), sources=summaries, batch=batch,
+    )
 
 
 def _recommendation_by_id(profile: CandidateProfile, job_id: str) -> JobRecommendation | None:
@@ -405,6 +487,12 @@ def queue_items(profile: CandidateProfile) -> list[ApplicationQueueItem]:
     items: list[ApplicationQueueItem] = []
     for record in list_job_queue_entries():
         recommendation = _recommendation_by_id(profile, record["job_id"])
+        if not recommendation:
+            try:
+                snapshot = JobPosting.model_validate_json(record.get("job_snapshot_json") or "{}")
+                recommendation = _score(profile, snapshot)
+            except (ValidationError, ValueError, TypeError):
+                recommendation = None
         if recommendation:
             items.append(ApplicationQueueItem(**record, recommendation=recommendation))
     return items
@@ -417,7 +505,12 @@ def add_to_queue(profile: CandidateProfile, payload: QueueAddRequest) -> list[Ap
         raise ValueError(f"岗位不存在：{', '.join(unknown)}")
     if payload.resume_id and not get_resume(payload.resume_id):
         raise LookupError("选择的简历不存在")
-    add_job_queue_entries(list(dict.fromkeys(payload.job_ids)), payload.resume_id)
+    unique_ids = list(dict.fromkeys(payload.job_ids))
+    snapshots = {
+        job_id: job.model_dump(mode="json")
+        for job_id in unique_ids if (job := catalog_job(job_id)) is not None
+    }
+    add_job_queue_entries(unique_ids, payload.resume_id, snapshots)
     return queue_items(profile)
 
 
@@ -445,6 +538,14 @@ def update_queue_item(profile: CandidateProfile, queue_id: str,
         changes["status_changed_at"] = now
         if next_status == "submitted" and not current.submitted_at:
             changes["submitted_at"] = now
+        if next_status in {"submitted", "interview", "offer", "rejected", "withdrawn", "planned"}:
+            changes["confirmation_pending"] = 0
+    if next_status == "in_progress":
+        now = datetime.now(timezone.utc).isoformat()
+        changes["assistance_started_at"] = current.assistance_started_at.isoformat() if current.assistance_started_at else now
+        changes["confirmation_pending"] = 1
+    if payload.candidate_confirmed:
+        changes["confirmation_pending"] = 0
     if payload.notes is not None:
         changes["notes"] = payload.notes.strip()
     if payload.application_id is not None:

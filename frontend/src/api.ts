@@ -1,4 +1,4 @@
-import type { ApplicationQueueItem, ApplicationReadiness, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, Conflict, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobDiscoveryResult, JobVerification, ModelHealth, NativeResumeImportResult, OfficialJobSource, PreSubmitCheck, QueueStatus, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
+import type { ApplicationAgentTurn, ApplicationQueueItem, ApplicationReadiness, ApplicationWorkflowState, AuthSession, BrowserSnapshot, CandidateProfile, CompanySize, Conflict, DiscoveryAdapter, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobDiscoveryResult, JobEvidenceExplanation, JobVerification, ModelHealth, NativeResumeImportResult, OfficialJobSource, PreSubmitCheck, QueueStatus, RecommendationBatch, ResumeProfile, ResumeRecord, SmartJobSearchResult, UserAccount } from './types'
 
 export const API = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/api`
 const nativeFetch=window.fetch.bind(window)
@@ -22,10 +22,15 @@ export const api={
   logout:()=>fetch(`${API}/auth/logout`,{method:'POST'}).then(result<void>),
   profile:()=>fetch(`${API}/profile`).then(result<CandidateProfile>),
   saveProfile:(profile:ResumeProfile)=>fetch(`${API}/profile`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(profile)}).then(result<CandidateProfile>),
-  saveApplicationAnswer:(question:string,field_name:string,value:string)=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value})}).then(result<CandidateProfile>),
+  saveApplicationAnswer:(question:string,field_name:string,value:string,metadata:Partial<{semantic_key:string;entity_scope:string;field_signature:string;field_type:string;options:string[];source_url:string}>={})=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value,...metadata})}).then(result<CandidateProfile>),
   recommendations:(location='')=>fetch(`${API}/jobs/recommendations${location?`?location=${encodeURIComponent(location)}`:''}`).then(result<RecommendationBatch>),
+  ragRecommendations:(payload:{location:string;query:string;company_sizes:CompanySize[]})=>fetch(`${API}/jobs/recommendations/rag`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<RecommendationBatch>),
+  explainJob:(id:string)=>fetch(`${API}/jobs/${encodeURIComponent(id)}/explain`,{method:'POST'}).then(result<JobEvidenceExplanation>),
   jobSources:()=>fetch(`${API}/jobs/sources`).then(result<OfficialJobSource[]>),
+  addJobSource:(payload:{company:string;official_url:string;adapter:DiscoveryAdapter;source_key?:string;company_size:CompanySize})=>fetch(`${API}/jobs/sources`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<OfficialJobSource>),
+  deleteJobSource:(id:string)=>fetch(`${API}/jobs/sources/${encodeURIComponent(id)}`,{method:'DELETE'}).then(result<void>),
   syncJobSource:(id:string)=>fetch(`${API}/jobs/sources/${encodeURIComponent(id)}/sync`,{method:'POST'}).then(result<JobDiscoveryResult>),
+  smartJobSearch:(payload:{query:string;location:string;company_sizes:CompanySize[];sync_sources:boolean;max_sources?:number})=>fetch(`${API}/jobs/search`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<SmartJobSearchResult>),
   verifyJob:(id:string)=>fetch(`${API}/jobs/${encodeURIComponent(id)}/verify`,{method:'POST'}).then(result<JobVerification>),
   readiness:()=>fetch(`${API}/readiness`).then(result<ApplicationReadiness>),
   modelHealth:()=>fetch(`${API}/model/health`,{method:'POST'}).then(result<ModelHealth>),
@@ -48,6 +53,8 @@ export const api={
   inspectBrowserField:(id:string,selector:string)=>fetch(`${API}/browser/${id}/field/inspect`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector})}).then(result<FormReviewResult>),
   importResumeWithSite:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/native-resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id})}).then(result<NativeResumeImportResult>),
   workflowState:(id:string)=>fetch(`${API}/browser/${id}/workflow`).then(result<ApplicationWorkflowState>),
+  assessApplicationAgent:(id:string)=>fetch(`${API}/browser/${id}/agent/assess`,{method:'POST'}).then(result<ApplicationAgentTurn>),
+  runApplicationAgentStep:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/agent/step`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id})}).then(result<ApplicationAgentTurn>),
   advanceWorkflow:(id:string,intent:'start_application'|'create_account'|'continue_application'|'refresh')=>fetch(`${API}/browser/${id}/workflow/advance`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({intent})}).then(result<ApplicationWorkflowState>),
   fillRegistration:(id:string,email:string,phone:string,password:string)=>fetch(`${API}/browser/${id}/workflow/registration`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,phone,password})}).then(result<ApplicationWorkflowState>),
   requestVerificationCode:(id:string,channel:'phone'|'email',value='')=>fetch(`${API}/browser/${id}/workflow/request-code`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel,value})}).then(result<ApplicationWorkflowState>),

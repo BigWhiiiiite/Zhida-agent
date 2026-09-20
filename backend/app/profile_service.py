@@ -1,27 +1,51 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
-from .models import FieldEvidence, ResumeProfile
+from .field_semantics import normalize_text, option_fingerprint
+from .models import ApplicationAnswerMemory, FieldEvidence, ResumeProfile
 from .storage import create_conflict, get_profile, get_resume, save_profile, update_resume
 
 
 SCALAR_FIELDS = [
     "name", "english_name", "gender", "birth_date", "age", "phone", "email", "qq", "wechat",
-    "location", "country_region", "hometown", "website", "github", "linkedin", "target_role", "available_date",
-    "internship_duration", "days_per_week", "expected_salary", "remote_preference", "summary",
+    "location", "country_region", "nationality", "ethnicity", "political_status", "marital_status",
+    "hometown", "hukou_location", "address", "website", "github", "linkedin", "target_role",
+    "available_date", "internship_duration", "days_per_week", "expected_salary", "remote_preference",
+    "willing_to_relocate", "campus_candidate_type", "summary",
 ]
-LIST_FIELDS = ["skills", "languages", "certificates", "awards", "target_industries", "target_cities"]
+LIST_FIELDS = [
+    "skills", "languages", "certificates", "awards", "target_industries", "target_cities",
+    "preferred_business_groups", "interview_preferences",
+]
+
+SEMANTIC_PROFILE_FIELDS = {
+    "candidate.email": "email", "candidate.phone": "phone", "candidate.wechat": "wechat",
+    "candidate.qq": "qq", "candidate.github": "github", "candidate.linkedin": "linkedin",
+    "candidate.website": "website", "candidate.country_region": "country_region",
+    "candidate.nationality": "nationality", "candidate.ethnicity": "ethnicity",
+    "candidate.political_status": "political_status", "candidate.marital_status": "marital_status",
+    "candidate.hukou_location": "hukou_location", "candidate.address": "address",
+    "candidate.current_location": "location", "candidate.campus_type": "campus_candidate_type",
+    "candidate.skills": "skills", "candidate.languages": "languages",
+    "preference.work_location": "target_cities",
+    "preference.business_group": "preferred_business_groups",
+    "preference.interview_location": "interview_preferences",
+    "preference.relocation": "willing_to_relocate",
+}
 
 NON_REUSABLE_ANSWER_HINTS = (
     "consent", "agree", "privacy", "terms", "legal", "declaration", "authorization", "visa",
     "sponsorship", "salary", "compensation", "gender", "sex", "race", "ethnicity", "disability",
     "veteran", "referral", "available", "availability", "work permit", "right to work",
     "同意", "隐私", "条款", "声明", "工作许可", "签证", "担保", "薪资", "薪酬", "性别",
-    "种族", "族裔", "残障", "退伍", "调剂", "内推", "政治面貌", "户口", "婚姻", "身份证",
-    "到岗", "可入职", "面试城市", "面试地点", "参加面试", "interview city", "interview location",
+    "种族", "族裔", "残障", "退伍", "内推", "政治面貌", "户口", "婚姻", "身份证",
+    "到岗", "可入职",
+    "身份证", "证件号码", "证件号", "护照号码", "护照号", "实名认证", "national id", "id number", "passport number",
 )
 
 
@@ -36,33 +60,83 @@ def _answer_profile_field(question: str, field_name: str) -> str:
         (("github",), "github"),
         (("portfolio", "personal website", "个人网站", "作品集"), "website"),
         (("country/region", "country or region", "国家/地区", "所在国家", "国家或地区"), "country_region"),
+        (("国籍", "citizenship", "nationality"), "nationality"),
+        (("民族", "族别", "ethnicity", "ethnic group"), "ethnicity"),
+        (("政治面貌", "political status", "political affiliation"), "political_status"),
+        (("婚姻状况", "marital status"), "marital_status"),
+        (("户籍所在地", "户口所在地", "户籍地", "hukou"), "hukou_location"),
+        (("通讯地址", "联系地址", "mailing address"), "address"),
         (("current location", "current city", "当前所在地", "当前所处地", "现居地", "居住地"), "location"),
         (("preferred location", "preferred city", "work city", "期望工作城市", "期望城市", "意向城市"), "target_cities"),
+        (("感兴趣的事业群", "意向事业群", "business group"), "preferred_business_groups"),
+        (("面试城市", "面试地点", "interview city", "interview location"), "interview_preferences"),
+        (("接受其他城市分配", "接受调剂", "willing to relocate"), "willing_to_relocate"),
         (("ai application skill", "ai skills", "technical skills", "专业技能", "技术技能", "ai应用技能"), "skills"),
         (("language ability", "language skills", "languages", "语言能力", "外语能力"), "languages"),
     )
     return next((field for hints, field in mappings if any(hint in description for hint in hints)), "")
 
 
-def save_application_answer(question: str, field_name: str, value: str):
+def save_application_answer(question: str, field_name: str, value: str, *, semantic_key: str = "",
+                            entity_scope: str = "", field_signature: str = "",
+                            field_type: str = "text", options: list[str] | None = None,
+                            source_url: str = ""):
     """Persist an explicit reusable answer without learning legal/sensitive decisions."""
     cleaned_question = re.sub(r"\s+", " ", question).strip().strip("*✱ ")
     cleaned_value = value.strip()
     description = f"{cleaned_question} {field_name}".casefold()
-    if any(hint in description for hint in NON_REUSABLE_ANSWER_HINTS):
+    semantic_key = semantic_key.strip() or "application.custom"
+    entity_scope = entity_scope.strip() or "application"
+    if (any(hint in description for hint in NON_REUSABLE_ANSWER_HINTS)
+            or semantic_key == "third_party.contact" or entity_scope == "third_party"):
         raise ValueError("这类敏感或本次申请答案不会保存到可复用主档案")
     if not cleaned_question or not cleaned_value:
         raise ValueError("问题和答案不能为空")
     current = ResumeProfile.model_validate(get_profile().model_dump())
-    direct_field = _answer_profile_field(cleaned_question, field_name)
+    direct_field = SEMANTIC_PROFILE_FIELDS.get(semantic_key) or _answer_profile_field(cleaned_question, field_name)
     if direct_field:
         if direct_field in LIST_FIELDS:
             values = [item.strip() for item in re.split(r"[,，、\n]", cleaned_value) if item.strip()]
             setattr(current, direct_field, values)
         else:
             setattr(current, direct_field, cleaned_value)
-    else:
+    elif not semantic_key.startswith(("education.", "experience.", "project.")):
         current.application_answers[cleaned_question] = cleaned_value
+    normalized_question = normalize_text(cleaned_question)
+    fingerprint = option_fingerprint(options or [])
+    memory_key = field_signature.strip() or "|".join((
+        semantic_key, entity_scope, normalized_question, field_type, fingerprint,
+    ))
+    now = datetime.now(timezone.utc)
+    existing = next((item for item in current.application_answer_memory
+                     if (item.field_signature or "|".join((
+                         item.semantic_key, item.entity_scope, item.normalized_question,
+                         item.field_type, item.option_fingerprint,
+                     ))) == memory_key), None)
+    source_host = (urlparse(source_url).hostname or "").casefold()
+    if existing:
+        existing.question = cleaned_question
+        existing.normalized_question = normalized_question
+        existing.semantic_key = semantic_key
+        existing.entity_scope = entity_scope
+        existing.field_signature = field_signature.strip()
+        existing.field_type = field_type
+        existing.option_fingerprint = fingerprint
+        existing.value = cleaned_value
+        existing.source_host = source_host or existing.source_host
+        existing.confirmed_count += 1
+        existing.updated_at = now
+    else:
+        current.application_answer_memory.append(ApplicationAnswerMemory(
+            id=str(uuid4()), question=cleaned_question, normalized_question=normalized_question,
+            semantic_key=semantic_key, entity_scope=entity_scope,
+            field_signature=field_signature.strip(), field_type=field_type,
+            option_fingerprint=fingerprint, value=cleaned_value, source_host=source_host,
+            updated_at=now,
+        ))
+    current.application_answer_memory = sorted(
+        current.application_answer_memory, key=lambda item: item.updated_at, reverse=True,
+    )[:500]
     return save_profile(current)
 
 

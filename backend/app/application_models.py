@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr
+
+from .browser_models import BrowserSnapshot, ExecutionResult, FormReviewResult, PreSubmitCheck
+from .ats_registry import SiteRoute
 
 
 ApplicationStage = Literal[
@@ -27,6 +31,7 @@ class ApplicationWorkflowState(BaseModel):
     url: str
     title: str
     adapter: str = "generic"
+    site_route: SiteRoute = Field(default_factory=SiteRoute)
     stage: ApplicationStage = "unknown"
     message: str = ""
     job_title: str = ""
@@ -65,3 +70,61 @@ class VerificationCodeRequest(BaseModel):
 class VerificationRequest(BaseModel):
     channel: Literal["phone", "email"]
     value: str = Field(default="", max_length=320)
+
+
+AgentNextAction = Literal[
+    "start_application", "analyze_and_fill", "continue_application", "refresh",
+    "wait_for_registration", "wait_for_login", "wait_for_verification",
+    "review_before_submit", "stop",
+]
+
+
+class ApplicationAgentDecision(BaseModel):
+    """A model-informed recommendation constrained by the workflow state machine."""
+
+    stage: ApplicationStage
+    goal: str
+    summary: str
+    next_action: AgentNextAction
+    next_label: str
+    rationale: str
+    blockers: list[str] = Field(default_factory=list, max_length=12)
+    user_questions: list[str] = Field(default_factory=list, max_length=8)
+    can_execute: bool = False
+    requires_user: bool = False
+    risk_level: Literal["low", "medium", "high"] = "low"
+    model_status: Literal["model", "local_fallback"] = "local_fallback"
+    model: str = ""
+
+
+class ApplicationAgentStepRequest(BaseModel):
+    resume_id: str = Field(default="", max_length=200)
+
+
+class ApplicationAgentEvent(BaseModel):
+    action: str
+    stage: ApplicationStage
+    summary: str
+    created_at: datetime
+
+
+class ApplicationAgentCheckpoint(BaseModel):
+    run_id: str
+    session_id: str
+    status: Literal["active", "waiting_user", "review", "completed", "stopped"]
+    stage: ApplicationStage
+    url: str
+    title: str
+    updated_at: datetime
+    events: list[ApplicationAgentEvent] = Field(default_factory=list)
+
+
+class ApplicationAgentTurn(BaseModel):
+    decision: ApplicationAgentDecision
+    workflow: ApplicationWorkflowState
+    snapshot: BrowserSnapshot
+    action_taken: AgentNextAction | Literal[""] = ""
+    review: FormReviewResult | None = None
+    execution: ExecutionResult | None = None
+    pre_submit: PreSubmitCheck | None = None
+    checkpoint: ApplicationAgentCheckpoint

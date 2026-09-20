@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 
 from agents import Agent, Runner
 from agents.exceptions import ModelBehaviorError
@@ -10,8 +11,11 @@ from openai import APIConnectionError, APITimeoutError, InternalServerError, Rat
 
 from .browser_models import (BrowserSnapshot, ComparisonSummary, FieldComparison, FillAction,
                              FormPlan, FormReviewResult, PageField)
+from .field_semantics import (education_scope_label, entity_scope_for, field_text, field_identity_text,
+                              normalize_text, option_fingerprint, semantic_key_for)
 from .model_provider import configured_model
-from .models import CandidateProfile
+from .models import CandidateProfile, Education
+from .ats_registry import resolve_site_route
 
 
 SYSTEM_PROMPT = """
@@ -31,6 +35,10 @@ SYSTEM_PROMPT = """
 11. 必须识别字段的信息主体。紧急联系人、家属、监护人、推荐人等第三方信息不得使用候选人本人的姓名、电话或邮箱。
 12. 是/否、是否接受调剂、意向事业群、工作偏好等需要候选人决策的字段，没有已确认答案时必须 ask_user。
 13. label_source、context、placeholder 是网页采集证据。字段标题不清楚时可以依据这些证据理解问题，但不得脱离网页原文猜造问题。
+14. semantic_key、entity_scope、field_signature 是规则层生成的字段身份。education.* 字段必须使用同一 entity_scope 的同一条教育经历，禁止把本科的学校与硕士的学院、专业或学位混合。
+15. entity_scope=education:unspecified 且候选人存在多段教育经历时必须 ask_user，模型不得猜测对应层次。
+16. question_text 是扫描器根据网页证据恢复的原题；nearby_labels、help_text、section_path 是补充上下文。action.label 应优先保留清晰原题，不得将“是/否/男/女/北京”等选项文本写成问题。
+17. 模型负责语义映射；真实值必须来自 candidate_profile。不得为结构化字段或选择题编造主档案中不存在的事实。
 """
 
 
@@ -43,6 +51,7 @@ SENSITIVE_HINTS = (
     "authorization", "visa", "sponsorship", "salary", "compensation", "gender", "sex", "race",
     "ethnicity", "disability", "veteran", "consent", "agree", "privacy", "terms", "legal",
     "工作许可", "签证", "担保", "薪资", "性别", "种族", "族裔", "残障", "退伍", "同意", "隐私", "条款",
+    "身份证", "证件号码", "证件号", "护照号码", "护照号", "实名认证", "national id", "id number", "passport number",
 )
 
 THIRD_PARTY_HINTS = (
@@ -105,13 +114,11 @@ OPTION_ALIASES = (
 
 
 def _normalized(value: str) -> str:
-    return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", value.casefold())
+    return normalize_text(value)
 
 
 def _field_text(field: PageField) -> str:
-    return " ".join(filter(None, (
-        field.section, field.group_label, field.label, field.context, field.placeholder, field.name,
-    ))).casefold()
+    return field_text(field)
 
 
 def _is_third_party(field: PageField) -> bool:
@@ -119,12 +126,64 @@ def _is_third_party(field: PageField) -> bool:
     return any(hint in text for hint in THIRD_PARTY_HINTS)
 
 
+@dataclass(frozen=True)
+class SavedAnswerMatch:
+    value: str = ""
+    source: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class EducationResolution:
+    record: Education | None
+    scope: str
+    reason: str
+
+
+def _saved_answer_match(field: PageField, profile: CandidateProfile) -> SavedAnswerMatch:
+    """Reuse only a user-confirmed answer with a compatible semantic identity."""
+    key = semantic_key_for(field)
+    scope = entity_scope_for(field, key)
+    question = _normalized(field.question_text or field.group_label or field.label)
+    fingerprint = option_fingerprint(field.options)
+
+    exact = next((item for item in profile.application_answer_memory
+                  if field.field_signature and item.field_signature == field.field_signature), None)
+    if exact:
+        if exact.option_fingerprint and fingerprint and exact.option_fingerprint != fingerprint:
+            return SavedAnswerMatch(reason="网页选项已发生变化，已保存答案需要重新确认")
+        return SavedAnswerMatch(
+            exact.value, "已确认答案记忆",
+            f"复用你在 {exact.source_host or '此前投递'} 确认过的答案（已确认 {exact.confirmed_count} 次）",
+        )
+
+    repeated_prefix = next((prefix for prefix in ("education.", "experience.", "project.")
+                            if key.startswith(prefix)), "")
+    reusable_scope = not repeated_prefix or not scope.endswith(":unspecified")
+    semantic = next((item for item in profile.application_answer_memory
+                     if reusable_scope and item.semantic_key == key and item.entity_scope == scope
+                     and item.normalized_question == question
+                     and (not item.option_fingerprint or not fingerprint
+                          or item.option_fingerprint == fingerprint)), None)
+    if semantic:
+        return SavedAnswerMatch(
+            semantic.value, "已确认答案记忆",
+            f"复用同类网页问题的已确认答案（已确认 {semantic.confirmed_count} 次）",
+        )
+
+    # Backward compatibility for answers saved before semantic signatures existed.
+    if not repeated_prefix:
+        targets = {_normalized(value) for value in (field.group_label, field.label) if value}
+        for saved_question, value in profile.application_answers.items():
+            if value and _normalized(saved_question) in targets:
+                return SavedAnswerMatch(value, "主档案.application_answers", "使用用户已确认的同题答案")
+    return SavedAnswerMatch(reason=("已保存答案与当前网页选项不一致，需要重新确认"
+                                    if any(item.normalized_question == question
+                                           for item in profile.application_answer_memory) else ""))
+
+
 def _saved_answer(field: PageField, profile: CandidateProfile) -> str:
-    targets = {_normalized(value) for value in (field.group_label, field.label) if value}
-    for question, value in profile.application_answers.items():
-        if value and _normalized(question) in targets:
-            return value
-    return ""
+    return _saved_answer_match(field, profile).value
 
 
 def _has_yes_no_options(field: PageField) -> bool:
@@ -138,6 +197,17 @@ def _needs_manual_decision(field: PageField) -> bool:
     return _has_yes_no_options(field) or any(hint in text for hint in MANUAL_DECISION_HINTS)
 
 
+def _action_label(field: PageField) -> str:
+    """Use the shared question prompt for choice controls, never an option caption alone."""
+    if field.field_type in {"radio", "checkbox"}:
+        return field.question_text or field.group_label or field.label or field.name
+    return field.question_text or field.label or field.group_label or field.name
+
+
+def _missing_choice_prompt(field: PageField) -> bool:
+    return field.field_type == "radio" and field.group_label.startswith("未识别的")
+
+
 def _degree_family(value: str) -> str:
     normalized = value.casefold()
     for family, aliases in DEGREE_ALIASES.items():
@@ -146,13 +216,90 @@ def _degree_family(value: str) -> str:
     return ""
 
 
-def _education_for_field(field: PageField, profile: CandidateProfile):
+def _education_summary(profile: CandidateProfile) -> str:
+    parts = []
+    for item in profile.education:
+        level = education_scope_label(f"education:{_degree_family(item.degree)}")
+        parts.append(" · ".join(value for value in (level, item.school, item.college, item.major) if value))
+    return "；".join(parts)
+
+
+def _education_value(record: Education, semantic_key: str) -> str:
+    attribute = semantic_key.removeprefix("education.")
+    return str(getattr(record, attribute, "") or "")
+
+
+def _education_record_for_scope(scope: str, profile: CandidateProfile) -> Education | None:
     if not profile.education:
         return None
-    text = _field_text(field)
-    if "最高" in text or "highest" in text:
-        return max(profile.education, key=lambda item: DEGREE_RANK.get(_degree_family(item.degree), -1))
-    return next((item for item in profile.education if item.current), None) or profile.education[0]
+    if scope.startswith("education:") and scope.split(":", 1)[1] in DEGREE_RANK:
+        family = scope.split(":", 1)[1]
+        candidates = [item for item in profile.education if _degree_family(item.degree) == family]
+        return candidates[0] if len(candidates) == 1 else None
+    if scope == "education:highest":
+        ranked = [(DEGREE_RANK.get(_degree_family(item.degree), -1), item) for item in profile.education]
+        best = max((rank for rank, _ in ranked), default=-1)
+        candidates = [item for rank, item in ranked if rank == best]
+        return candidates[0] if best >= 0 and len(candidates) == 1 else None
+    if scope == "education:current":
+        candidates = [item for item in profile.education if item.current]
+        return candidates[0] if len(candidates) == 1 else None
+    return profile.education[0] if len(profile.education) == 1 else None
+
+
+def _education_resolutions(snapshot: BrowserSnapshot,
+                           profile: CandidateProfile) -> dict[str, EducationResolution]:
+    education_fields = [field for field in snapshot.fields
+                        if semantic_key_for(field).startswith("education.")]
+    groups: dict[str, list[PageField]] = {}
+    for field in education_fields:
+        scope = entity_scope_for(field, semantic_key_for(field))
+        group = field.container_key or (scope if scope != "education:unspecified" else field.selector)
+        groups.setdefault(group, []).append(field)
+
+    resolutions: dict[str, EducationResolution] = {}
+    for fields in groups.values():
+        explicit_scopes = {
+            entity_scope_for(field, semantic_key_for(field)) for field in fields
+            if entity_scope_for(field, semantic_key_for(field)) != "education:unspecified"
+        }
+        scope = next(iter(explicit_scopes)) if len(explicit_scopes) == 1 else "education:unspecified"
+        record = _education_record_for_scope(scope, profile)
+        reason = ""
+
+        # A site's own resume parser can provide strong evidence for the whole education block.
+        if record is None and not explicit_scopes and profile.education and len(fields) >= 2:
+            matched_records: set[int] = set()
+            for field in fields:
+                if not field.current_value:
+                    continue
+                key = semantic_key_for(field)
+                for index, candidate in enumerate(profile.education):
+                    expected = _education_value(candidate, key)
+                    if expected and _normalized(expected) == _normalized(field.current_value):
+                        matched_records.add(index)
+            if len(matched_records) == 1:
+                record = profile.education[next(iter(matched_records))]
+                scope = f"education:{_degree_family(record.degree)}"
+            elif len(matched_records) > 1:
+                reason = "网页当前值分别命中了多段教育经历，存在串填风险，必须人工核对整组字段"
+
+        if record is None and not reason:
+            if not profile.education:
+                reason = "主档案还没有教育经历，请先补充后再填写"
+            elif len(explicit_scopes) > 1:
+                reason = "同一教育分组同时出现多个学历层次，系统已阻止跨经历混填"
+            elif scope != "education:unspecified":
+                reason = f"主档案中无法唯一找到{education_scope_label(scope)}经历，请人工确认"
+            else:
+                reason = f"网页没有说明该组对应哪段教育经历，不能在以下记录中猜测：{_education_summary(profile)}"
+        elif record:
+            resolved_level = education_scope_label(f"education:{_degree_family(record.degree)}")
+            reason = f"已将本组锁定为{resolved_level}经历：{record.school or '学校未填写'}"
+
+        for field in fields:
+            resolutions[field.selector] = EducationResolution(record, scope, reason)
+    return resolutions
 
 
 def _matching_degree_option(value: str, options: list[str], label: str) -> str:
@@ -178,36 +325,55 @@ def _matching_degree_option(value: str, options: list[str], label: str) -> str:
     return ""
 
 
-def _manual_answer_action(field: PageField, answer: str) -> FillAction:
-    label = field.label or field.group_label or field.name
+def _manual_answer_action(field: PageField, match: SavedAnswerMatch) -> FillAction:
+    label = _action_label(field)
+    answer = match.value
+    reason = match.reason or "使用用户已确认的同题答案"
     if field.field_type == "radio":
         option = field.option_label or field.option_value
         matches = _normalized(answer) in {_normalized(option), _normalized(field.option_value)}
         return FillAction(selector=field.selector, label=label, action="check" if matches else "skip",
-                          value=True if matches else "", value_source="主档案.application_answers",
-                          confidence=1, user_confirmed=True, reason="使用用户已确认的同题答案")
+                          value=True if matches else "", value_source=match.source,
+                          confidence=1, user_confirmed=True, reason=reason)
     if field.field_type == "checkbox":
         checked = _normalized(answer) in {_normalized(value) for value in ("是", "yes", "true", "1")}
         return FillAction(selector=field.selector, label=label, action="check", value=checked,
-                          value_source="主档案.application_answers", confidence=1, user_confirmed=True,
-                          reason="使用用户已确认的同题答案")
+                          value_source=match.source, confidence=1, user_confirmed=True,
+                          reason=reason)
     if field.field_type in {"select-one", "select-multiple", "combobox"}:
-        selected = _matching_option(answer, field.options) if field.options else ""
-        if not selected:
+        values = [item.strip() for item in re.split(r"[,，、\n]", answer) if item.strip()]
+        selected_values = _matching_options(values, field.options) if field.options else []
+        selected = ", ".join(selected_values if field.multiple else selected_values[:1])
+        if not selected or (field.multiple and len(selected_values) != len(values)):
             return FillAction(selector=field.selector, label=label, action="ask_user", sensitive=False,
                               confidence=1, reason="已保存答案与当前网页选项不一致，需要重新确认")
         return FillAction(selector=field.selector, label=label, action="select", value=selected,
-                          value_source="主档案.application_answers", confidence=1, user_confirmed=True)
+                          value_source=match.source, confidence=1, user_confirmed=True, reason=reason)
     return FillAction(selector=field.selector, label=label, action="fill", value=answer,
-                      value_source="主档案.application_answers", confidence=1, user_confirmed=True)
+                      value_source=match.source, confidence=1, user_confirmed=True, reason=reason)
 
 
 def _form_prompt(snapshot: BrowserSnapshot, profile: CandidateProfile) -> str:
+    profile_payload = profile.model_dump(
+        mode="json", exclude={"created_at", "updated_at", "application_answer_memory"},
+        exclude_defaults=True, exclude_none=True,
+    )
+    profile_payload["application_answers"] = {
+        question: value for question, value in profile.application_answers.items()
+        if not any(hint in question.casefold() for hint in (*SENSITIVE_HINTS, *THIRD_PARTY_HINTS))
+    }
     return json.dumps({
+        "mapping_contract": {
+            "goal": "先理解网页原题，再将其映射到已确认主档案；不得根据选项文字反猜题干",
+            "field_evidence": [
+                "question_text", "label_source", "nearby_labels", "help_text", "section_path",
+                "context", "field_type", "options", "semantic_key", "entity_scope",
+            ],
+            "selection_rule": "select/check 只能使用网页 options 中的真实完整文本",
+            "unknown_rule": "题干或资料主体不明时 ask_user，不得猜测",
+        },
         "page": snapshot.model_dump(mode="json"),
-        "candidate_profile": profile.model_dump(
-            mode="json", exclude={"created_at", "updated_at"}, exclude_defaults=True, exclude_none=True,
-        ),
+        "candidate_profile": profile_payload,
     }, ensure_ascii=False)
 
 
@@ -228,11 +394,83 @@ def _keep_page_actions(plan: FormPlan, snapshot: BrowserSnapshot) -> FormPlan:
     return plan
 
 
-def _direct_profile_value(field: PageField, profile: CandidateProfile) -> tuple[str, str]:
+def _direct_profile_value(field: PageField, profile: CandidateProfile,
+                          education_resolution: EducationResolution | None = None) -> tuple[str, str]:
     if _is_third_party(field):
         return "", ""
-    label = _field_text(field)
-    education = _education_for_field(field, profile)
+    label = field_identity_text(field)
+    semantic_key = semantic_key_for(field)
+    if semantic_key.startswith("education."):
+        resolution = education_resolution or EducationResolution(
+            _education_record_for_scope(entity_scope_for(field, semantic_key), profile),
+            entity_scope_for(field, semantic_key), "",
+        )
+        if not resolution.record:
+            saved = _saved_answer_match(field, profile)
+            return (saved.value, saved.source) if saved.value else ("", "")
+        value = _education_value(resolution.record, semantic_key)
+        if semantic_key == "education.degree" and value and field.options:
+            value = _matching_degree_option(value, field.options, label)
+        if value:
+            level = education_scope_label(f"education:{_degree_family(resolution.record.degree)}")
+            return value, f"主档案.education[{level}].{semantic_key.removeprefix('education.')}"
+        return "", ""
+    if semantic_key.startswith("experience."):
+        scope = entity_scope_for(field, semantic_key)
+        candidates = ([item for item in profile.internships if item.current]
+                      if scope == "experience:current" else profile.internships)
+        record = candidates[0] if len(candidates) == 1 else None
+        if record:
+            value = str(getattr(record, semantic_key.removeprefix("experience."), "") or "")
+            if value:
+                return value, f"主档案.internships[{record.organization or '当前记录'}]"
+        saved = _saved_answer_match(field, profile)
+        return (saved.value, saved.source) if saved.value else ("", "")
+    if semantic_key.startswith("project."):
+        record = profile.projects[0] if len(profile.projects) == 1 else None
+        if record:
+            value = str(getattr(record, semantic_key.removeprefix("project."), "") or "")
+            if value:
+                return value, f"主档案.projects[{record.name or '项目记录'}]"
+        saved = _saved_answer_match(field, profile)
+        return (saved.value, saved.source) if saved.value else ("", "")
+    semantic_profile_values = {
+        "candidate.name": (profile.name, "主档案.name"),
+        "candidate.email": (profile.email, "主档案.email"),
+        "candidate.phone": (profile.phone, "主档案.phone"),
+        "candidate.wechat": (profile.wechat, "主档案.wechat"),
+        "candidate.qq": (profile.qq, "主档案.qq"),
+        "candidate.github": (profile.github, "主档案.github"),
+        "candidate.linkedin": (profile.linkedin, "主档案.linkedin"),
+        "candidate.website": (profile.website, "主档案.website"),
+        "candidate.country_region": (profile.country_region, "主档案.country_region"),
+        "candidate.nationality": (profile.nationality, "主档案.nationality"),
+        "candidate.ethnicity": (profile.ethnicity, "主档案.ethnicity"),
+        "candidate.political_status": (profile.political_status, "主档案.political_status"),
+        "candidate.marital_status": (profile.marital_status, "主档案.marital_status"),
+        "candidate.hukou_location": (profile.hukou_location, "主档案.hukou_location"),
+        "candidate.address": (profile.address, "主档案.address"),
+        "candidate.current_location": (profile.location, "主档案.location"),
+        "candidate.campus_type": (profile.campus_candidate_type, "主档案.campus_candidate_type"),
+        "candidate.skills": (", ".join(profile.skills), "主档案.skills"),
+        "candidate.languages": (", ".join(profile.languages), "主档案.languages"),
+        "preference.work_location": (
+            ", ".join(profile.target_cities if field.multiple else profile.target_cities[:1]),
+            "主档案.target_cities",
+        ),
+        "preference.interview_location": (
+            ", ".join(profile.interview_preferences if field.multiple else profile.interview_preferences[:1]),
+            "主档案.interview_preferences",
+        ),
+        "preference.business_group": (
+            ", ".join(profile.preferred_business_groups if field.multiple else profile.preferred_business_groups[:1]),
+            "主档案.preferred_business_groups",
+        ),
+        "preference.relocation": (profile.willing_to_relocate, "主档案.willing_to_relocate"),
+    }
+    semantic_value, semantic_source = semantic_profile_values.get(semantic_key, ("", ""))
+    if semantic_value:
+        return str(semantic_value), semantic_source
     current_job = next((item for item in profile.internships if item.current), None)
     current_job = current_job or (profile.internships[0] if profile.internships else None)
     if _is_any(label, INTERVIEW_LOCATION_HINTS):
@@ -241,6 +479,7 @@ def _direct_profile_value(field: PageField, profile: CandidateProfile) -> tuple[
     if _is_any(label, COUNTRY_HINTS):
         return (profile.country_region, "主档案.country_region") if profile.country_region else ("", "")
     if _is_any(label, STUDY_LOCATION_HINTS):
+        education = _education_record_for_scope(entity_scope_for(field, "education.location"), profile)
         if education and education.location:
             return education.location, "主档案.education.location"
         saved = _saved_answer(field, profile)
@@ -257,11 +496,6 @@ def _direct_profile_value(field: PageField, profile: CandidateProfile) -> tuple[
         return ", ".join(profile.skills), "主档案.skills"
     if _is_any(label, LANGUAGE_HINTS) and profile.languages:
         return ", ".join(profile.languages), "主档案.languages"
-    if education and any(hint in label for hint in ("degree", "education level", "学历", "学位")):
-        degree = (_matching_degree_option(education.degree, field.options, label)
-                  if field.options else education.degree)
-        if degree:
-            return degree, "主档案.education.degree"
     mappings = (
         (("email", "e-mail", "邮箱", "电子邮件"), profile.email, "主档案.email"),
         (("phone", "mobile", "telephone", "手机", "电话"), profile.phone, "主档案.phone"),
@@ -270,13 +504,6 @@ def _direct_profile_value(field: PageField, profile: CandidateProfile) -> tuple[
         (("portfolio", "personal website", "个人网站", "作品集"), profile.website, "主档案.website"),
         (("current company", "current employer", "当前公司", "当前雇主"),
          current_job.organization if current_job else "", "主档案.internships"),
-        (("school", "university", "学校", "院校"), education.school if education else "", "主档案.education.school"),
-        (("college", "faculty", "department", "学院", "院系"), education.college if education else "",
-         "主档案.education.college"),
-        (("major", "field of study", "专业"), education.major if education else "", "主档案.education.major"),
-        (("graduat", "expected month", "毕业时间", "毕业日期", "毕业年月"),
-         education.end_date if education else "", "主档案.education.end_date"),
-        (("gpa", "绩点"), education.gpa if education else "", "主档案.education.gpa"),
         (("qq", "qq号", "qq号码", "qq account"), profile.qq, "主档案.qq"),
         (("wechat", "weixin", "微信"), profile.wechat, "主档案.wechat"),
         (("full name", "legal name", "candidate name", "姓名", "名字"), profile.name, "主档案.name"),
@@ -284,9 +511,9 @@ def _direct_profile_value(field: PageField, profile: CandidateProfile) -> tuple[
     for hints, value, source in mappings:
         if value and any(hint in label for hint in hints):
             return str(value), source
-    saved = _saved_answer(field, profile)
-    if saved:
-        return saved, "主档案.application_answers"
+    saved = _saved_answer_match(field, profile)
+    if saved.value:
+        return saved.value, saved.source
     return "", ""
 
 
@@ -303,6 +530,18 @@ def _matching_option(value: str, options: list[str]) -> str:
             _normalized(item) for item in OPTION_ALIASES[wanted_alias]
         }]
         return aliases[0] if len(aliases) == 1 else ""
+    # Chinese ATSes often vary only by administrative suffix: 北京 / 北京市,
+    # 内蒙古 / 内蒙古自治区. Only accept a unique normalized match.
+    def administrative_core(text: str) -> str:
+        normalized = _normalized(text)
+        for suffix in ("特别行政区", "壮族自治区", "回族自治区", "维吾尔自治区", "自治区", "自治州", "地区", "省", "市"):
+            if normalized.endswith(suffix) and len(normalized) > len(suffix) + 1:
+                return normalized[:-len(suffix)]
+        return normalized
+    location_matches = [option for option in options
+                        if administrative_core(option) == administrative_core(value)]
+    if len(location_matches) == 1:
+        return location_matches[0]
     partial = [option for option in options
                if wanted and (wanted in _normalized(option) or _normalized(option) in wanted)]
     return partial[0] if len(partial) == 1 else ""
@@ -323,61 +562,115 @@ def _is_any(text: str, hints: tuple[str, ...]) -> bool:
 
 def _surface_when_empty(field: PageField) -> bool:
     text = _field_text(field)
-    return field.field_type in {"radio", "checkbox", "select-one", "select-multiple", "combobox"} or _is_any(
-        text, OPTIONAL_REVIEW_HINTS
-    )
+    semantic_key = semantic_key_for(field)
+    understood_custom_question = (semantic_key == "application.custom"
+                                  and field.label_source not in {"generated", "unknown", "name"}
+                                  and bool(field.label or field.group_label))
+    return (field.field_type in {"radio", "checkbox", "select-one", "select-multiple", "combobox"}
+            or semantic_key.startswith(("education.", "experience.", "project."))
+            or understood_custom_question or _is_any(text, OPTIONAL_REVIEW_HINTS))
+
+
+def _repeated_entity_issue(field: PageField, profile: CandidateProfile) -> str:
+    key = semantic_key_for(field)
+    if key.startswith("experience.") and len(profile.internships) > 1:
+        choices = "；".join(" · ".join(value for value in (item.organization, item.role) if value)
+                           for item in profile.internships)
+        return f"网页没有唯一标明对应哪段实习/工作经历，不能在以下记录中猜测：{choices}"
+    if key.startswith("project.") and len(profile.projects) > 1:
+        choices = "；".join(item.name for item in profile.projects if item.name)
+        return f"网页没有唯一标明对应哪个项目，不能在以下记录中猜测：{choices}"
+    return ""
 
 
 def _local_safe_plan(snapshot: BrowserSnapshot, profile: CandidateProfile) -> FormPlan:
     actions: list[FillAction] = []
     missing: list[str] = []
     cities = [*profile.target_cities, profile.location]
+    education_resolutions = _education_resolutions(snapshot, profile)
     for field in snapshot.fields:
         label = _field_text(field)
+        semantic_key = semantic_key_for(field)
         sensitive = any(hint in label for hint in SENSITIVE_HINTS)
-        saved_answer = _saved_answer(field, profile)
+        saved_answer = _saved_answer_match(field, profile)
+        education_resolution = education_resolutions.get(field.selector)
+        repeated_entity_issue = _repeated_entity_issue(field, profile)
         if field.field_type == "section-button":
-            action = FillAction(selector=field.selector, label=field.label or field.group_label,
+            action = FillAction(selector=field.selector, label=_action_label(field),
                                 action="ask_user", confidence=1,
                                 reason="网页中的可选资料栏目尚未展开，请先展开后再分析其中字段")
         elif field.field_type == "file":
-            action = FillAction(selector=field.selector, label=field.label or field.name, action="skip",
+            action = FillAction(selector=field.selector, label=_action_label(field), action="skip",
                                 reason="文件由前端的简历选择器单独上传", confidence=1)
         elif _is_third_party(field):
-            action = FillAction(selector=field.selector, label=field.label or field.group_label or field.name,
+            action = FillAction(selector=field.selector, label=_action_label(field),
                                 action="ask_user", reason="第三方联系信息不得使用候选人本人资料",
                                 sensitive=True, confidence=1)
+        elif semantic_key == "candidate.gender":
+            if not profile.gender or profile.gender == "未识别":
+                action = FillAction(selector=field.selector, label=_action_label(field),
+                                    action="ask_user", reason="主档案尚未确认性别，请本人选择",
+                                    sensitive=True, confidence=1)
+            elif field.field_type == "radio":
+                option = field.option_label or field.option_value or field.label
+                matches = bool(_matching_option(profile.gender, [option]))
+                action = FillAction(selector=field.selector, label=_action_label(field),
+                                    action="check" if matches else "skip", value=True if matches else "",
+                                    value_source="已确认主档案.gender", confidence=1,
+                                    reason=f"主档案已确认为“{profile.gender}”")
+            elif field.field_type in {"select-one", "select-multiple", "combobox"}:
+                selected = _matching_option(profile.gender, field.options) if field.options else profile.gender
+                action = (FillAction(selector=field.selector, label=_action_label(field), action="select",
+                                     value=selected, value_source="已确认主档案.gender",
+                                     confidence=.99 if field.options else .9,
+                                     reason="执行后会回读网页真实选项")
+                          if selected else FillAction(selector=field.selector, label=_action_label(field),
+                                                     action="ask_user", sensitive=True, confidence=1,
+                                                     reason="主档案性别无法唯一对应网页选项"))
+            else:
+                action = FillAction(selector=field.selector, label=_action_label(field), action="fill",
+                                    value=profile.gender, value_source="已确认主档案.gender",
+                                    confidence=.99)
         elif sensitive:
             suggestion = ""
             if any(hint in label for hint in ("gender", "sex", "性别")) and profile.gender != "未识别":
                 suggestion = f"；主档案记录为“{profile.gender}”，请从网页的真实选项中确认"
-            action = FillAction(selector=field.selector, label=field.label or field.name, action="ask_user",
+            action = FillAction(selector=field.selector, label=_action_label(field), action="ask_user",
                                 reason=f"敏感或同意类字段需要用户确认{suggestion}", sensitive=True, confidence=1)
         elif _needs_manual_decision(field):
-            action = (_manual_answer_action(field, saved_answer) if saved_answer else
-                      FillAction(selector=field.selector, label=field.label or field.group_label or field.name,
-                                 action="ask_user", reason="是否/偏好类问题需要用户明确选择",
+            direct_value, direct_source = _direct_profile_value(field, profile, education_resolution)
+            confirmed_answer = (SavedAnswerMatch(direct_value, direct_source,
+                                "使用主档案中已确认的投递偏好")
+                                if direct_value and direct_source not in {
+                                    "已确认答案记忆", "主档案.application_answers",
+                                } else saved_answer)
+            action = (_manual_answer_action(field, confirmed_answer) if confirmed_answer.value and not _missing_choice_prompt(field) else
+                      FillAction(selector=field.selector, label=_action_label(field),
+                                 action="ask_user", reason=(
+                                 "网页只暴露了单选项，尚未可靠识别共同题干；系统已阻止把当前选中状态当作答案，请先在招聘网页定位核对"
+                                 if _missing_choice_prompt(field) else confirmed_answer.reason or
+                                 "是否/偏好类问题需要用户明确选择；确认后会安全记忆，下次无需重复填写"),
                                  confidence=1))
         elif field.field_type in {"checkbox", "radio"}:
-            value, source = _direct_profile_value(field, profile)
+            value, source = _direct_profile_value(field, profile, education_resolution)
             profile_values = [item.strip() for item in re.split(r"[,，、\n]", value) if item.strip()]
             option = field.option_label or field.option_value or field.label
             option_match = next((item for item in profile_values if _matching_option(item, [option])), "")
             city = next((city for city in cities if city and city.casefold() in label), "")
             if option_match:
-                action = FillAction(selector=field.selector, label=field.label or field.name, action="check",
+                action = FillAction(selector=field.selector, label=_action_label(field), action="check",
                                     value=True, value_source=source, confidence=.99,
                                     reason="该选项与已确认主档案一致")
             elif city:
-                action = FillAction(selector=field.selector, label=field.label or field.name, action="check",
+                action = FillAction(selector=field.selector, label=_action_label(field), action="check",
                                     value=True, value_source="主档案.target_cities/location", confidence=.95)
             else:
                 kind = "skip" if value else ("ask_user" if field.required or _surface_when_empty(field) else "skip")
-                action = FillAction(selector=field.selector, label=field.label or field.name, action=kind,
+                action = FillAction(selector=field.selector, label=_action_label(field), action=kind,
                                     reason=("该选项不在已确认主档案值中"
                                             if value else "单选或复选含义无法从主档案确定"), confidence=1)
         else:
-            value, source = _direct_profile_value(field, profile)
+            value, source = _direct_profile_value(field, profile, education_resolution)
             selection_mismatch = False
             if value and field.field_type in {"select-one", "select-multiple", "combobox"}:
                 raw_values = [item.strip() for item in re.split(r"[,，、\n]", value) if item.strip()]
@@ -390,21 +683,34 @@ def _local_safe_plan(snapshot: BrowserSnapshot, profile: CandidateProfile) -> Fo
                 elif not field.multiple:
                     value = raw_values[0] if raw_values else ""
             if value:
-                action = FillAction(selector=field.selector, label=field.label or field.name,
+                mapped_reason = (saved_answer.reason if source in {
+                    "已确认答案记忆", "主档案.application_answers",
+                } and saved_answer.reason else education_resolution.reason if education_resolution else "")
+                action = FillAction(selector=field.selector, label=_action_label(field),
                                     action="select" if field.field_type.startswith("select") or field.field_type == "combobox" else "fill",
                                     value=value, value_source=source, confidence=.9 if field.field_type == "combobox" and not field.options else .99,
-                                    reason="执行时会再次读取网页选项并回读验证" if field.field_type == "combobox" else "")
+                                    reason=(f"{mapped_reason}；执行时会再次读取网页选项并回读验证"
+                                            if field.field_type == "combobox" and mapped_reason else
+                                            "执行时会再次读取网页选项并回读验证"
+                                            if field.field_type == "combobox" else mapped_reason))
             else:
                 kind = "ask_user" if field.required or _surface_when_empty(field) else "skip"
-                action = FillAction(selector=field.selector, label=field.label or field.name, action=kind,
-                                    reason=("主档案值在网页真实选项中没有唯一匹配，请人工选择"
+                action = FillAction(selector=field.selector, label=_action_label(field), action=kind,
+                                    reason=(education_resolution.reason
+                                            if education_resolution and not education_resolution.record else
+                                            "主档案值在网页真实选项中没有唯一匹配，请人工选择"
                                             if selection_mismatch else
+                                            saved_answer.reason
+                                            if saved_answer.reason else
+                                            repeated_entity_issue
+                                            if repeated_entity_issue else
                                             "主档案中没有可直接确认的值，请从网页真实选项中选择"
                                             if field.options else "主档案中没有可直接确认的值"), confidence=1)
         actions.append(action)
         if field.required and action.action == "ask_user":
-            missing.append(field.label or field.name or field.field_type)
-    site_type = next((site for site in ("lever", "greenhouse", "workday") if site in snapshot.url.lower()), "generic")
+            missing.append(_action_label(field) or field.field_type)
+    site_type = (snapshot.site_route.adapter if snapshot.site_route.matched_by != "fallback"
+                 else resolve_site_route(snapshot.url).adapter)
     return FormPlan(page_summary="本地安全映射已生成；不明确的字段已保留给用户确认。",
                     site_type=site_type, actions=actions, missing_questions=missing)
 
@@ -420,30 +726,38 @@ def _merge_plans(base: FormPlan, model_plan: FormPlan, snapshot: BrowserSnapshot
     base.actions = [replacements.get(action.selector, action) for action in base.actions]
     required = {field.selector: field for field in snapshot.fields if field.required}
     base.missing_questions = [
-        required[action.selector].label or required[action.selector].name
+        _action_label(required[action.selector])
         for action in base.actions if action.selector in required and action.action == "ask_user"
     ]
     if model_plan.page_summary:
         base.page_summary = model_plan.page_summary
-    if model_plan.site_type and model_plan.site_type != "generic":
-        base.site_type = model_plan.site_type
+    # The model does not get to override the route established from page evidence.
     return base
 
 
 def _enforce_policy(plan: FormPlan, snapshot: BrowserSnapshot, profile: CandidateProfile) -> FormPlan:
     """Apply deterministic safety rules after the model so it cannot bypass them."""
     fields = {field.selector: field for field in snapshot.fields}
+    local_actions = {action.selector: action for action in _local_safe_plan(snapshot, profile).actions}
     guarded: list[FillAction] = []
     for action in plan.actions:
         field = fields.get(action.selector)
         if not field:
             continue
-        label = field.label or field.group_label or field.name
+        label = _action_label(field)
         text = _field_text(field)
         if _is_third_party(field):
             guarded.append(FillAction(selector=field.selector, label=label, action="ask_user", value="",
                                       confidence=1, sensitive=True,
                                       reason="第三方联系信息必须由用户提供，禁止使用候选人资料"))
+            continue
+        if semantic_key_for(field) == "candidate.gender":
+            guarded.append(local_actions[action.selector])
+            continue
+        # Education fields are entity-bound by deterministic rules. The model may explain
+        # an unknown field, but it cannot move a school/college/major across degree records.
+        if semantic_key_for(field).startswith(("education.", "experience.", "project.")):
+            guarded.append(local_actions[action.selector])
             continue
         if field.field_type == "section-button":
             guarded.append(FillAction(selector=field.selector, label=label, action="ask_user", value="",
@@ -458,10 +772,13 @@ def _enforce_policy(plan: FormPlan, snapshot: BrowserSnapshot, profile: Candidat
                                       reason=f"敏感或声明类字段必须由用户确认{suggestion}"))
             continue
         if _needs_manual_decision(field):
-            saved = _saved_answer(field, profile)
-            guarded.append(_manual_answer_action(field, saved) if saved else
+            local = local_actions[action.selector]
+            guarded.append(local if local.action in {"fill", "select", "check"} else
                            FillAction(selector=field.selector, label=label, action="ask_user", value="",
-                                      confidence=1, reason="是否/偏好类问题需要用户明确选择"))
+                                      confidence=1, reason=(
+                                      "网页只暴露了单选项，尚未可靠识别共同题干；请先在招聘网页定位核对"
+                                      if _missing_choice_prompt(field) else local.reason or
+                                      "是否/偏好类问题需要用户明确选择；确认后会安全记忆")))
             continue
         direct_value, _ = _direct_profile_value(field, profile)
         contextual_location = any(_is_any(text, hints) for hints in (
@@ -483,8 +800,7 @@ def _enforce_policy(plan: FormPlan, snapshot: BrowserSnapshot, profile: Candidat
     plan.actions = guarded
     required = {field.selector: field for field in snapshot.fields if field.required}
     plan.missing_questions = list(dict.fromkeys(
-        (required[action.selector].group_label or required[action.selector].label or
-         required[action.selector].name or required[action.selector].field_type)
+        _action_label(required[action.selector]) or required[action.selector].field_type
         for action in plan.actions if action.selector in required and action.action == "ask_user"
     ))
     return plan
@@ -582,7 +898,7 @@ def build_form_review(snapshot: BrowserSnapshot, plan: FormPlan) -> FormReviewRe
     groups: dict[str, list[PageField]] = {}
     for field in snapshot.fields:
         if field.field_type == "radio":
-            key = f"radio:{_normalized(field.group_label or field.name or field.label)}"
+            key = f"radio:{field.control_group_key or _normalized(field.group_label or field.name or field.label)}"
         elif field.field_type == "checkbox" and field.group_label:
             key = f"checkbox:{_normalized(field.group_label)}"
         else:
@@ -593,7 +909,7 @@ def build_form_review(snapshot: BrowserSnapshot, plan: FormPlan) -> FormReviewRe
     for key, fields in groups.items():
         group_actions = [actions[field.selector] for field in fields if field.selector in actions]
         representative = fields[0]
-        label = representative.group_label or representative.label or representative.name or representative.field_type
+        label = (_action_label(representative) or representative.name or representative.field_type)
         toggle_group = representative.field_type in {"radio", "checkbox"}
         if toggle_group:
             options = list(dict.fromkeys(

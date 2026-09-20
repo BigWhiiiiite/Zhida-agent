@@ -128,6 +128,7 @@ def initialize() -> None:
                 resume_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned',
                 notes TEXT NOT NULL DEFAULT '', application_id TEXT NOT NULL DEFAULT '',
                 status_changed_at TEXT NOT NULL DEFAULT '', submitted_at TEXT,
+                job_snapshot_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 UNIQUE(user_id, job_id)
             )
@@ -154,6 +155,44 @@ def initialize() -> None:
                 partial INTEGER NOT NULL DEFAULT 1, message TEXT NOT NULL DEFAULT ''
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS job_sources (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(user_id, id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rag_index_state (
+                user_id TEXT PRIMARY KEY, profile_hash TEXT NOT NULL,
+                model TEXT NOT NULL, indexed_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rag_evidence (
+                user_id TEXT NOT NULL, chunk_id TEXT NOT NULL,
+                source_kind TEXT NOT NULL, source_title TEXT NOT NULL,
+                source_path TEXT NOT NULL, quote TEXT NOT NULL,
+                embedding_text TEXT NOT NULL, strength REAL NOT NULL,
+                vector_json TEXT NOT NULL, PRIMARY KEY(user_id, chunk_id)
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS rag_evidence_fts USING fts5(
+                user_id UNINDEXED, chunk_id UNINDEXED, quote, tokenize='trigram'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS application_agent_runs (
+                run_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, status TEXT NOT NULL,
+                stage TEXT NOT NULL, url TEXT NOT NULL, title TEXT NOT NULL,
+                events_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(user_id, session_id)
+            )
+        """)
         _add_missing_columns(conn, "application_queue", {"user_id": "TEXT NOT NULL DEFAULT ''"})
         _migrate_application_queue(conn)
         _add_missing_columns(conn, "application_queue", {
@@ -161,6 +200,9 @@ def initialize() -> None:
             "application_id": "TEXT NOT NULL DEFAULT ''",
             "status_changed_at": "TEXT NOT NULL DEFAULT ''",
             "submitted_at": "TEXT",
+            "assistance_started_at": "TEXT",
+            "confirmation_pending": "INTEGER NOT NULL DEFAULT 0",
+            "job_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
         })
         conn.execute("""UPDATE application_queue SET status_changed_at=updated_at
                         WHERE status_changed_at=''""")
@@ -168,6 +210,7 @@ def initialize() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conflicts_user ON conflicts(user_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_discovered_jobs_source ON discovered_jobs(source_id, last_seen_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_job_sources_user ON job_sources(user_id, updated_at)")
         conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_user
                         ON candidate_profiles(user_id) WHERE user_id != ''""")
 
@@ -189,7 +232,7 @@ def create_user_account(email: str, display_name: str, password_hash: str) -> sq
                          (LOCAL_USER_ID, claimable_profile["id"]))
             conn.execute("UPDATE candidate_profiles SET user_id=? WHERE id=?",
                          (user_id, claimable_profile["id"]))
-            for table in ("resumes", "conflicts", "application_queue"):
+            for table in ("resumes", "conflicts", "application_queue", "job_sources"):
                 conn.execute(f"UPDATE {table} SET user_id=? WHERE user_id IN ('', ?)",
                              (user_id, LOCAL_USER_ID))
         else:
@@ -218,7 +261,7 @@ def activate_local_user() -> None:
                     (id, user_id, profile_json, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?)""",
                     (LOCAL_USER_ID, LOCAL_USER_ID, ResumeProfile().model_dump_json(), now, now))
-        for table in ("resumes", "conflicts", "application_queue"):
+        for table in ("resumes", "conflicts", "application_queue", "job_sources"):
             conn.execute(f"UPDATE {table} SET user_id=? WHERE user_id=''", (LOCAL_USER_ID,))
 
 
@@ -412,7 +455,114 @@ def save_profile(profile: ResumeProfile) -> CandidateProfile:
     with _connection() as conn:
         conn.execute("UPDATE candidate_profiles SET profile_json=?, updated_at=? WHERE user_id=?",
                      (profile.model_dump_json(), _now(), user_id))
+        # Main-profile edits invalidate private evidence vectors immediately. A fresh
+        # index is built on the next recommendation request, never from stale facts.
+        conn.execute("DELETE FROM rag_evidence WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM rag_evidence_fts WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM rag_index_state WHERE user_id=?", (user_id,))
     return get_profile()
+
+
+def get_rag_index(profile_hash: str, model: str) -> list[dict[str, Any]] | None:
+    user_id = current_user_id()
+    with _connection() as conn:
+        state = conn.execute(
+            "SELECT profile_hash, model FROM rag_index_state WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if not state or state["profile_hash"] != profile_hash or state["model"] != model:
+            return None
+        rows = conn.execute("SELECT * FROM rag_evidence WHERE user_id=? ORDER BY chunk_id", (user_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def replace_rag_index(profile_hash: str, model: str, chunks: list[dict[str, Any]]) -> None:
+    user_id = current_user_id()
+    with _connection() as conn:
+        conn.execute("DELETE FROM rag_evidence WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM rag_evidence_fts WHERE user_id=?", (user_id,))
+        for chunk in chunks:
+            conn.execute("""INSERT INTO rag_evidence
+                (user_id, chunk_id, source_kind, source_title, source_path, quote,
+                 embedding_text, strength, vector_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, chunk["chunk_id"], chunk["source_kind"], chunk["source_title"],
+                 chunk["source_path"], chunk["quote"], chunk["embedding_text"],
+                 chunk["strength"], chunk["vector_json"]))
+            conn.execute("INSERT INTO rag_evidence_fts (user_id, chunk_id, quote) VALUES (?, ?, ?)",
+                         (user_id, chunk["chunk_id"], chunk["quote"]))
+        conn.execute("""INSERT INTO rag_index_state (user_id, profile_hash, model, indexed_at)
+            VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+            profile_hash=excluded.profile_hash, model=excluded.model,
+            indexed_at=excluded.indexed_at""", (user_id, profile_hash, model, _now()))
+
+
+def rag_fts_ranks(query: str) -> dict[str, int]:
+    """Return ranks from the user's own indexed evidence; short terms use exact matching."""
+    if len(query.strip()) < 3:
+        return {}
+    user_id = current_user_id()
+    phrase = '"' + query.strip().replace('"', '""') + '"'
+    try:
+        with _connection() as conn:
+            rows = conn.execute("""SELECT chunk_id FROM rag_evidence_fts
+                WHERE rag_evidence_fts MATCH ? AND user_id=?
+                ORDER BY bm25(rag_evidence_fts) LIMIT 100""", (phrase, user_id)).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {row["chunk_id"]: rank + 1 for rank, row in enumerate(rows)}
+
+
+def save_application_agent_checkpoint(session_id: str, status: str, stage: str,
+                                      url: str, title: str, action: str,
+                                      summary: str) -> dict[str, Any]:
+    """Append a non-sensitive workflow event and persist the latest checkpoint."""
+    user_id = current_user_id()
+    now = _now()
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM application_agent_runs WHERE user_id=? AND session_id=?",
+            (user_id, session_id),
+        ).fetchone()
+        events = json.loads(row["events_json"] or "[]") if row else []
+        events.append({"action": action[:80], "stage": stage,
+                       "summary": summary[:500], "created_at": now})
+        events = events[-100:]
+        events_json = json.dumps(events, ensure_ascii=False)
+        if row:
+            run_id = row["run_id"]
+            conn.execute("""UPDATE application_agent_runs
+                SET status=?, stage=?, url=?, title=?, events_json=?, updated_at=?
+                WHERE run_id=? AND user_id=?""",
+                (status, stage, url, title, events_json, now, run_id, user_id))
+        else:
+            run_id = str(uuid4())
+            conn.execute("""INSERT INTO application_agent_runs
+                (run_id, user_id, session_id, status, stage, url, title,
+                 events_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, user_id, session_id, status, stage, url, title,
+                 events_json, now, now))
+        saved = conn.execute(
+            "SELECT * FROM application_agent_runs WHERE run_id=? AND user_id=?",
+            (run_id, user_id),
+        ).fetchone()
+    result = dict(saved)
+    result["events"] = json.loads(result.pop("events_json") or "[]")
+    return result
+
+
+def get_application_agent_checkpoint(session_id: str) -> dict[str, Any] | None:
+    user_id = current_user_id()
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM application_agent_runs WHERE user_id=? AND session_id=?",
+            (user_id, session_id),
+        ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["events"] = json.loads(result.pop("events_json") or "[]")
+    return result
 
 
 def create_conflict(field_path: str, current_value: Any, incoming_value: Any, resume_id: str) -> None:
@@ -493,21 +643,25 @@ def raw_text_for(resume_id: str) -> str | None:
     return row["raw_text"] if row else None
 
 
-def add_job_queue_entries(job_ids: list[str], resume_id: str = "") -> None:
+def add_job_queue_entries(job_ids: list[str], resume_id: str = "",
+                          job_snapshots: dict[str, dict[str, Any]] | None = None) -> None:
     user_id, now = current_user_id(), _now()
+    snapshots = job_snapshots or {}
     with _connection() as conn:
         for job_id in job_ids:
+            snapshot_json = json.dumps(snapshots.get(job_id, {}), ensure_ascii=False)
             existing = conn.execute("SELECT id FROM application_queue WHERE user_id=? AND job_id=?",
                                     (user_id, job_id)).fetchone()
             if existing:
-                conn.execute("""UPDATE application_queue SET resume_id=?, updated_at=?
-                                WHERE user_id=? AND job_id=?""", (resume_id, now, user_id, job_id))
+                conn.execute("""UPDATE application_queue SET resume_id=?, job_snapshot_json=?, updated_at=?
+                                WHERE user_id=? AND job_id=?""",
+                             (resume_id, snapshot_json, now, user_id, job_id))
             else:
                 conn.execute("""INSERT INTO application_queue
                     (id, user_id, job_id, resume_id, status, status_changed_at,
-                     created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'planned', ?, ?, ?)""",
-                    (str(uuid4()), user_id, job_id, resume_id, now, now, now))
+                     job_snapshot_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?)""",
+                    (str(uuid4()), user_id, job_id, resume_id, now, snapshot_json, now, now))
 
 
 def list_job_queue_entries() -> list[dict[str, str]]:
@@ -527,7 +681,10 @@ def delete_job_queue_entry(queue_id: str) -> bool:
 
 def update_job_queue_entry(queue_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
     user_id, now = current_user_id(), _now()
-    allowed = {"status", "notes", "application_id", "submitted_at", "status_changed_at"}
+    allowed = {
+        "status", "notes", "application_id", "submitted_at", "status_changed_at",
+        "assistance_started_at", "confirmation_pending",
+    }
     updates = {key: value for key, value in changes.items() if key in allowed}
     updates["updated_at"] = now
     if not updates:
@@ -578,9 +735,20 @@ def get_job_verification(job_id: str) -> dict[str, Any] | None:
     return result
 
 
-def save_discovered_jobs(source_id: str, jobs: list[dict[str, Any]], seen_at: str) -> tuple[int, int]:
+def save_discovered_jobs(source_id: str, jobs: list[dict[str, Any]], seen_at: str,
+                         replace_missing: bool = False) -> tuple[int, int]:
     created = updated = 0
     with _connection() as conn:
+        if replace_missing:
+            job_ids = [str(job["id"]) for job in jobs]
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                conn.execute(
+                    f"DELETE FROM discovered_jobs WHERE source_id=? AND job_id NOT IN ({placeholders})",
+                    (source_id, *job_ids),
+                )
+            else:
+                conn.execute("DELETE FROM discovered_jobs WHERE source_id=?", (source_id,))
         for job in jobs:
             existing = conn.execute(
                 "SELECT 1 FROM discovered_jobs WHERE job_id=?", (job["id"],)
@@ -600,12 +768,23 @@ def save_discovered_jobs(source_id: str, jobs: list[dict[str, Any]], seen_at: st
     return created, updated
 
 
-def list_discovered_jobs() -> list[dict[str, Any]]:
+def list_discovered_jobs(source_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    if source_ids is not None and not source_ids:
+        return []
     try:
         with _connection() as conn:
-            rows = conn.execute(
-                "SELECT job_json FROM discovered_jobs ORDER BY last_seen_at DESC"
-            ).fetchall()
+            if source_ids is None:
+                rows = conn.execute(
+                    "SELECT job_json FROM discovered_jobs ORDER BY last_seen_at DESC"
+                ).fetchall()
+            else:
+                ordered_ids = sorted(source_ids)
+                placeholders = ",".join("?" for _ in ordered_ids)
+                rows = conn.execute(
+                    f"SELECT job_json FROM discovered_jobs WHERE source_id IN ({placeholders}) "
+                    "ORDER BY last_seen_at DESC",
+                    ordered_ids,
+                ).fetchall()
     except sqlite3.OperationalError:
         return []
     result: list[dict[str, Any]] = []
@@ -648,3 +827,49 @@ def get_job_source_run(source_id: str) -> dict[str, Any] | None:
     result = dict(row)
     result["partial"] = bool(result["partial"])
     return result
+
+
+def save_custom_job_source(config: dict[str, Any]) -> dict[str, Any]:
+    user_id, now = current_user_id(), _now()
+    payload = json.dumps(config, ensure_ascii=False)
+    with _connection() as conn:
+        conn.execute("""INSERT INTO job_sources (id, user_id, config_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              config_json=excluded.config_json, updated_at=excluded.updated_at
+            WHERE job_sources.user_id=excluded.user_id""",
+            (config["id"], user_id, payload, now, now))
+    return config
+
+
+def list_custom_job_sources() -> list[dict[str, Any]]:
+    try:
+        user_id = current_user_id()
+    except RuntimeError:
+        return []
+    with _connection() as conn:
+        rows = conn.execute(
+            "SELECT config_json FROM job_sources WHERE user_id=? ORDER BY updated_at DESC",
+            (user_id,),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["config_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            result.append(payload)
+    return result
+
+
+def delete_custom_job_source(source_id: str) -> bool:
+    user_id = current_user_id()
+    with _connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM job_sources WHERE id=? AND user_id=?", (source_id, user_id)
+        )
+        if cursor.rowcount:
+            conn.execute("DELETE FROM discovered_jobs WHERE source_id=?", (source_id,))
+            conn.execute("DELETE FROM job_source_runs WHERE source_id=?", (source_id,))
+    return cursor.rowcount > 0

@@ -32,6 +32,15 @@ HTML = """
     <button type="button" role="radio" data-value="female" aria-label="女" aria-checked="false"
       onclick="this.parentElement.querySelectorAll('[role=radio]').forEach(x=>x.setAttribute('aria-checked','false'));this.setAttribute('aria-checked','true')">女</button>
   </div>
+  <div class="tencent-custom-question">
+    <div>除上述选择外，是否还接受其他城市分配 ✱</div>
+    <div class="tencent-choice-options" aria-required="true">
+      <span tabindex="0" role="radio" data-value="yes" aria-label="是" aria-checked="false"
+        onclick="this.parentElement.querySelectorAll('[role=radio]').forEach(x=>x.setAttribute('aria-checked','false'));this.setAttribute('aria-checked','true')">是</span>
+      <span tabindex="0" role="radio" data-value="no" aria-label="否" aria-checked="false"
+        onclick="this.parentElement.querySelectorAll('[role=radio]').forEach(x=>x.setAttribute('aria-checked','false'));this.setAttribute('aria-checked','true')">否</span>
+    </div>
+  </div>
   <label>国家/地区 ✱<select name="country" required>
     <option value="">请选择</option><option value="CN">中国大陆</option><option value="SG">新加坡</option>
   </select></label>
@@ -47,6 +56,16 @@ HTML = """
       <div class="ant-select-item-option">上海市</div>
     </div>
   </div>
+  <div class="moka-form-item">
+    <div class="question-title">期望工作城市 ✱</div>
+    <small>请从公司开放的真实城市中选择</small>
+    <button type="button" role="combobox" aria-label="北京" aria-required="true" aria-controls="preferred-city-options"
+      onclick="document.getElementById('preferred-city-options').hidden=false"><input name="preferred_city" readonly></button>
+    <div id="preferred-city-options" role="listbox" hidden>
+      <button type="button" role="option" onclick="const c=this.closest('.moka-form-item').querySelector('[role=combobox]');c.setAttribute('aria-valuetext','北京市');this.parentElement.hidden=true">北京市</button>
+      <button type="button" role="option">上海市</button>
+    </div>
+  </div>
   <div class="ant-form-item">
     <div class="ant-form-item-label">AI应用技能</div>
     <div class="ant-select-selector multiple" aria-controls="skill-options"
@@ -60,6 +79,17 @@ HTML = """
     </div>
   </div>
   <label>语言能力<textarea name="languages"></textarea></label>
+  <section class="application-section"><h3>教育经历</h3>
+    <div class="education-item"><h4>硕士教育经历</h4>
+      <label>院校名称<input name="master_school"></label>
+      <label>学院名称<input name="master_college"></label>
+      <label>培养方式<input name="master_study_mode"></label>
+    </div>
+    <div class="education-item"><h4>本科教育经历</h4>
+      <label>院校名称<input name="bachelor_school"></label>
+      <label>学院名称<input name="bachelor_college"></label>
+    </div>
+  </section>
   <div class="moka-dynamic-question">
     <div>补充问题：是否接受轮岗</div>
     <div class="select-shell">
@@ -123,11 +153,26 @@ async def main() -> None:
             gender_fields = [field for field in snapshot.fields if field.group_label.startswith("性别")]
             assert len(gender_fields) == 2, [field.model_dump() for field in snapshot.fields]
             assert {field.option_label for field in gender_fields} == {"男", "女"}
+            allocation_fields = [field for field in snapshot.fields
+                                 if "是否还接受其他城市分配" in field.group_label]
+            assert len(allocation_fields) == 2, [field.model_dump() for field in snapshot.fields]
+            assert len({field.control_group_key for field in allocation_fields}) == 1
+            assert all(field.control_group_key for field in allocation_fields)
+            assert {field.option_label for field in allocation_fields} == {"是", "否"}
+            assert all(field.options == ["是", "否"] for field in allocation_fields), [
+                field.model_dump() for field in allocation_fields
+            ]
             country = by_name["country"]
             assert country.options == ["中国大陆", "新加坡"]
             current_location = by_name["current_location"]
             assert current_location.field_type == "combobox"
             assert current_location.options == ["北京市", "上海市"]
+            preferred_city = by_name["preferred_city"]
+            assert preferred_city.question_text.startswith("期望工作城市"), preferred_city.model_dump()
+            assert preferred_city.label_source == "nearby"
+            assert preferred_city.recognition_confidence >= .7
+            assert "公司开放的真实城市" in preferred_city.help_text
+            assert preferred_city.options == ["北京市", "上海市"]
             skills = by_name["ai_skills"]
             assert skills.field_type == "combobox" and skills.multiple
             assert skills.options == ["Python", "Agent", "Java"], skills.model_dump()
@@ -137,9 +182,23 @@ async def main() -> None:
             opaque = by_name["field_7f3a91"]
             assert opaque.label.startswith("未识别字段 "), opaque.model_dump()
             assert opaque.label_source == "generated"
+            master_school = by_name["master_school"]
+            master_college = by_name["master_college"]
+            master_study_mode = by_name["master_study_mode"]
+            bachelor_school = by_name["bachelor_school"]
+            assert master_school.semantic_key == "education.school"
+            assert master_college.semantic_key == "education.college"
+            assert master_study_mode.semantic_key == "education.study_mode"
+            assert master_school.entity_scope == "education:master"
+            assert master_study_mode.entity_scope == "education:master"
+            assert bachelor_school.entity_scope == "education:bachelor"
+            assert master_school.container_key == master_college.container_key
+            assert master_school.container_key != bachelor_school.container_key
+            assert master_school.field_signature and master_school.expected_input
             refreshed = await service.inspect_field("browser-smoke", rotation.selector)
             refreshed_rotation = next(field for field in refreshed.fields if field.name == "rotation-control")
             assert refreshed_rotation.options == ["是", "否"], refreshed_rotation.model_dump()
+            assert refreshed_rotation.field_signature == rotation.field_signature
             outline = await page.locator(rotation.selector).evaluate("el => el.style.outline")
             assert "solid" in outline and ("217" in outline or "d99025" in outline), outline
 
@@ -165,9 +224,14 @@ async def main() -> None:
                 FillAction(selector=next(field for field in gender_fields if field.option_label == "男").selector,
                            label="性别", action="check", value=True, confidence=1,
                            sensitive=True, user_confirmed=True),
+                FillAction(selector=next(field for field in allocation_fields if field.option_label == "否").selector,
+                           label="除上述选择外，是否还接受其他城市分配", action="check", value=True,
+                           confidence=1, user_confirmed=True),
                 FillAction(selector=country.selector, label="国家/地区", action="select",
                            value="中国", confidence=1),
                 FillAction(selector=current_location.selector, label="当前所处地", action="select",
+                           value="北京", confidence=1),
+                FillAction(selector=preferred_city.selector, label="期望工作城市", action="select",
                            value="北京", confidence=1),
                 FillAction(selector=skills.selector, label="AI应用技能", action="select",
                            value="Python, Agent", confidence=1),
@@ -178,13 +242,14 @@ async def main() -> None:
             ]
             result = await service.execute("browser-smoke", ExecutePlanRequest(actions=actions), resume)
             assert result.failed == 0, [item.model_dump() for item in result.results]
-            assert result.verified == 11
+            assert result.verified == 13
             assert result.skipped == 1
             assert await page.locator('[name="emergency_name"]').input_value() == ""
             assert await page.locator(business.selector).get_attribute("aria-valuetext") == "TEG"
             assert await page.locator('[role="radio"][aria-label="男"]').get_attribute("aria-checked") == "true"
             assert await page.locator('[name="country"] option:checked').inner_text() == "中国大陆"
             assert await page.locator('[name="current_location"]').locator("xpath=..").get_attribute("aria-valuetext") == "北京市"
+            assert await page.locator('[name="preferred_city"]').locator("xpath=..").get_attribute("aria-valuetext") == "北京市"
             assert await page.locator('.ant-form-item:has-text("AI应用技能") .selection-item').all_text_contents() == ["Python", "Agent"]
             assert result.pre_submit.ready
             assert result.pre_submit.human_challenges == []

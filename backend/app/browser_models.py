@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .ats_registry import SiteRoute
+
 
 class BrowserStart(BaseModel):
     url: str
@@ -20,8 +22,15 @@ class NativeResumeImportRequest(BaseModel):
 class PageField(BaseModel):
     selector: str
     label: str = ""
+    # Exact user-facing question reconstructed from DOM evidence. `label` remains
+    # for backwards compatibility, while this is the preferred review title.
+    question_text: str = ""
     label_source: str = "unknown"
     context: str = ""
+    help_text: str = ""
+    nearby_labels: list[str] = Field(default_factory=list)
+    section_path: list[str] = Field(default_factory=list)
+    recognition_confidence: float = Field(default=0, ge=0, le=1)
     placeholder: str = ""
     ordinal: int = 0
     name: str = ""
@@ -37,12 +46,26 @@ class PageField(BaseModel):
     option_value: str = ""
     multiple: bool = False
     readonly: bool = False
+    autocomplete: str = ""
+    # Stable semantic metadata is separated from the temporary DOM selector.
+    semantic_key: str = ""
+    entity_scope: str = ""
+    field_signature: str = ""
+    signature_rank: int = 0
+    container_key: str = ""
+    # All options belonging to one radio/checkbox question share this DOM-derived key.
+    # It prevents option captions such as “是” and “否” from becoming separate questions.
+    control_group_key: str = ""
+    expected_input: str = ""
+    recognition_evidence: str = ""
 
 
 class BrowserSnapshot(BaseModel):
     session_id: str
     url: str
     title: str
+    recognition_profile: str = "generic-semantic"
+    site_route: SiteRoute = Field(default_factory=SiteRoute)
     fields: list[PageField]
 
 

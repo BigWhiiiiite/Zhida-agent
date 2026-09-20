@@ -14,11 +14,15 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright, asyn
 from .application_models import (ApplicationWorkflowState, RegistrationCredentialsRequest,
                                  VerificationCodeRequest, VerificationRequest,
                                  WorkflowAdvanceRequest)
+from .ats_field_profiles import field_profile_for_url
+from .ats_registry import policy_for, route_for_page
+from .ats_controls import scoped_option_entries, visible_popup_ids
 from .ats_adapters import (continue_application, create_account, fill_registration_info,
                            fill_verification_code, inspect_application_page,
                            request_verification_code, start_application)
 from .browser_models import (ActionResult, BrowserSnapshot, ExecutePlanRequest, ExecutionResult,
                              NativeResumeImportResult, PageField, PreSubmitCheck, RequiredFieldIssue)
+from .field_semantics import enrich_fields
 
 
 SENSITIVE_FIELD_HINTS = {
@@ -26,6 +30,7 @@ SENSITIVE_FIELD_HINTS = {
     "gender", "sex", "race", "ethnicity", "disability", "veteran", "consent", "agree", "agreement",
     "privacy", "terms", "legal", "work permit", "right to work",
     "性别", "薪资", "期望薪资", "签证", "担保", "工作许可", "残障", "退伍", "族裔", "种族", "同意", "隐私", "条款", "法律声明",
+    "身份证", "证件号码", "证件号", "护照号码", "护照号", "实名认证", "national id", "id number", "passport number",
     "emergency contact", "next of kin", "guardian", "referee", "recommender",
     "紧急联系人", "紧急联络人", "家属联系人", "监护人", "推荐人", "证明人",
 }
@@ -35,11 +40,6 @@ MANUAL_CONFIRM_FIELD_HINTS = {
     "would you", "are you willing", "preference", "preferred business", "business group", "relocate",
 }
 
-OPTION_LOCATOR_SELECTOR = ", ".join((
-    '[role="option"]', '[role="listbox"] option', '.ant-select-item-option',
-    '.arco-select-option', '.el-select-dropdown__item', '.ivu-select-item',
-    '.semi-select-option', '[class*="select-option"]', '[class*="dropdown-item"]',
-))
 OPTION_PLACEHOLDERS = {
     "", "select", "selectone", "choose", "chooseone", "pleasechoose", "请选择", "请选择一项",
     "暂未选择", "未选择", "点击选择", "搜索并选择",
@@ -117,7 +117,12 @@ def _clean_metadata(value: object, limit: int) -> str:
 
 def _useful_field_label(value: str) -> bool:
     normalized = value.strip()
-    return bool(normalized and not UNHELPFUL_FIELD_LABEL.fullmatch(normalized))
+    return bool(
+        normalized
+        and not UNHELPFUL_FIELD_LABEL.fullmatch(normalized)
+        and not re.fullmatch(r"[+()\-./\s\d．、:：]+", normalized)
+        and len(_normalized_option(normalized)) > 1
+    )
 
 
 def _context_label(value: str) -> str:
@@ -139,14 +144,24 @@ def _finalize_field_metadata(items: list[dict[str, object]]) -> None:
     for index, item in enumerate(items, start=1):
         item["ordinal"] = index
         item["context"] = _clean_metadata(item.get("context"), 600)
+        item["help_text"] = _clean_metadata(item.get("help_text"), 500)
+        item["nearby_labels"] = list(dict.fromkeys(
+            _clean_metadata(value, 300) for value in (item.get("nearby_labels") or [])
+            if _clean_metadata(value, 300)
+        ))[:8]
+        item["section_path"] = list(dict.fromkeys(
+            _clean_metadata(value, 200) for value in (item.get("section_path") or [])
+            if _clean_metadata(value, 200)
+        ))[:8]
         item["placeholder"] = _clean_metadata(item.get("placeholder"), 300)
-        label = _clean_metadata(item.get("label"), 500)
+        label = _clean_metadata(item.get("question_text") or item.get("label"), 500)
         source = _clean_metadata(item.get("label_source"), 40) or "unknown"
         if source == "placeholder":
             label = re.sub(r"^(?:请输入|请填写|请选择|选择)\s*", "", label, flags=re.I).strip(" .…:：-")
         if not _useful_field_label(label):
             candidates = (
                 (_clean_metadata(item.get("group_label"), 500), "nearby"),
+                *[(value, "nearby") for value in item["nearby_labels"]],
                 (_context_label(str(item.get("context") or "")), "context"),
                 (re.sub(r"^(?:请输入|请填写|请选择|选择)\s*", "",
                         _clean_metadata(item.get("placeholder"), 300), flags=re.I).strip(" .…:：-"),
@@ -165,7 +180,106 @@ def _finalize_field_metadata(items: list[dict[str, object]]) -> None:
             label = f"未识别字段 {index}"
             source = "generated"
         item["label"] = label
+        item["question_text"] = label
         item["label_source"] = source
+        default_confidence = {
+            "explicit": .98, "aria-labelledby": .96, "nearby": .92, "aria": .86,
+            "attribute": .78, "context": .72, "placeholder": .62, "name": .45,
+            "generated": .1, "unknown": .1,
+        }.get(source, .5)
+        raw_confidence = item.get("recognition_confidence")
+        try:
+            confidence = float(raw_confidence) if raw_confidence not in (None, "") else default_confidence
+        except (TypeError, ValueError):
+            confidence = default_confidence
+        item["recognition_confidence"] = max(0, min(1, confidence))
+
+
+def _choice_only_text(value: str, options: list[str]) -> bool:
+    """Return true when text is only one or more option captions (for example 是/否)."""
+    remaining = _normalized_option(value)
+    option_tokens = sorted({_normalized_option(option) for option in options if option}, key=len, reverse=True)
+    if not remaining or not option_tokens:
+        return False
+    previous = None
+    while previous != remaining:
+        previous = remaining
+        for token in option_tokens:
+            remaining = remaining.replace(token, "")
+    return not remaining
+
+
+def _strip_choice_suffix(value: str, options: list[str]) -> str:
+    """Remove rendered option captions from the end of an ancestor's visible question text."""
+    result = _clean_metadata(value, 500)
+    tokens = sorted({option.strip() for option in options if option.strip()}, key=len, reverse=True)
+    changed = True
+    while result and changed:
+        changed = False
+        for token in tokens:
+            updated = re.sub(
+                rf"(?:^|[\s/、，,;；|·—-]){re.escape(token)}[\s/、，,;；|·—-]*$", "", result,
+                flags=re.I,
+            ).strip()
+            if updated != result:
+                result, changed = updated, True
+                break
+    return result
+
+
+def _finalize_choice_metadata(items: list[dict[str, object]]) -> None:
+    """Unify choice controls under one meaningful question and fail closed without a prompt."""
+    groups: dict[str, list[dict[str, object]]] = {}
+    for item in items:
+        if item.get("field_type") not in {"radio", "checkbox"}:
+            continue
+        key = _clean_metadata(item.get("control_group_key"), 500)
+        if not key:
+            name = _clean_metadata(item.get("name"), 500)
+            key = f"name:{name}" if name else ""
+        if key:
+            groups.setdefault(key, []).append(item)
+
+    for group in groups.values():
+        options = list(dict.fromkeys(
+            _clean_metadata(option, 300)
+            for item in group
+            for option in [*(item.get("options") or []), item.get("option_label")]
+            if _clean_metadata(option, 300)
+        ))
+        if not options:
+            options = list(dict.fromkeys(
+                _clean_metadata(item.get("option_value"), 300) for item in group
+                if _clean_metadata(item.get("option_value"), 300)
+            ))
+        candidates = [
+            value
+            for item in group
+            for value in (item.get("group_label"), item.get("context"), item.get("section"))
+        ]
+        prompt = ""
+        for candidate in candidates:
+            cleaned = _strip_choice_suffix(str(candidate or ""), options)
+            if (_useful_field_label(cleaned) and not _choice_only_text(cleaned, options)
+                    and len(cleaned) > 1):
+                prompt = cleaned
+                break
+        if not prompt:
+            ordinal = min((int(item.get("ordinal") or 0) for item in group), default=0)
+            yes_no = {_normalized_option(option) for option in options}.issubset(
+                {_normalized_option(option) for option in ("是", "否", "yes", "no", "true", "false")}
+            )
+            kind = ("是/否问题" if yes_no and len(options) >= 2 else
+                    "复选题" if group[0].get("field_type") == "checkbox" else "单选题")
+            prompt = f"未识别的{kind}（网页第 {ordinal} 个控件附近）"
+        for item in group:
+            item["group_label"] = prompt
+            item["question_text"] = prompt
+            item["label"] = prompt
+            if not prompt.startswith("未识别的"):
+                item["label_source"] = "nearby"
+                item["recognition_confidence"] = max(float(item.get("recognition_confidence") or 0), .92)
+            item["options"] = options
 
 
 def _meaningful_value(field: PageField) -> str:
@@ -253,7 +367,7 @@ class BrowserDemoService:
         self.session_id = str(uuid4())
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await self.page.wait_for_timeout(500)
+            await self.page.wait_for_timeout(int(field_profile_for_url(url)["load_delay_ms"]))
             return await self.snapshot()
         except Exception:
             await self.close()
@@ -334,17 +448,53 @@ class BrowserDemoService:
     async def snapshot(self) -> BrowserSnapshot:
         if not self.page or not self.session_id:
             raise LookupError("浏览器会话尚未启动")
+        site_route = await route_for_page(self.page)
+        policy = policy_for(site_route.adapter)
+        recognition_profile = policy.field_profile()
         data = await self.page.evaluate("""
-        () => {
+        profile => {
           const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
           const labelText = node => {
             if (!node) return '';
             const clone = node.cloneNode(true);
-            clone.querySelectorAll('input, select, textarea, option, button, [role="option"]').forEach(item => item.remove());
+            clone.querySelectorAll('input, select, textarea, option, button, [role="option"], [role="radio"], [role="checkbox"]').forEach(item => item.remove());
             return clean(clone.innerText || clone.textContent);
+          };
+          const normalizeFieldText = value => clean(value).replace(/[＊*]+\s*$/g, '').trim();
+          const meaningfulFieldText = value => {
+            const text = normalizeFieldText(value);
+            return Boolean(text && text.length > 1 && !/^[+()\-.、。．\s\d/:：]+$/.test(text));
+          };
+          const normalizedToken = value => normalizeFieldText(value).toLowerCase()
+            .replace(/[^a-z0-9\u4e00-\u9fff]/g, '');
+          const fieldTextScore = (value, source = 'unknown', optionTexts = []) => {
+            const text = normalizeFieldText(value);
+            if (!meaningfulFieldText(text)) return -1000;
+            const token = normalizedToken(text);
+            const optionTokens = optionTexts.map(normalizedToken).filter(Boolean);
+            if (optionTokens.includes(token)) return -90;
+            let score = ({explicit: 42, 'aria-labelledby': 40, nearby: 34, preceding: 31,
+              aria: 23, attribute: 18, placeholder: 12, name: 5}[source] || 0);
+            if (text.length <= 16) score += 12;
+            else if (text.length <= 40) score += 9;
+            else if (text.length <= 100) score += 4;
+            else if (text.length > 220) score -= 22;
+            if (/[？?:：]$/.test(text)) score += 5;
+            if (/(姓名|邮箱|手机|电话|性别|国家|城市|地区|地点|学校|院校|学历|学位|学院|专业|毕业|培养|学制|导师|实验室|经历|项目|技能|语言|意向|期望|是否|接受|职位|公司|name|email|phone|gender|country|city|location|school|degree|major|experience|project|skill|language|preference)/i.test(text)) score += 13;
+            if (/^(请输入|请填写|请选择|选择|select|choose)(一项|内容|信息|答案|one)?[.\s…:：-]*$/i.test(text)) score -= 80;
+            if (/^(?:field|question|input|select|item|value|answer)?(?:[-_.0-9a-f]|\\[|\\]){5,}$/i.test(text)) score -= 45;
+            if (/^(?:是|否|男|女|yes|no|true|false|北京|上海|请选择)$/i.test(text)) score -= 35;
+            return score;
+          };
+          const bestFieldText = (candidates, optionTexts = []) => {
+            const ranked = candidates.map(item => ({...item, text: normalizeFieldText(item.text),
+              score: fieldTextScore(item.text, item.source, optionTexts)}))
+              .filter(item => item.text).sort((left, right) => right.score - left.score);
+            return ranked[0] && ranked[0].score > -20 ? ranked[0] : {text: '', source: 'unknown', score: -1000};
           };
           const placeholder = value => /^(select|select one|choose|choose one|please choose|请选择|请选择一项|暂未选择|未选择|点击选择|搜索并选择)[.\\s…]*$/i.test(clean(value));
           const customWrapperSelector = [
+            ...(profile?.control_selectors || []),
             '.ant-select-selector', '.arco-select-view', '.el-select__wrapper', '.ivu-select-selection',
             '.semi-select', '.t-select__wrap', '[class*="select-selector"]',
             '[class*="select__selector"]', '[class*="select-view"]',
@@ -353,6 +503,7 @@ class BrowserDemoService:
           const customSelector = '[role="combobox"], [aria-haspopup="listbox"], ' + customWrapperSelector;
           const controlSelector = 'input, select, textarea, [role="radio"], [role="checkbox"], [role="combobox"], [aria-haspopup="listbox"]';
           const fieldContainer = el => el.closest([
+            ...(profile?.question_containers || []),
             '.application-question', '.application-additional', 'fieldset', '[role="radiogroup"]', '[role="group"]',
             '.form-field', '.field', '.ant-form-item', '.arco-form-item', '.el-form-item',
             '.form-group', '.atsx-form-item', '[class*="form-item"]', '[class*="formItem"]',
@@ -370,6 +521,25 @@ class BrowserDemoService:
             }
             return null;
           };
+          const entityContainerFor = el => {
+            const named = el.closest([
+              '.education-item', '.educationItem', '.education-experience-item', '.academic-item',
+              '.experience-item', '.experienceItem', '.project-item', '.projectItem',
+              '[data-qa*="education"]', '[data-testid*="education"]',
+              '[class*="education-item"]', '[class*="educationItem"]',
+              '[class*="academic-item"]', '[class*="academicItem"]'
+            ].join(', '));
+            if (named && named.querySelectorAll(controlSelector).length > 1) return named;
+            const semantic = semanticContainer(el);
+            let node = semantic?.parentElement || el.parentElement;
+            for (let depth = 0; node && depth < 7 && node !== document.body; depth += 1, node = node.parentElement) {
+              const text = labelText(node);
+              const controls = node.querySelectorAll(controlSelector).length;
+              const education = /(教育|学历|本科|硕士|博士|院校|学校|专业|education|academic|university|school|degree|major)/i.test(text);
+              if (education && controls >= 2 && controls <= 14 && text.length <= 1800) return node;
+            }
+            return semantic;
+          };
           const inputFor = el => el.matches('input, select, textarea') ? el : el.querySelector('input, select, textarea');
           const labelledBy = el => clean((el.getAttribute('aria-labelledby') || '').split(/\\s+/)
             .map(id => document.getElementById(id)?.innerText || '').join(' '));
@@ -377,6 +547,7 @@ class BrowserDemoService:
             const container = semanticContainer(el);
             if (!container) return '';
             const selector = [
+              ...(profile?.label_selectors || []),
               'legend', '.application-label', '.question-label', '[data-qa="question-label"]',
               '.ant-form-item-label', '.arco-form-label-item', '.el-form-item__label',
               '[class*="form-label"]', '[class*="field-label"]', '[class*="item-label"]',
@@ -399,6 +570,186 @@ class BrowserDemoService:
             }
             return '';
           };
+          const nearbyLabelCandidates = el => {
+            const values = [];
+            const push = value => {
+              const text = normalizeFieldText(value);
+              if (meaningfulFieldText(text) && text.length <= 300 && !values.includes(text)) values.push(text);
+            };
+            const labelLike = [
+              ...(profile?.label_selectors || []),
+              'legend', 'label', '[role="heading"]', '.application-label', '.question-label',
+              '[data-qa="question-label"]', '.ant-form-item-label', '.arco-form-label-item',
+              '.el-form-item__label', '[class*="form-label"]', '[class*="field-label"]',
+              '[class*="item-label"]', '[class*="question-title"]', '[class*="questionTitle"]',
+              '[class*="label"]', '[class*="title"]'
+            ].join(', ');
+            const container = semanticContainer(el);
+            if (container) {
+              for (const node of [...container.querySelectorAll(labelLike)].slice(0, 24)) {
+                if (node === el || node.contains(el)) continue;
+                push(labelText(node));
+              }
+              for (const child of [...container.children].slice(0, 24)) {
+                if (child === el || child.contains(el) || child.querySelector(controlSelector)) continue;
+                push(labelText(child));
+              }
+            }
+            let node = el;
+            for (let depth = 0; node && depth < 6 && node !== document.body; depth += 1, node = node.parentElement) {
+              let sibling = node.previousElementSibling;
+              for (let count = 0; sibling && count < 3; count += 1, sibling = sibling.previousElementSibling) {
+                if (!sibling.querySelector(controlSelector)) push(labelText(sibling));
+              }
+            }
+            return values.slice(0, 8);
+          };
+          const sectionPathFor = el => {
+            const values = [];
+            const push = value => {
+              const text = normalizeFieldText(value);
+              if (meaningfulFieldText(text) && text.length <= 160 && !values.includes(text)) values.push(text);
+            };
+            const sectionSelector = [
+              ...(profile?.section_selectors || []),
+              'legend', 'h1', 'h2', 'h3', 'h4', 'h5', '[role="heading"]',
+              '[class*="section-title"]', '[class*="sectionTitle"]'
+            ].join(', ');
+            let node = semanticContainer(el) || el.parentElement;
+            for (let depth = 0; node && depth < 9 && node !== document.body; depth += 1, node = node.parentElement) {
+              const directHeading = [...node.children].find(child => child.matches?.(sectionSelector));
+              if (directHeading && !directHeading.contains(el)) push(labelText(directHeading));
+              let sibling = node.previousElementSibling;
+              for (let count = 0; sibling && count < 3; count += 1, sibling = sibling.previousElementSibling) {
+                if (sibling.matches?.(sectionSelector)) {
+                  push(labelText(sibling)); break;
+                }
+              }
+            }
+            return values.reverse().slice(-8);
+          };
+          const helpTextFor = el => {
+            const ids = clean((inputFor(el)?.getAttribute('aria-describedby') || el.getAttribute('aria-describedby')))
+              .split(/\s+/).filter(Boolean);
+            const described = ids.map(id => labelText(document.getElementById(id))).filter(Boolean);
+            const container = semanticContainer(el);
+            const helperSelector = [
+              '.help', '.hint', '.tip', '.description', '.ant-form-item-extra', '.ant-form-item-explain',
+              '.arco-form-item-extra', '.el-form-item__error', '[class*="help-text"]',
+              '[class*="field-help"]', '[class*="form-tip"]', 'small'
+            ].join(', ');
+            const nearby = [...(container?.querySelectorAll(helperSelector) || [])]
+              .filter(node => node !== el && !node.contains(el)).map(labelText).filter(Boolean);
+            return [...new Set([...described, ...nearby])].join(' / ').slice(0, 500);
+          };
+          const choiceSelectorFor = fieldType => fieldType === 'radio'
+            ? 'input[type="radio"], [role="radio"]'
+            : 'input[type="checkbox"], [role="checkbox"]';
+          const visibleChoices = (root, fieldType) => [...(root?.querySelectorAll(choiceSelectorFor(fieldType)) || [])]
+            .filter(item => !item.disabled && (item.getClientRects().length || item.closest('label')?.getClientRects().length || item.parentElement?.getClientRects().length));
+          const commonAncestor = nodes => {
+            let candidate = nodes[0] || null;
+            while (candidate && !nodes.every(node => candidate.contains(node))) candidate = candidate.parentElement;
+            return candidate;
+          };
+          const choiceMembersFor = (el, fieldType) => {
+            const input = inputFor(el);
+            const target = input && (input.type || '').toLowerCase() === fieldType ? input : el;
+            if (target.name && target.matches(`input[type="${fieldType}"]`)) {
+              const scope = target.form || document;
+              const named = [...scope.querySelectorAll(`input[type="${fieldType}"][name="${CSS.escape(target.name)}"]`)]
+                .filter(item => !item.disabled);
+              if (named.length) return named;
+            }
+            const declared = el.closest(fieldType === 'radio' ? '[role="radiogroup"]' : '[role="group"]');
+            const declaredMembers = visibleChoices(declared, fieldType);
+            if (declaredMembers.length >= 2) return declaredMembers;
+            let node = el.parentElement;
+            for (let depth = 0; node && depth < 9 && node !== document.body; depth += 1, node = node.parentElement) {
+              const members = visibleChoices(node, fieldType);
+              if (members.length >= 2 && members.length <= 20) return members;
+            }
+            return [el];
+          };
+          const stripChoiceSuffix = (value, options) => {
+            let result = clean(value);
+            const tokens = [...new Set(options.map(clean).filter(Boolean))].sort((a, b) => b.length - a.length);
+            let changed = true;
+            while (result && changed) {
+              changed = false;
+              for (const token of tokens) {
+                if (result === token) {
+                  result = ''; changed = true; break;
+                }
+                if (result.endsWith(token)) {
+                  const prefix = result.slice(0, -token.length);
+                  if (/[\s/、，,;；|·—-]$/.test(prefix)) {
+                    result = prefix.replace(/[\s/、，,;；|·—-]+$/, '').trim();
+                    changed = true; break;
+                  }
+                }
+              }
+            }
+            return result;
+          };
+          const choiceOnlyText = (value, options) => {
+            let remaining = clean(value).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '');
+            const tokens = [...new Set(options.map(value => clean(value).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '')).filter(Boolean))]
+              .sort((a, b) => b.length - a.length);
+            if (!remaining || !tokens.length) return false;
+            let previous = null;
+            while (previous !== remaining) {
+              previous = remaining;
+              for (const token of tokens) remaining = remaining.split(token).join('');
+            }
+            return !remaining;
+          };
+          let choiceGroupSequence = 0;
+          const choiceGroupInfoFor = (el, fieldType) => {
+            if (!['radio', 'checkbox'].includes(fieldType)) return null;
+            const members = choiceMembersFor(el, fieldType);
+            let group = commonAncestor(members);
+            if (!group || group === document || group === document.documentElement || group === document.body) {
+              group = el.closest('[role="radiogroup"], fieldset, [role="group"]') || el.parentElement;
+            }
+            const options = members.map(item => clean(
+              labelText(item.id ? document.querySelector(`label[for="${CSS.escape(item.id)}"]`) : null) ||
+              labelText(item.closest('label')) || item.getAttribute('aria-label') || item.innerText || item.value
+            )).filter(Boolean);
+            const questionSelector = [
+              ...(profile?.label_selectors || []),
+              'legend', '.application-label', '.question-label', '[data-qa="question-label"]',
+              '.ant-form-item-label', '.arco-form-label-item', '.el-form-item__label',
+              '[class*="form-label"]', '[class*="field-label"]', '[class*="item-label"]',
+              '[class*="formLabel"]', '[class*="fieldLabel"]', '[class*="questionTitle"]',
+              '[class*="question-title"]', '[data-testid*="question"]'
+            ].join(', ');
+            const candidates = [
+              {text: labelledBy(group), source: 'aria-labelledby'},
+              {text: group?.getAttribute('aria-label'), source: 'aria'},
+              ...[...(group?.querySelectorAll(questionSelector) || [])]
+                .map(node => ({text: labelText(node), source: 'nearby'})),
+              ...nearbyLabelCandidates(group || el).map(text => ({text, source: 'nearby'})),
+              {text: precedingLabel(group || el), source: 'preceding'}
+            ];
+            let node = group;
+            for (let depth = 0; node && depth < 5 && node !== document.body; depth += 1, node = node.parentElement) {
+              const choiceCount = visibleChoices(node, fieldType).length;
+              const allControls = node.querySelectorAll(controlSelector).length;
+              if (choiceCount === members.length && allControls <= members.length + 1) {
+                candidates.push({text: labelText(node), source: 'nearby'});
+              }
+            }
+            const cleanedCandidates = candidates.map(item => ({
+              ...item, text: stripChoiceSuffix(item.text, options)
+            })).filter(item => item.text && item.text.length <= 300 && !choiceOnlyText(item.text, options));
+            const question = bestFieldText(cleanedCandidates, options).text;
+            const marker = group ? (group.getAttribute('data-zhida-choice-group') ||
+              `zhida-choice-${Date.now()}-${choiceGroupSequence++}`) : '';
+            if (group && marker) group.setAttribute('data-zhida-choice-group', marker);
+            if (group && question) group.setAttribute('data-zhida-choice-label', question);
+            return {group, members, options, question, key: marker};
+          };
           const contextFor = el => {
             const preferred = semanticContainer(el);
             const text = labelText(preferred);
@@ -411,7 +762,7 @@ class BrowserDemoService:
             }
             return '';
           };
-          const labelInfoFor = el => {
+          const labelInfoFor = (el, fieldType, choiceInfo) => {
             const input = inputFor(el);
             const target = input || el;
             const explicit = target.id ? document.querySelector(`label[for="${CSS.escape(target.id)}"]`) : null;
@@ -419,25 +770,33 @@ class BrowserDemoService:
             const question = semanticContainer(el);
             const questionLabel = question?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"]');
             const optionLabel = labelText(explicit) || labelText(wrapping);
-            const groupLabel = clean(questionLabel?.innerText || nearbyLabel(el));
+            const groupLabel = clean(choiceInfo?.question || questionLabel?.innerText || nearbyLabel(el));
             const internalName = (target.getAttribute('name') || '').includes('[');
-            if ((internalName || ['radio', 'checkbox', 'file'].includes(target.type)) && groupLabel) {
-              return {text: clean(groupLabel === optionLabel ? groupLabel : `${groupLabel}${optionLabel ? ` — ${optionLabel}` : ''}`), source: 'nearby'};
+            if (choiceInfo?.question) {
+              return {text: clean(choiceInfo.question), source: 'nearby', confidence: .96};
             }
             const candidates = [
-              [labelText(explicit), 'explicit'], [labelText(wrapping), 'explicit'],
-              [labelledBy(target) || labelledBy(el), 'aria'],
-              [target.getAttribute('aria-label') || el.getAttribute('aria-label'), 'aria'],
-              [groupLabel || nearbyLabel(el), 'nearby'], [precedingLabel(el), 'nearby'],
-              [target.getAttribute('data-label') || el.getAttribute('data-label'), 'attribute'],
-              [target.getAttribute('title') || el.getAttribute('title'), 'attribute'],
-              [target.getAttribute('placeholder') || el.getAttribute('placeholder'), 'placeholder'],
-              [target.getAttribute('name') || el.getAttribute('name'), 'name'],
+              {text: labelText(explicit), source: 'explicit'},
+              {text: labelText(wrapping), source: 'explicit'},
+              {text: labelledBy(target) || labelledBy(el), source: 'aria-labelledby'},
+              {text: groupLabel || nearbyLabel(el), source: 'nearby'},
+              {text: precedingLabel(el), source: 'preceding'},
+              ...nearbyLabelCandidates(el).map(text => ({text, source: 'nearby'})),
+              {text: target.getAttribute('aria-label') || el.getAttribute('aria-label'), source: 'aria'},
+              {text: target.getAttribute('data-label') || el.getAttribute('data-label'), source: 'attribute'},
+              {text: target.getAttribute('title') || el.getAttribute('title'), source: 'attribute'},
+              {text: target.getAttribute('placeholder') || el.getAttribute('placeholder'), source: 'placeholder'},
+              {text: target.getAttribute('name') || el.getAttribute('name'), source: 'name'},
             ];
-            const candidate = candidates.find(([value]) => clean(value));
-            return {text: clean(candidate?.[0]), source: candidate?.[1] || 'unknown'};
+            if ((internalName || ['file'].includes(target.type)) && groupLabel) {
+              candidates.unshift({text: groupLabel, source: 'nearby'});
+            }
+            const candidate = bestFieldText(candidates, choiceInfo?.options || []);
+            const confidence = Math.max(.1, Math.min(.99, (candidate.score + 20) / 85));
+            return {text: candidate.text, source: candidate.source, confidence};
           };
-          const groupLabelFor = el => {
+          const groupLabelFor = (el, choiceInfo) => {
+            if (choiceInfo?.question) return clean(choiceInfo.question);
             const group = semanticContainer(el);
             return clean(group?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"], .ant-form-item-label, .arco-form-label-item, .el-form-item__label, [class*="form-label"], [class*="field-label"], [class*="formLabel"], [class*="fieldLabel"], [class*="questionTitle"]')?.innerText || nearbyLabel(el));
           };
@@ -446,6 +805,10 @@ class BrowserDemoService:
             return clean(labelText(explicit) || labelText(el.closest('label')) || el.getAttribute('aria-label') || el.innerText || el.value);
           };
           const sectionFor = el => {
+            const entity = entityContainerFor(el);
+            const entityHeading = entity ? [...entity.children]
+              .find(child => child.matches?.('legend, h1, h2, h3, h4, [role="heading"], [class*="title"]')) : null;
+            if (entityHeading) return clean(entityHeading.innerText);
             const section = el.closest('fieldset, section, [role="group"], .application-section, .form-section');
             const heading = section?.querySelector('legend, h1, h2, h3, h4, [role="heading"]');
             return clean(heading?.innerText);
@@ -475,53 +838,58 @@ class BrowserDemoService:
               const optionVisible = optionInput && (el.closest('label')?.getClientRects().length || el.parentElement?.getClientRects().length);
               return !el.disabled && (type === 'file' || el.getClientRects().length > 0 || optionVisible);
             });
+          let containerSequence = 0;
           const fields = elements.map((el, index) => {
             const marker = el.getAttribute('data-zhida-field') ||
               `zhida-${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`;
             el.setAttribute('data-zhida-field', marker);
-            const labelInfo = labelInfoFor(el);
-            const label = labelInfo.text.slice(0, 500);
             const input = inputFor(el);
-            const context = contextFor(el).slice(0, 600);
-            const placeholderText = clean(input?.getAttribute('placeholder') || el.getAttribute('placeholder')).slice(0, 300);
             const role = (el.getAttribute('role') || '').toLowerCase();
             const customSelect = role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox' || el.matches(customSelector);
             const fieldType = customSelect ? 'combobox' : (['radio', 'checkbox'].includes(role) ? role : (el.type || el.tagName).toLowerCase());
-            let options = el.tagName === 'SELECT' ? [...el.options].map(o => clean(o.text)).filter(value => value && !placeholder(value)) : [];
+            const choiceInfo = choiceGroupInfoFor(el, fieldType);
+            const labelInfo = labelInfoFor(el, fieldType, choiceInfo);
+            const label = labelInfo.text.slice(0, 500);
+            const nearbyLabels = nearbyLabelCandidates(el);
+            const sectionPath = sectionPathFor(el);
+            const entityContainer = entityContainerFor(el);
+            const containerMarker = entityContainer ? (entityContainer.getAttribute('data-zhida-container') ||
+              `zhida-container-${Date.now()}-${containerSequence++}`) : '';
+            if (entityContainer && containerMarker) entityContainer.setAttribute('data-zhida-container', containerMarker);
+            const context = clean(choiceInfo?.question || contextFor(el)).slice(0, 600);
+            const placeholderText = clean(input?.getAttribute('placeholder') || el.getAttribute('placeholder')).slice(0, 300);
+            let options = el.tagName === 'SELECT' ? [...el.options].filter(o => !o.disabled && !o.parentElement?.disabled).map(o => clean(o.text)).filter(value => value && !placeholder(value)) : [];
             if (['radio', 'checkbox'].includes(fieldType)) {
-              const group = fieldContainer(el) || el.closest('[role="radiogroup"], [role="group"]');
-              const members = el.name ? [...document.querySelectorAll(`input[name="${CSS.escape(el.name)}"]`)] :
-                [...(group?.querySelectorAll(`[role="${fieldType}"]`) || [el])];
-              options = members.map(item => clean(item.closest('label')?.innerText || item.getAttribute('aria-label') || item.innerText || item.value)).filter(Boolean);
+              options = choiceInfo?.options || [];
             }
-            if (customSelect) {
-              const controlled = (el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '')
-                .split(/\\s+/).map(id => document.getElementById(id)).filter(Boolean);
-              const localOptions = controlled.flatMap(root => [...root.querySelectorAll('[role="option"], option')]);
-              options = localOptions.map(item => clean(item.innerText || item.textContent || item.value)).filter(value => value && !placeholder(value));
-            }
+            // Custom options are read through the same scoped tool used by execution.
             const selectedItems = customSelect ? [...el.querySelectorAll('[class*="selection-item"], [class*="selected-value"], [class*="selected-item"]')]
               .map(item => clean(item.innerText || item.textContent)).filter(value => value && !placeholder(value)) : [];
             const customValue = selectedItems.join(', ') || clean(el.getAttribute('aria-valuetext') || el.querySelector('input')?.value || el.innerText);
             return {
-              selector: `[data-zhida-field="${marker}"]`, label, label_source: labelInfo.source,
-              context, placeholder: placeholderText, ordinal: index + 1,
+              selector: `[data-zhida-field="${marker}"]`, label, question_text: label,
+              label_source: labelInfo.source, recognition_confidence: labelInfo.confidence || 0,
+              context, help_text: helpTextFor(el), nearby_labels: nearbyLabels,
+              section_path: sectionPath, placeholder: placeholderText, ordinal: index + 1,
               name: el.getAttribute('name') || el.querySelector('input')?.getAttribute('name') || el.getAttribute('id') || '', field_type: fieldType,
-              required: el.required || el.querySelector('input')?.required || el.getAttribute('aria-required') === 'true' || /[*✱]/.test(label), options,
+              required: el.required || el.querySelector('input')?.required || el.getAttribute('aria-required') === 'true' ||
+                choiceInfo?.group?.getAttribute('aria-required') === 'true' || choiceInfo?.members.some(item => item.required) || /[*✱]/.test(label), options,
               current_value: el.type === 'file' ? [...(el.files || [])].map(file => file.name).join(', ') :
                 (el.tagName === 'SELECT' ? [...el.selectedOptions]
                   .map(option => clean(option.textContent || option.value)).filter(value => value && !placeholder(value)).join(', ') :
                 (['checkbox','radio'].includes(fieldType) ? String(el.checked ?? el.getAttribute('aria-checked') === 'true') :
                   clean(el.value || (customSelect ? customValue : '')))),
               accept: el.getAttribute('accept') || '', role,
-              group_label: groupLabelFor(el).slice(0, 500),
+              group_label: groupLabelFor(el, choiceInfo).slice(0, 500),
               option_label: ['radio','checkbox'].includes(fieldType) ? optionLabelFor(el).slice(0, 500) : '',
               option_value: ['radio','checkbox'].includes(fieldType) ? clean(el.value || el.getAttribute('data-value') || el.innerText) : '',
               multiple: Boolean(el.multiple || el.getAttribute('aria-multiselectable') === 'true' ||
                 /multiple|multi|tags/.test(String(el.className || '').toLowerCase()) ||
                 /multiple|multi|tags/.test(String(el.closest('[class]')?.className || '').toLowerCase())),
               readonly: Boolean(el.readOnly || el.querySelector('input')?.readOnly || el.getAttribute('aria-readonly') === 'true'),
-              section: sectionFor(el).slice(0, 500)
+              autocomplete: input?.getAttribute('autocomplete') || el.getAttribute('autocomplete') || '',
+              section: (sectionFor(el) || sectionPath[sectionPath.length - 1] || '').slice(0, 500), container_key: containerMarker,
+              control_group_key: choiceInfo?.key || ''
             };
           });
           const addPattern = /^(添加|新增|补充|add|new)(\\s|$|一条|经历|项目|技能|语言|证书|奖项)/i;
@@ -548,17 +916,20 @@ class BrowserDemoService:
               `zhida-expand-${Date.now()}-${expanders.length}-${Math.random().toString(36).slice(2)}`;
             button.setAttribute('data-zhida-field', marker);
             expanders.push({
-              selector: `[data-zhida-field="${marker}"]`, label: semanticLabel,
-              label_source: 'explicit', context: semanticLabel, placeholder: '', ordinal: fields.length + expanders.length + 1,
+              selector: `[data-zhida-field="${marker}"]`, label: semanticLabel, question_text: semanticLabel,
+              label_source: 'explicit', recognition_confidence: .98, context: semanticLabel,
+              help_text: '', nearby_labels: [], section_path: heading ? [heading] : [],
+              placeholder: '', ordinal: fields.length + expanders.length + 1,
               name: button.getAttribute('name') || button.getAttribute('id') || '',
               field_type: 'section-button', required: false, options: [], current_value: '',
               accept: '', role: 'button', group_label: heading, option_label: '',
-              option_value: '', multiple: false, readonly: false, section: heading
+              option_value: '', multiple: false, readonly: false, autocomplete: '', section: heading,
+              container_key: '', control_group_key: ''
             });
           }
           return [...fields, ...expanders];
         }
-        """)
+        """, recognition_profile)
         # Component libraries often render options only after the combobox opens.
         # Opening a list is read-only and lets the review UI present the real choices.
         for item in data:
@@ -566,34 +937,24 @@ class BrowserDemoService:
                 continue
             try:
                 locator = self.page.locator(item["selector"]).first
-                await locator.click(timeout=1800)
-                await self.page.wait_for_timeout(180)
-                item["options"] = await self.page.evaluate("""
-                marker => {
-                  const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
-                  const placeholder = value => /^(select|select one|choose|choose one|please choose|请选择|请选择一项|暂未选择|未选择|点击选择|搜索并选择)[.\\s…]*$/i.test(clean(value));
-                  const el = document.querySelector(`[data-zhida-field="${CSS.escape(marker)}"]`);
-                  const ids = (el?.getAttribute('aria-controls') || el?.getAttribute('aria-owns') || '')
-                    .split(/\\s+/).filter(Boolean);
-                  const controlled = ids.map(id => document.getElementById(id)).filter(Boolean)
-                    .flatMap(root => [...root.querySelectorAll('[role="option"], option, .ant-select-item-option, .arco-select-option, .el-select-dropdown__item, .ivu-select-item, .semi-select-option, [class*="select-option"], [class*="dropdown-item"]')]);
-                  const visible = [...document.querySelectorAll([
-                    '[role="option"]', '[role="listbox"] option', '.ant-select-item-option',
-                    '.arco-select-option', '.el-select-dropdown__item', '.ivu-select-item',
-                    '.semi-select-option', '[class*="select-option"]', '[class*="dropdown-item"]'
-                  ].join(', '))]
-                    .filter(option => option.getClientRects().length > 0);
-                  return [...new Set(controlled.length ? controlled : visible)]
-                    .map(option => clean(option.innerText || option.textContent || option.value))
-                    .filter(value => value && value.length <= 300 && !placeholder(value));
-                }
-                """, item["selector"].split('"')[1])
+                before_open = await visible_popup_ids(self.page, policy)
+                already_open = await scoped_option_entries(self.page, locator, policy)
+                if already_open:
+                    entries = already_open
+                else:
+                    await locator.click(timeout=1800)
+                    entries = await self._wait_for_options(locator, policy, before_open)
+                item["options"] = list(dict.fromkeys(text for text, _ in entries))
                 await self.page.keyboard.press("Escape")
             except Exception:
                 item["options"] = item.get("options", [])
         _finalize_field_metadata(data)
-        fields = [PageField.model_validate(item) for item in data]
-        return BrowserSnapshot(session_id=self.session_id, url=self.page.url, title=await self.page.title(), fields=fields)
+        _finalize_choice_metadata(data)
+        fields = enrich_fields([PageField.model_validate(item) for item in data], self.page.url)
+        return BrowserSnapshot(
+            session_id=self.session_id, url=self.page.url, title=await self.page.title(),
+            recognition_profile=str(recognition_profile["name"]), site_route=site_route, fields=fields,
+        )
 
     async def snapshot_for(self, session_id: str) -> BrowserSnapshot:
         self._require(session_id)
@@ -727,10 +1088,12 @@ class BrowserDemoService:
 
     async def pre_submit_check(self, session_id: str) -> PreSubmitCheck:
         page = self._require(session_id)
+        policy = policy_for((await route_for_page(page)).adapter)
         data = await page.evaluate("""
-        () => {
+        profile => {
           const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
           const customWrapperSelector = [
+            ...(profile?.control_selectors || []),
             '.ant-select-selector', '.arco-select-view', '.el-select__wrapper', '.ivu-select-selection',
             '.semi-select', '.t-select__wrap', '[class*="select-selector"]',
             '[class*="select__selector"]', '[class*="select-view"]',
@@ -739,8 +1102,8 @@ class BrowserDemoService:
           const customSelector = '[role="combobox"], [aria-haspopup="listbox"], ' + customWrapperSelector;
           const labelFor = el => {
             const explicit = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
-            const question = el.closest('.application-question, .application-additional, fieldset, [role="radiogroup"], [role="group"], .form-field, .field, .ant-form-item, .arco-form-item, .el-form-item, [class*="form-item"], [class*="formItem"]');
-            return clean(explicit?.innerText || question?.querySelector('.application-label, legend, .question-label')?.innerText ||
+            const question = el.closest('[data-zhida-choice-group], .application-question, .application-additional, fieldset, [role="radiogroup"], [role="group"], .form-field, .field, .ant-form-item, .arco-form-item, .el-form-item, [class*="form-item"], [class*="formItem"]');
+            return clean(question?.getAttribute('data-zhida-choice-label') || explicit?.innerText || question?.querySelector('.application-label, legend, .question-label')?.innerText ||
               el.closest('label')?.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name);
           };
           const canonical = el => el.closest(customWrapperSelector) || (el.matches(customSelector) ? el : (el.closest(customSelector) || el));
@@ -769,12 +1132,13 @@ class BrowserDemoService:
             const customSelect = el.getAttribute('role') === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox' || el.matches(customSelector);
             if (el.type === 'file') filled = Boolean(el.files?.length);
             else if (fieldType === 'radio') {
-              const group = el.closest('[role="radiogroup"], fieldset, [role="group"]');
-              const groupKey = el.name || group?.getAttribute('data-zhida-radio-group') ||
+              const group = el.closest('[data-zhida-choice-group], [role="radiogroup"], fieldset, [role="group"]');
+              const groupKey = group?.getAttribute('data-zhida-choice-group') || el.name ||
                 ('radio-' + [...document.querySelectorAll('[role="radiogroup"], fieldset, [role="group"]')].indexOf(group));
               if (handledRadioNames.has(groupKey)) continue;
               handledRadioNames.add(groupKey);
-              const members = el.name ? [...document.querySelectorAll(`input[name="${CSS.escape(el.name)}"]`)] :
+              const members = group?.hasAttribute('data-zhida-choice-group') ?
+                [...group.querySelectorAll('input[type="radio"], [role="radio"]')] : el.name ? [...document.querySelectorAll(`input[name="${CSS.escape(el.name)}"]`)] :
                 [...(group?.querySelectorAll('input[type="radio"], [role="radio"]') || [el])];
               filled = members.some(item => item.checked || item.getAttribute('aria-checked') === 'true');
             } else if (fieldType === 'checkbox') {
@@ -815,7 +1179,7 @@ class BrowserDemoService:
             validation_errors: [...new Set(validationErrors)], human_challenges: humanChallenges,
             file_uploads: fileUploads, submit_labels: submitLabels};
         }
-        """)
+        """, policy.field_profile())
         missing_rows = data["required_missing"]
         _finalize_field_metadata(missing_rows)
         missing = [RequiredFieldIssue.model_validate(item) for item in missing_rows]
@@ -847,63 +1211,51 @@ class BrowserDemoService:
         replacement = matches[0]
         return replacement, self.page.locator(replacement.selector).first
 
+    async def _wait_for_options(self, control, policy, before_open, wanted: str = ""):
+        # Poll only the current control's menu, bounded by the selected ATS policy.
+        entries = []
+        for elapsed in range(0, policy.option_wait_ms + 1, 100):
+            entries = await scoped_option_entries(self.page, control, policy, before_open)
+            if entries and (not wanted or _best_option(wanted, [text for text, _ in entries])):
+                return entries
+            if elapsed < policy.option_wait_ms:
+                await self.page.wait_for_timeout(100)
+        return entries
+
     async def _visible_option_entries(self, control):
         if not self.page:
             return []
-        controlled_ids = await control.evaluate("""el => {
-          const direct = `${el.getAttribute('aria-controls') || ''} ${el.getAttribute('aria-owns') || ''}`;
-          const nested = el.querySelector('[aria-controls], [aria-owns]');
-          return `${direct} ${nested?.getAttribute('aria-controls') || ''} ${nested?.getAttribute('aria-owns') || ''}`
-            .trim().split(/\s+/).filter(Boolean);
-        }""")
-        option_locators = []
-        for controlled_id in controlled_ids:
-            root = self.page.locator(f"#{controlled_id}")
-            if await root.count():
-                option_locators.append(root.locator(OPTION_LOCATOR_SELECTOR))
-        option_locators.append(self.page.locator(OPTION_LOCATOR_SELECTOR))
-        entries = []
-        seen: set[str] = set()
-        for options in option_locators:
-            for index in range(min(await options.count(), 300)):
-                option = options.nth(index)
-                try:
-                    if not await option.is_visible():
-                        continue
-                    text = re.sub(r"\s+", " ", (await option.inner_text()).strip())
-                    normalized = _normalized_option(text)
-                    if not text or len(text) > 300 or normalized in OPTION_PLACEHOLDERS or normalized in seen:
-                        continue
-                    seen.add(normalized)
-                    entries.append((text, option))
-                except Exception:
-                    continue
-            if entries:
-                break
-        return entries
+        policy = policy_for((await route_for_page(self.page)).adapter)
+        return await scoped_option_entries(self.page, control, policy)
 
     async def _select_custom(self, field: PageField, values: list[str]) -> list[str]:
         selected: list[str] = []
+        policy = policy_for((await route_for_page(self.page)).adapter)
         targets = values if field.multiple else values[:1]
         for wanted in targets:
             live_field, control = await self._resolve_field(field)
             await control.scroll_into_view_if_needed(timeout=3000)
-            await control.click(timeout=8000)
-            await self.page.wait_for_timeout(300)
-            entries = await self._visible_option_entries(control)
+            before_open = await visible_popup_ids(self.page, policy)
+            entries = await scoped_option_entries(self.page, control, policy)
+            if not entries:
+                await control.click(timeout=8000)
+                entries = await self._wait_for_options(control, policy, before_open, wanted)
             match = _best_option(wanted, [text for text, _ in entries])
             if not match:
                 search = control if await control.evaluate("el => el.tagName === 'INPUT'") else control.locator("input").first
                 if await search.count() and await search.is_editable():
                     await search.fill(wanted)
-                    await self.page.wait_for_timeout(350)
-                    entries = await self._visible_option_entries(control)
+                    entries = await self._wait_for_options(control, policy, before_open, wanted)
                     match = _best_option(wanted, [text for text, _ in entries])
             if not match:
                 await self.page.keyboard.press("Escape")
                 choices = "、".join(text for text, _ in entries[:12]) or "未读取到选项"
                 raise ValueError(f"网页选项中找不到“{wanted}”；当前选项：{choices}")
-            option = next(option for text, option in entries if text == match)
+            matches = [option for text, option in entries if text == match]
+            if len(matches) != 1:
+                await self.page.keyboard.press("Escape")
+                raise ValueError(f"“{wanted}”对应多个网页选项，请在网页中核对层级后选择")
+            option = matches[0]
             await option.click(timeout=8000)
             selected.append(match)
             await self.page.wait_for_timeout(250)
@@ -913,7 +1265,7 @@ class BrowserDemoService:
     async def _select_native(self, field: PageField, values: list[str]) -> list[str]:
         _, control = await self._resolve_field(field)
         options = await control.locator("option").evaluate_all(
-            "items => items.map(item => ({label: String(item.textContent || '').trim(), value: item.value}))"
+            "items => items.filter(item => !item.disabled && !item.parentElement?.disabled).map(item => ({label: String(item.textContent || '').trim(), value: item.value}))"
         )
         selected: list[str] = []
         targets = values if field.multiple else values[:1]
