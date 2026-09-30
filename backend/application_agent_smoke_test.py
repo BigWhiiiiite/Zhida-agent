@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from app import storage
 from app.application_agent import decide_application_step
 from app.application_models import ApplicationAgentCheckpoint, ApplicationAgentDecision, ApplicationWorkflowState
-from app.browser_models import BrowserSnapshot, PageField, PreSubmitCheck
+from app.browser_models import ApplicationTarget, NavigationCandidate, BrowserSnapshot, PageField, PreSubmitCheck
 from app.ats_registry import resolve_site_route
 from app.models import CandidateProfile
 
@@ -81,19 +81,25 @@ async def main() -> None:
             "registration_required": "wait_for_registration",
             "auth_required": "wait_for_login",
             "verification_required": "wait_for_verification",
-            "profile_form": "analyze_and_fill",
-            "application_form": "analyze_and_fill",
-            "review": "review_before_submit",
+            "profile_form": "refresh",
+            "application_form": "refresh",
+            "review": "refresh",
             "unknown": "refresh",
         }
         for stage_name, expected in expectations.items():
             decision = await decide_application_step(state(stage_name), snapshot, profile)
             assert decision.next_action == expected
         verified = await decide_application_step(
+            state("application_form", safe_next_present=True, safe_next_label="下一页", form_fields=1),
+            snapshot.model_copy(update={"fields": [PageField(selector="#name",label="姓名",current_value=profile.name)]}),
+            profile, PreSubmitCheck(url=snapshot.url, ready=True),
+        )
+        assert verified.next_action == "continue_application" and verified.can_execute
+        empty = await decide_application_step(
             state("application_form", safe_next_present=True, safe_next_label="下一页"),
             snapshot, profile, PreSubmitCheck(url=snapshot.url, ready=True),
         )
-        assert verified.next_action == "continue_application" and verified.can_execute
+        assert empty.next_action == "refresh"
 
     # Even if the model asks to auto-fill during verification, code limits it to
     # the actions permitted by the authoritative stage.
@@ -113,6 +119,32 @@ async def main() -> None:
     assert guarded.next_action == "wait_for_verification"
     assert guarded.requires_user and not guarded.can_execute
     assert guarded.next_label != "自动填写"
+
+    disagreement = ApplicationAgentDecision(
+        stage="job_detail", observed_stage="job_list", stage_conflict=True,
+        stage_conflict_evidence="只有职位筛选控件，未发现具体岗位", goal="核对阶段",
+        summary="需要重读", next_action="start_application", next_label="进入申请",
+        rationale="导航页不能填写",
+    )
+    with patch("app.application_agent.configured_model", return_value=(object(), object())), \
+            patch("app.application_agent.Agent", return_value=object()), \
+            patch("app.application_agent.Runner.run", return_value=SimpleNamespace(final_output=disagreement)):
+        corrected = await decide_application_step(state("job_detail"), snapshot, profile)
+    assert corrected.next_action == "refresh" and corrected.stage_conflict
+    assert corrected.stage == "job_detail" and corrected.candidate_id == ""
+    assert corrected.observed_stage == "job_list"
+    selected = NavigationCandidate(id="observed-target",label="AI Agent 工程师",url="https://jobs.example.test/job/1",
+                                   kind="open_job",matches_target=True)
+    nav_state = state("job_list",target=ApplicationTarget(job_title="AI Agent 工程师"),
+                      navigation_candidates=[selected])
+    malicious_candidate = disagreement.model_copy(update={
+        "stage":"job_list","observed_stage":"","stage_conflict":False,
+        "next_action":"open_job","candidate_id":"invented-selector","next_label":"打开伪造入口"})
+    with patch("app.application_agent.configured_model", return_value=(object(), object())), \
+            patch("app.application_agent.Agent", return_value=object()), \
+            patch("app.application_agent.Runner.run", return_value=SimpleNamespace(final_output=malicious_candidate)):
+        nav_decision = await decide_application_step(nav_state,snapshot,profile)
+    assert nav_decision.candidate_id == selected.id and nav_decision.next_label != "打开伪造入口"
 
     # An optional known field is still worth filling on a single-page form even
     # when all required fields are complete. The final submit itself stays gated.

@@ -53,6 +53,9 @@ PROJECT_ATTRIBUTE_HINTS = (
 SEMANTIC_HINTS = (
     ("third_party.contact", ("紧急联系人", "紧急联络人", "监护人", "推荐人", "证明人", "emergency contact", "guardian", "referee", "recommender")),
     ("candidate.government_id", ("身份证", "证件号码", "证件号", "护照号码", "护照号", "实名认证", "national id", "id number", "passport number")),
+    ("candidate.english_name", ("英文姓名", "英文名", "english name", "name in english")),
+    ("candidate.age", ("年龄", "周岁", "age")),
+    ("candidate.birth_date", ("出生日期", "出生年月", "birth date", "date of birth")),
     ("candidate.email", ("电子邮箱", "电子邮件", "邮箱", "e-mail", "email")),
     ("candidate.phone", ("手机号码", "联系电话", "手机号", "手机", "telephone", "mobile", "phone")),
     ("candidate.wechat", ("微信号", "微信", "wechat", "weixin")),
@@ -76,7 +79,7 @@ SEMANTIC_HINTS = (
     ("candidate.campus_type", ("应届生类型", "毕业生类型", "招聘对象", "校招类型", "campus candidate type")),
     ("candidate.skills", ("ai应用技能", "ai技能", "技术技能", "专业技能", "skill set", "technical skills", "skills")),
     ("candidate.languages", ("语言能力", "外语能力", "掌握语言", "language ability", "language skills", "languages")),
-    ("candidate.name", ("候选人姓名", "真实姓名", "中文姓名", "英文姓名", "full name", "legal name", "candidate name", "姓名")),
+    ("candidate.name", ("候选人姓名", "真实姓名", "中文姓名", "full name", "legal name", "candidate name", "姓名")),
 )
 
 AUTOCOMPLETE_SEMANTICS = {
@@ -106,9 +109,19 @@ def field_text(field: PageField) -> str:
 
 def education_level_hint(value: str) -> str:
     text = value.casefold()
-    matches = [level for level, aliases in EDUCATION_LEVEL_ALIASES.items()
-               if any(alias in text for alias in aliases)]
-    return matches[0] if len(set(matches)) == 1 else ""
+    # Abbreviations are tokens, not substrings (e.g. MSc must not match a
+    # department name). 博士研究生 is doctoral, not a second master's claim.
+    doctorate = bool(re.search(r"博士|\bdoctor(?:al|ate)?\b|\bph\.?d\.?\b", text))
+    flags = {
+        "high_school": bool(re.search(r"高中|中专|high school|secondary school", text)),
+        "associate": bool(re.search(r"大专|专科|\bassociate\b|college diploma", text)),
+        "bachelor": bool(re.search(r"本科|学士|\b(?:bachelor|undergraduate|bsc|bs|beng|b\.sc\.?|b\.s\.?)\b", text)),
+        "master": bool(re.search(r"硕士|\b(?:master|msc|ms|meng|m\.sc\.?|m\.s\.?)\b", text))
+                  or (not doctorate and "研究生" in text),
+        "doctorate": doctorate,
+    }
+    matches = [level for level, matched in flags.items() if matched]
+    return matches[0] if len(matches) == 1 else ""
 
 
 def field_identity_text(field: PageField) -> str:
@@ -133,10 +146,10 @@ def semantic_key_for(field: PageField) -> str:
     if any(hint in text for hint in SEMANTIC_HINTS[0][1]):
         return "third_party.contact"
     autocomplete = field.autocomplete.casefold().strip().split()[-1] if field.autocomplete.strip() else ""
-    if autocomplete in AUTOCOMPLETE_SEMANTICS:
-        return AUTOCOMPLETE_SEMANTICS[autocomplete]
     for key, hints in SEMANTIC_HINTS:
-        if any(hint in own_text for hint in hints):
+        if any((bool(re.search(rf"(?<![a-z]){re.escape(hint)}(?![a-z])", own_text))
+                if hint.isascii() and hint.isalpha() and len(hint) <= 3 else hint in own_text)
+               for hint in hints):
             return key
     education_context = any(hint in f"{text} {own_text}" for hint in (
         "教育", "学历", "学位", "本科", "硕士", "博士", "学院", "院系", "院校", "学校", "就读", "学校所在", "院校所在", "education", "academic",
@@ -161,6 +174,8 @@ def semantic_key_for(field: PageField) -> str:
         for key, hints in PROJECT_ATTRIBUTE_HINTS:
             if any(hint in own_text for hint in hints):
                 return key
+    if autocomplete in AUTOCOMPLETE_SEMANTICS:
+        return AUTOCOMPLETE_SEMANTICS[autocomplete]
     return "application.custom"
 
 

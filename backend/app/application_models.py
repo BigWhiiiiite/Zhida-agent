@@ -5,12 +5,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr
 
-from .browser_models import BrowserSnapshot, ExecutionResult, FormReviewResult, PreSubmitCheck
+from .browser_models import (ApplicationTarget, NavigationCandidate, BrowserSnapshot,
+                             ExecutionResult, FormReviewResult, PreSubmitCheck)
 from .ats_registry import SiteRoute
 
 
 ApplicationStage = Literal[
-    "job_detail", "registration_required", "auth_required", "verification_required",
+    "homepage", "job_list", "job_detail", "registration_required", "auth_required", "verification_required",
     "profile_form", "application_form", "review", "unknown",
 ]
 
@@ -20,6 +21,7 @@ class WorkflowAction(BaseModel):
         "start_application", "fill_registration", "create_account", "manual_login",
         "request_phone_code", "request_email_code", "enter_verification",
         "analyze_form", "continue_application", "refresh",
+        "browse_jobs", "search_jobs", "open_job",
     ]
     label: str
     automated: bool = False
@@ -50,10 +52,16 @@ class ApplicationWorkflowState(BaseModel):
     page_step_current: int | None = None
     page_step_total: int | None = None
     actions: list[WorkflowAction] = Field(default_factory=list)
+    target: ApplicationTarget = Field(default_factory=ApplicationTarget)
+    navigation_candidates: list[NavigationCandidate] = Field(default_factory=list)
+    navigation_blocker: str = ""
+    stage_evidence: list[str] = Field(default_factory=list)
 
 
 class WorkflowAdvanceRequest(BaseModel):
-    intent: Literal["start_application", "create_account", "continue_application", "refresh"]
+    intent: Literal["start_application", "create_account", "continue_application", "refresh",
+                    "browse_jobs", "search_jobs", "open_job"]
+    candidate_id: str = Field(default="", max_length=100)
 
 
 class RegistrationCredentialsRequest(BaseModel):
@@ -76,6 +84,7 @@ AgentNextAction = Literal[
     "start_application", "analyze_and_fill", "continue_application", "refresh",
     "wait_for_registration", "wait_for_login", "wait_for_verification",
     "review_before_submit", "stop",
+    "browse_jobs", "search_jobs", "open_job",
 ]
 
 
@@ -95,6 +104,10 @@ class ApplicationAgentDecision(BaseModel):
     risk_level: Literal["low", "medium", "high"] = "low"
     model_status: Literal["model", "local_fallback"] = "local_fallback"
     model: str = ""
+    candidate_id: str = ""
+    observed_stage: ApplicationStage | Literal[""] = ""
+    stage_conflict: bool = False
+    stage_conflict_evidence: str = ""
 
 
 class ApplicationAgentStepRequest(BaseModel):

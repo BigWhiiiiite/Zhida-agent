@@ -24,6 +24,8 @@ LIST_FIELDS = [
 ]
 
 SEMANTIC_PROFILE_FIELDS = {
+    "candidate.english_name": "english_name", "candidate.age": "age",
+    "candidate.birth_date": "birth_date",
     "candidate.email": "email", "candidate.phone": "phone", "candidate.wechat": "wechat",
     "candidate.qq": "qq", "candidate.github": "github", "candidate.linkedin": "linkedin",
     "candidate.website": "website", "candidate.country_region": "country_region",
@@ -95,7 +97,12 @@ def save_application_answer(question: str, field_name: str, value: str, *, seman
     current = ResumeProfile.model_validate(get_profile().model_dump())
     direct_field = SEMANTIC_PROFILE_FIELDS.get(semantic_key) or _answer_profile_field(cleaned_question, field_name)
     if direct_field:
-        if direct_field in LIST_FIELDS:
+        if direct_field == "age":
+            age_text = re.sub(r"(?:周岁|岁)$", "", cleaned_value).strip()
+            if not age_text.isdecimal() or not 0 <= int(age_text) <= 120:
+                raise ValueError("年龄请填写 0 到 120 之间的整数周岁")
+            current.age = int(age_text)
+        elif direct_field in LIST_FIELDS:
             values = [item.strip() for item in re.split(r"[,，、\n]", cleaned_value) if item.strip()]
             setattr(current, direct_field, values)
         else:

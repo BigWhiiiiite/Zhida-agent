@@ -105,7 +105,7 @@ async def main() -> None:
         await page.route("**/*", generic_route)
         await page.goto("https://careers.example/application")
         state = await inspect_application_page(page, "generic")
-        assert state.stage == "verification_required" and state.final_submit_present
+        assert state.stage == "verification_required" and not state.final_submit_present
         await request_verification_code(page, "phone", "13800138000")
         assert await page.locator('input[name="mobile"]').input_value() == "13800138000"
         assert await page.locator("body").get_attribute("data-sent") == "yes"
@@ -170,7 +170,7 @@ async def main() -> None:
 
         await page.set_content('<button onclick="document.body.dataset.final=\'yes\'">提交申请</button>')
         state = await inspect_application_page(page, "final")
-        assert state.stage == "review" and state.final_submit_present and not state.safe_next_present
+        assert state.stage == "unknown" and not state.final_submit_present and not state.safe_next_present
         try:
             await continue_application(page)
             raise AssertionError("final submit must never be clicked")

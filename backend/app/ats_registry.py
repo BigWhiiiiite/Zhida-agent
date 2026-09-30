@@ -31,7 +31,8 @@ COMMON_POPUPS = (
     '.el-select-dropdown', '.ivu-select-dropdown', '.semi-select-option-list',
 )
 COMMON_TOOLS = ("observe_page", "map_profile", "fill_text", "select_native",
-                "select_scoped_options", "check_choice", "upload_resume", "verify_fields")
+                "select_scoped_options", "check_choice", "upload_resume", "verify_fields",
+                "browse_jobs", "search_jobs", "open_job")
 
 
 @dataclass(frozen=True)

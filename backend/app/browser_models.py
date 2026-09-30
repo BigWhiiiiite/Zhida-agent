@@ -7,8 +7,26 @@ from pydantic import BaseModel, Field
 from .ats_registry import SiteRoute
 
 
+class ApplicationTarget(BaseModel):
+    company: str = Field(default="", max_length=200)
+    job_title: str = Field(default="", max_length=200)
+    city: str = Field(default="", max_length=100)
+    recruitment_cycle: str = Field(default="", max_length=100)
+    source_url: str = Field(default="", max_length=2000)
+
+
+class NavigationCandidate(BaseModel):
+    id: str
+    label: str
+    url: str = ""
+    kind: Literal["browse_jobs", "search_jobs", "open_job"]
+    matches_target: bool = False
+
+
 class BrowserStart(BaseModel):
-    url: str
+    model_config = {"extra": "forbid"}
+    url: str = Field(min_length=1, max_length=2000)
+    target: ApplicationTarget | None = None
 
 
 class ExpandSectionRequest(BaseModel):
@@ -58,6 +76,26 @@ class PageField(BaseModel):
     control_group_key: str = ""
     expected_input: str = ""
     recognition_evidence: str = ""
+    # Server-derived knowledge references, never personal values or executable instructions.
+    knowledge_profile_path: str = ""
+    knowledge_id: str = ""
+    knowledge_block_reason: str = ""
+
+
+class FieldKnowledgeEvidence(BaseModel):
+    selector: str
+    knowledge_id: str
+    kind: Literal["mapping", "rule"]
+    question: str
+    profile_path: str = ""
+    semantic_key: str = ""
+    entity_scope: str = ""
+    note: str = ""
+    score: float = 0
+    exact: bool = False
+    usable: bool = False
+    reason: str = ""
+    retrieval_mode: Literal["hybrid", "keyword-only"] = "keyword-only"
 
 
 class BrowserSnapshot(BaseModel):
@@ -67,6 +105,7 @@ class BrowserSnapshot(BaseModel):
     recognition_profile: str = "generic-semantic"
     site_route: SiteRoute = Field(default_factory=SiteRoute)
     fields: list[PageField]
+    knowledge_context: list[FieldKnowledgeEvidence] = Field(default_factory=list)
 
 
 class FillAction(BaseModel):
@@ -82,6 +121,21 @@ class FillAction(BaseModel):
     reason: str = ""
     sensitive: bool = False
     user_confirmed: bool = False
+    profile_path: str = ""
+    entity_scope: str = ""
+    question_evidence: str = ""
+    # Routing metadata is assigned by the server, never trusted from the LLM.
+    resolution_source: Literal["rules", "model", "user", "blocked"] = "rules"
+    needs_model: bool = False
+    review_question: str = ""
+    review_hint: str = ""
+
+
+class FormRoutingSummary(BaseModel):
+    rules_ready: int = 0
+    model_resolved: int = 0
+    needs_user: int = 0
+    model_pending: int = 0
 
 
 class FormPlan(BaseModel):
@@ -89,6 +143,8 @@ class FormPlan(BaseModel):
     site_type: str = "generic"
     actions: list[FillAction] = Field(default_factory=list)
     missing_questions: list[str] = Field(default_factory=list)
+    knowledge_matches: list[FieldKnowledgeEvidence] = Field(default_factory=list)
+    routing_summary: FormRoutingSummary = Field(default_factory=FormRoutingSummary)
 
 
 class FieldComparison(BaseModel):
@@ -173,3 +229,14 @@ class ExecutionResult(BaseModel):
     unverified: int = 0
     results: list[ActionResult]
     pre_submit: PreSubmitCheck
+
+
+class HybridAutofillRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    phase: Literal["rules", "model"] = "rules"
+
+
+class HybridAutofillResult(BaseModel):
+    phase: Literal["rules", "model"]
+    review: FormReviewResult
+    execution: ExecutionResult

@@ -22,14 +22,20 @@ from .agent import get_resume_extractor
 from .auth_models import AuthSession, LoginRequest, RegisterRequest, UserAccount
 from .auth_service import SESSION_DAYS, local_user, login, register, token_hash, user_for_token
 from .application_agent import decide_application_step
+from .application_knowledge import (KnowledgeCreate, KnowledgeRecord, MappingTarget,
+                                    delete_knowledge, initialize as initialize_application_knowledge,
+                                    list_knowledge, mapping_targets, save_knowledge)
 from .application_models import (ApplicationAgentCheckpoint, ApplicationAgentStepRequest,
                                  ApplicationAgentTurn, ApplicationWorkflowState,
                                  RegistrationCredentialsRequest, VerificationCodeRequest,
                                  VerificationRequest, WorkflowAdvanceRequest)
 from .browser_models import (BrowserSnapshot, BrowserStart, ExecutePlanRequest, ExecutionResult,
                              ExpandSectionRequest, FormPlan, FormReviewResult,
+                             HybridAutofillRequest, HybridAutofillResult,
                              NativeResumeImportRequest, NativeResumeImportResult, PreSubmitCheck)
 from .browser_service import browser_demo
+from .chat_api import router as chat_router
+from .chat_storage import initialize as initialize_chat
 from .extractors import extract_text, preview_html
 from .form_agent import build_form_review, create_form_plan, create_local_form_plan
 from .job_discovery import (official_job_sources, register_job_source,
@@ -89,6 +95,8 @@ def _local_access_allowed(request: Request) -> bool:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize(); UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    initialize_application_knowledge()
+    initialize_chat()
     app.state.browser_operation_lock = asyncio.Lock()
     yield
     await browser_demo.close()
@@ -97,6 +105,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="职达 Zhida API", description="候选人资料、岗位推荐、简历解析与求职表单 Demo", version="0.4.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(chat_router)
 
 
 @app.middleware("http")
@@ -201,6 +210,31 @@ def remember_application_answer(payload: ApplicationAnswerUpdate) -> CandidatePr
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/application-knowledge/targets", response_model=list[MappingTarget])
+def application_mapping_targets() -> list[MappingTarget]:
+    return mapping_targets()
+
+
+@app.get("/api/application-knowledge", response_model=list[KnowledgeRecord])
+def application_knowledge() -> list[KnowledgeRecord]:
+    return list_knowledge()
+
+
+@app.post("/api/application-knowledge", response_model=KnowledgeRecord, status_code=201)
+def confirm_application_knowledge(payload: KnowledgeCreate) -> KnowledgeRecord:
+    try:
+        return save_knowledge(payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/application-knowledge/{knowledge_id}", status_code=204)
+def remove_application_knowledge(knowledge_id: str) -> FastAPIResponse:
+    if not delete_knowledge(knowledge_id):
+        raise HTTPException(404, "知识不存在或不属于当前用户")
+    return FastAPIResponse(status_code=204)
 
 
 @app.get("/api/jobs/recommendations", response_model=RecommendationBatch)
@@ -519,13 +553,27 @@ def export_data() -> ExportBundle:
                         resumes=list_resumes(), conflicts=list_conflicts(pending_only=False))
 
 
+@app.get("/api/browser/current")
+async def current_browser_session() -> dict[str, Any]:
+    session_id = browser_demo.session_id
+    owns_session = bool(session_id and browser_session_owners.get(session_id) == current_user_id())
+    # Recover task UI on refresh without exposing another user's URL or target.
+    return {"session_id": session_id if owns_session else None, "occupied": bool(session_id)}
+
+
 @app.post("/api/browser/start", response_model=BrowserSnapshot)
 async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
     try:
-        result = await browser_demo.start(payload.url, current_user_id())
+        if browser_demo.session_id:
+            # A new chat task must not silently close another task or user's
+            # browser, including their in-progress application and login.
+            raise HTTPException(409, "已有投递浏览器会话正在进行，请先结束当前会话，再打开新的任务")
+        result = await browser_demo.start(payload.url, current_user_id(), target=payload.target)
         browser_session_owners.clear()
         browser_session_owners[result.session_id] = current_user_id()
         return result
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
@@ -572,6 +620,7 @@ async def import_resume_with_site_parser(session_id: str,
                                          payload: NativeResumeImportRequest) -> NativeResumeImportResult:
     try:
         _require_browser_owner(session_id)
+        await _require_application_form(session_id)
         row = get_resume_internal(payload.resume_id)
         if not row:
             raise HTTPException(404, "选择的简历不存在")
@@ -592,6 +641,18 @@ async def browser_workflow(session_id: str) -> ApplicationWorkflowState:
         return await browser_demo.workflow_state(session_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+async def _require_application_form(session_id: str) -> ApplicationWorkflowState:
+    """Do not send profile data into homepage/search/login controls.
+
+    This is a server-side gate, not just a disabled button. A recognition
+    failure is a reason to inspect the page, never evidence of completion.
+    """
+    workflow = await browser_demo.workflow_state(session_id)
+    if workflow.stage not in {"profile_form", "application_form", "review"} or workflow.form_fields < 1:
+        raise HTTPException(409, "当前尚未确认有效的简历/申请表，请先选择具体岗位并完成必要登录；不会向搜索或筛选控件填写个人资料")
+    return workflow
 
 
 def _agent_checkpoint_status(workflow: ApplicationWorkflowState,
@@ -659,12 +720,13 @@ async def run_application_agent_step(session_id: str,
         execution = None
         action_taken = ""
 
-        if decision.can_execute and action == "start_application":
+        if decision.can_execute and action in {"start_application", "browse_jobs", "search_jobs", "open_job"}:
             workflow = await browser_demo.advance_workflow(
-                session_id, WorkflowAdvanceRequest(intent="start_application")
+                session_id, WorkflowAdvanceRequest(intent=action, candidate_id=decision.candidate_id)
             )
             action_taken = action
         elif decision.can_execute and action == "analyze_and_fill":
+            await _require_application_form(session_id)
             snapshot = await browser_demo.snapshot_for(session_id)
             plan = await create_form_plan(snapshot, get_profile())
             review = build_form_review(snapshot, plan)
@@ -800,6 +862,7 @@ async def review_current_form(session_id: str, use_model: bool = False) -> FormR
 async def execute_form_plan(session_id: str, payload: ExecutePlanRequest) -> ExecutionResult:
     try:
         _require_browser_owner(session_id)
+        await _require_application_form(session_id)
         resume_path: Path | None = None
         if payload.resume_id:
             row = get_resume_internal(payload.resume_id)
@@ -810,6 +873,52 @@ async def execute_form_plan(session_id: str, payload: ExecutePlanRequest) -> Exe
         return await browser_demo.execute(session_id, payload, resume_path)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/browser/{session_id}/autofill", response_model=HybridAutofillResult)
+async def autofill_current_form(session_id: str,
+                                payload: HybridAutofillRequest) -> HybridAutofillResult:
+    """Fill one stage without navigation/uploads; each stage sees current page values.
+
+    The UI can show the rules result immediately, then request model assistance.
+    A model-stage failure never rolls back the already completed rules stage.
+    The browser middleware serializes both stages with other browser operations.
+    """
+    try:
+        _require_browser_owner(session_id)
+        await _require_application_form(session_id)
+        snapshot = await browser_demo.snapshot_for(session_id)
+        profile = get_profile()
+        plan = (create_local_form_plan(snapshot, profile) if payload.phase == "rules"
+                else await create_form_plan(snapshot, profile))
+        review = build_form_review(snapshot, plan)
+        fields = {field.selector: field for field in snapshot.fields}
+        actions = [action for action in review.plan.actions
+                   if action.action in {"fill", "select", "check"}
+                   and action.confidence >= .85
+                   and (not action.sensitive or action.user_confirmed)
+                   and action.selector in fields
+                   and fields[action.selector].field_type not in {
+                       "file", "password", "hidden", "section-button", "submit", "button", "reset",
+                   }]
+        # No resume argument, selector from the caller, click, or navigation is
+        # accepted here. Existing executor policy and read-back still apply.
+        execution = await browser_demo.execute(
+            session_id, ExecutePlanRequest(actions=actions, min_confidence=.85),
+        )
+        refreshed = await browser_demo.snapshot_for(session_id)
+        # Keep the original actions/expected values, not pre-review's skips,
+        # so newly verified and previously matching fields both remain matched.
+        final_review = build_form_review(refreshed, plan)
+        return HybridAutofillResult(phase=payload.phase, review=final_review, execution=execution)
+    except HTTPException:
+        raise
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"分阶段填写失败，已完成的填写不会撤销：{str(exc)[:240]}") from exc
 
 
 @app.get("/api/browser/{session_id}/check", response_model=PreSubmitCheck)

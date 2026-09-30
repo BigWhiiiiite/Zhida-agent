@@ -6,3 +6,11 @@ frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
 .env
+
+# Local development notes and interview retrospectives; do not publish.
+docs/APPLICATION_AGENT.md
+docs/APPLICATION_KNOWLEDGE.md
+docs/ATS_EVALUATION.md
+docs/GLODON_LIVE_ACCEPTANCE_2026-09-26.md
+docs/HYBRID_AUTOFILL.md
+docs/RAG_DESIGN.md

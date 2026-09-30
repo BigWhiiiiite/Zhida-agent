@@ -5,13 +5,14 @@ import ipaddress
 import os
 import re
 import socket
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
-from .application_models import (ApplicationWorkflowState, RegistrationCredentialsRequest,
+from .application_models import (ApplicationTarget, ApplicationWorkflowState, RegistrationCredentialsRequest,
                                  VerificationCodeRequest, VerificationRequest,
                                  WorkflowAdvanceRequest)
 from .ats_field_profiles import field_profile_for_url
@@ -23,6 +24,7 @@ from .ats_adapters import (continue_application, create_account, fill_registrati
 from .browser_models import (ActionResult, BrowserSnapshot, ExecutePlanRequest, ExecutionResult,
                              NativeResumeImportResult, PageField, PreSubmitCheck, RequiredFieldIssue)
 from .field_semantics import enrich_fields
+from .job_navigation import execute_navigation, choose_candidate, workflow_fingerprint
 
 
 SENSITIVE_FIELD_HINTS = {
@@ -70,27 +72,47 @@ def _normalized_option(value: str) -> str:
 
 
 def _option_alias(value: str) -> int:
-    normalized = _normalized_option(value)
+    normalized = _option_identity(value)
     for index, group in enumerate(OPTION_ALIASES):
-        if normalized in {_normalized_option(item) for item in group}:
+        if normalized in {_option_identity(item) for item in group}:
             return index
     return -1
 
 
+def _option_identity(value: str) -> str:
+    # Unlike a fuzzy field-name key, option identities retain meaningful
+    # punctuation: C, C++, C# and Beijing/Shanghai are different choices.
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).casefold())
+
+
+def _administrative_core(value: str) -> str:
+    text = _option_identity(value)
+    if not re.fullmatch(r"[\u4e00-\u9fff]{2,}", text):
+        return text
+    for suffix in ("特别行政区", "壮族自治区", "回族自治区", "维吾尔自治区", "自治区", "自治州", "地区", "省", "市"):
+        if text.endswith(suffix) and len(text) > len(suffix) + 1:
+            return text[:-len(suffix)]
+    return text
+
+
 def _option_matches(wanted: str, actual: str) -> bool:
-    left, right = _normalized_option(wanted), _normalized_option(actual)
+    left, right = _option_identity(wanted), _option_identity(actual)
     if not left or not right or right in OPTION_PLACEHOLDERS:
         return False
+    if left == right:
+        return True
     left_alias, right_alias = _option_alias(wanted), _option_alias(actual)
     if left_alias >= 0 or right_alias >= 0:
         return left_alias >= 0 and left_alias == right_alias
-    return left == right or left in right or right in left
+    # Only administrative suffixes have a deterministic equivalence. A unique
+    # substring is not enough: 1 != 10年, 北京 != 北京/上海, 计算机 != 非计算机专业.
+    return _administrative_core(wanted) == _administrative_core(actual)
 
 
 def _best_option(wanted: str, candidates: list[str]) -> str:
-    exact = [item for item in candidates if _normalized_option(item) == _normalized_option(wanted)]
+    exact = [item for item in candidates if _option_identity(item) == _option_identity(wanted)]
     if exact:
-        return exact[0]
+        return exact[0] if len(exact) == 1 else ""
     matched = [item for item in candidates if _option_matches(wanted, item)]
     return matched[0] if len(matched) == 1 else ""
 
@@ -101,8 +123,15 @@ def _split_values(value: str | bool) -> list[str]:
 
 def _selected_values_match(expected: list[str], actual: str) -> bool:
     actual_values = _split_values(actual)
-    return all(any(_option_matches(wanted, item) for item in actual_values) or _option_matches(wanted, actual)
-               for wanted in expected)
+    if not expected or len(expected) != len(actual_values):
+        return False
+    remaining = list(actual_values)
+    for wanted in expected:
+        matches = [index for index, item in enumerate(remaining) if _option_matches(wanted, item)]
+        if len(matches) != 1:
+            return False
+        remaining.pop(matches[0])
+    return not remaining
 
 
 def _field_identity(field: PageField) -> str:
@@ -184,6 +213,7 @@ def _finalize_field_metadata(items: list[dict[str, object]]) -> None:
         item["label_source"] = source
         default_confidence = {
             "explicit": .98, "aria-labelledby": .96, "nearby": .92, "aria": .86,
+            "container-owned": .95,
             "attribute": .78, "context": .72, "placeholder": .62, "name": .45,
             "generated": .1, "unknown": .1,
         }.get(source, .5)
@@ -273,11 +303,14 @@ def _finalize_choice_metadata(items: list[dict[str, object]]) -> None:
                     "复选题" if group[0].get("field_type") == "checkbox" else "单选题")
             prompt = f"未识别的{kind}（网页第 {ordinal} 个控件附近）"
         for item in group:
+            previous_question = str(item.get("question_text") or "")
             item["group_label"] = prompt
             item["question_text"] = prompt
             item["label"] = prompt
             if not prompt.startswith("未识别的"):
-                item["label_source"] = "nearby"
+                if not (item.get("label_source") in {"explicit", "aria-labelledby"}
+                        and previous_question == prompt):
+                    item["label_source"] = "nearby"
                 item["recognition_confidence"] = max(float(item.get("recognition_confidence") or 0), .92)
             item["options"] = options
 
@@ -305,6 +338,8 @@ class BrowserDemoService:
         self.context: BrowserContext | None = None
         self.page: Page | None = None
         self.session_id: str | None = None
+        self.target = ApplicationTarget()
+        self._stalled_navigation: set[str] = set()
 
     @staticmethod
     def profile_directory(user_id: str) -> Path:
@@ -335,9 +370,11 @@ class BrowserDemoService:
             raise ValueError("无法解析这个网站地址") from exc
         return url.strip()
 
-    async def start(self, url: str, user_id: str = "local") -> BrowserSnapshot:
+    async def start(self, url: str, user_id: str = "local",
+                    target: ApplicationTarget | None = None) -> BrowserSnapshot:
         url = self._validate_url(url)
         await self.close()
+        self.target = target.model_copy(deep=True) if target else ApplicationTarget()
         self.playwright = await async_playwright().start()
         try:
             channel = os.getenv("APP_BROWSER_CHANNEL", "chrome")
@@ -386,16 +423,37 @@ class BrowserDemoService:
 
     async def workflow_state(self, session_id: str) -> ApplicationWorkflowState:
         page = self._require(session_id)
-        return await inspect_application_page(page, session_id)
+        state = await inspect_application_page(page, session_id, self.target)
+        if any(key.startswith(workflow_fingerprint(state) + "|") for key in self._stalled_navigation):
+            state.navigation_blocker = "上一次导航未观察到页面进展，已停止重复操作。请更换真实候选或手动导航后重新识别。"
+        return state
 
     async def advance_workflow(self, session_id: str,
                                request: WorkflowAdvanceRequest) -> ApplicationWorkflowState:
         page = self._require(session_id)
-        if request.intent == "start_application":
+        before = await self.workflow_state(session_id)
+        candidate = None
+        if request.intent in {"browse_jobs", "search_jobs", "open_job"}:
+            if before.stage not in {"homepage", "job_list", "unknown"}:
+                raise ValueError("当前不是招聘导航页面，禁止将申请表控件用作搜索或选岗")
+            candidate = choose_candidate(before.navigation_candidates, request.intent,
+                                         self.target, request.candidate_id)
+            if candidate.url:
+                self._validate_url(candidate.url)
+        operation = f"{workflow_fingerprint(before)}|{request.intent}|{candidate.id if candidate else ''}"
+        if request.intent != "refresh" and operation in self._stalled_navigation:
+            raise ValueError("已阻止重复的无进展操作；请重新选择入口或在招聘网页中导航后再识别")
+        if candidate:
+            await execute_navigation(page, request.intent, self.target, candidate.id)
+        elif request.intent == "start_application":
+            if before.stage != "job_detail":
+                raise ValueError("只能从明确识别的岗位详情页进入申请，不能在首页或预览页点击投递")
             await start_application(page)
         elif request.intent == "create_account":
             await create_account(page)
         elif request.intent == "continue_application":
+            if before.stage not in {"profile_form", "application_form"}:
+                raise ValueError("当前不是可继续的申请表页面，不能自动翻页或提交")
             check = await self.pre_submit_check(session_id)
             blockers = [
                 f"{len(check.required_missing)} 个必填项未填",
@@ -412,7 +470,11 @@ class BrowserDemoService:
             pages = [candidate for candidate in self.context.pages if not candidate.is_closed()]
             if pages:
                 self.page = page = pages[-1]
-        return await inspect_application_page(page, session_id)
+        after = await self.workflow_state(session_id)
+        if request.intent != "refresh" and workflow_fingerprint(before) == workflow_fingerprint(after):
+            self._stalled_navigation.add(operation)
+            raise ValueError("已尝试操作，但未观察到网址、阶段、岗位或候选列表变化；未确认流程前进，已停止自动重复")
+        return after
 
     async def fill_registration(self, session_id: str,
                                 request: RegistrationCredentialsRequest) -> ApplicationWorkflowState:
@@ -422,7 +484,7 @@ class BrowserDemoService:
             await fill_registration_info(page, request.email.strip(), request.phone.strip(), password)
         finally:
             password = ""
-        return await inspect_application_page(page, session_id)
+        return await inspect_application_page(page, session_id, self.target)
 
     async def enter_verification(self, session_id: str,
                                  request: VerificationCodeRequest) -> ApplicationWorkflowState:
@@ -436,14 +498,14 @@ class BrowserDemoService:
             pages = [candidate for candidate in self.context.pages if not candidate.is_closed()]
             if pages:
                 self.page = page = pages[-1]
-        return await inspect_application_page(page, session_id)
+        return await inspect_application_page(page, session_id, self.target)
 
     async def request_code(self, session_id: str, request: VerificationRequest,
                            phone: str, email: str) -> ApplicationWorkflowState:
         page = self._require(session_id)
         value = request.value.strip() or (phone if request.channel == "phone" else email)
         await request_verification_code(page, request.channel, value)
-        return await inspect_application_page(page, session_id)
+        return await inspect_application_page(page, session_id, self.target)
 
     async def snapshot(self) -> BrowserSnapshot:
         if not self.page or not self.session_id:
@@ -473,7 +535,7 @@ class BrowserDemoService:
             const token = normalizedToken(text);
             const optionTokens = optionTexts.map(normalizedToken).filter(Boolean);
             if (optionTokens.includes(token)) return -90;
-            let score = ({explicit: 42, 'aria-labelledby': 40, nearby: 34, preceding: 31,
+            let score = ({explicit: 42, 'aria-labelledby': 40, 'container-owned': 37, nearby: 34, preceding: 31,
               aria: 23, attribute: 18, placeholder: 12, name: 5}[source] || 0);
             if (text.length <= 16) score += 12;
             else if (text.length <= 40) score += 9;
@@ -490,6 +552,14 @@ class BrowserDemoService:
             const ranked = candidates.map(item => ({...item, text: normalizeFieldText(item.text),
               score: fieldTextScore(item.text, item.source, optionTexts)}))
               .filter(item => item.text).sort((left, right) => right.score - left.score);
+            // A label linked to this exact control outranks a familiar-looking
+            // neighbour. Keyword scores must not turn an adjacent 姓名 into
+            // the title of an explicitly labelled 称呼 field.
+            const owned = ranked.filter(item => ['explicit', 'aria-labelledby'].includes(item.source)
+              && item.score > -20);
+            if (owned.length) return owned[0];
+            const containerOwned = ranked.find(item => item.source === 'container-owned' && item.score > -20);
+            if (containerOwned) return containerOwned;
             return ranked[0] && ranked[0].score > -20 ? ranked[0] : {text: '', source: 'unknown', score: -1000};
           };
           const placeholder = value => /^(select|select one|choose|choose one|please choose|请选择|请选择一项|暂未选择|未选择|点击选择|搜索并选择)[.\\s…]*$/i.test(clean(value));
@@ -728,7 +798,8 @@ class BrowserDemoService:
               {text: labelledBy(group), source: 'aria-labelledby'},
               {text: group?.getAttribute('aria-label'), source: 'aria'},
               ...[...(group?.querySelectorAll(questionSelector) || [])]
-                .map(node => ({text: labelText(node), source: 'nearby'})),
+                .map(node => ({text: labelText(node), source:
+                  node.tagName === 'LEGEND' && node.parentElement === group ? 'explicit' : 'nearby'})),
               ...nearbyLabelCandidates(group || el).map(text => ({text, source: 'nearby'})),
               {text: precedingLabel(group || el), source: 'preceding'}
             ];
@@ -743,12 +814,13 @@ class BrowserDemoService:
             const cleanedCandidates = candidates.map(item => ({
               ...item, text: stripChoiceSuffix(item.text, options)
             })).filter(item => item.text && item.text.length <= 300 && !choiceOnlyText(item.text, options));
-            const question = bestFieldText(cleanedCandidates, options).text;
+            const bestQuestion = bestFieldText(cleanedCandidates, options);
+            const question = bestQuestion.text;
             const marker = group ? (group.getAttribute('data-zhida-choice-group') ||
               `zhida-choice-${Date.now()}-${choiceGroupSequence++}`) : '';
             if (group && marker) group.setAttribute('data-zhida-choice-group', marker);
             if (group && question) group.setAttribute('data-zhida-choice-label', question);
-            return {group, members, options, question, key: marker};
+            return {group, members, options, question, source: bestQuestion.source, key: marker};
           };
           const contextFor = el => {
             const preferred = semanticContainer(el);
@@ -773,12 +845,41 @@ class BrowserDemoService:
             const groupLabel = clean(choiceInfo?.question || questionLabel?.innerText || nearbyLabel(el));
             const internalName = (target.getAttribute('name') || '').includes('[');
             if (choiceInfo?.question) {
-              return {text: clean(choiceInfo.question), source: 'nearby', confidence: .96};
+              return {text: clean(choiceInfo.question), source: choiceInfo.source || 'nearby', confidence: .96};
             }
+            // ATS components often use a div instead of label[for]. Treat it
+            // as owned only when this question container has exactly one
+            // logical control and one distinct label belonging to that same
+            // container. Canonicalisation collapses a combobox wrapper and its
+            // nested input; adjacent fields and nested question labels cannot
+            // acquire this provenance merely because they are nearby.
+            const ownedContainerLabel = () => {
+              if (!question) return '';
+              const controls = [...question.querySelectorAll(controlSelector + ', ' + customSelector)]
+                .filter(item => item.type !== 'hidden' && !item.disabled);
+              const logical = [...new Set(controls.map(canonical))];
+              if (logical.length !== 1 || logical[0] !== canonical(el)) return '';
+              const selectors = [
+                ...(profile?.label_selectors || []), 'label', 'legend', '.application-label',
+                '.question-label', '[data-qa="question-label"]', '.ant-form-item-label',
+                '.arco-form-label-item', '.el-form-item__label', '[class*="form-label"]',
+                '[class*="field-label"]', '[class*="item-label"]', '[class*="formLabel"]',
+                '[class*="fieldLabel"]', '[class*="questionTitle"]'
+              ].join(', ');
+              const labels = [...question.querySelectorAll(selectors)].filter(node => {
+                if (node === el || node.contains(el) || node.querySelector(controlSelector + ', ' + customSelector)) return false;
+                const owner = (node.parentElement && fieldContainer(node.parentElement)) || semanticContainer(node);
+                return owner === question;
+              }).map(node => normalizeFieldText(labelText(node)))
+                .filter(text => meaningfulFieldText(text) && text.length <= 300);
+              const distinct = [...new Map(labels.map(text => [normalizedToken(text), text])).values()];
+              return distinct.length === 1 ? distinct[0] : '';
+            };
             const candidates = [
               {text: labelText(explicit), source: 'explicit'},
               {text: labelText(wrapping), source: 'explicit'},
               {text: labelledBy(target) || labelledBy(el), source: 'aria-labelledby'},
+              {text: ownedContainerLabel(), source: 'container-owned'},
               {text: groupLabel || nearbyLabel(el), source: 'nearby'},
               {text: precedingLabel(el), source: 'preceding'},
               ...nearbyLabelCandidates(el).map(text => ({text, source: 'nearby'})),
@@ -1027,6 +1128,8 @@ class BrowserDemoService:
         confirm/next/save/apply buttons remain a manual gate.
         """
         page = self._require(session_id)
+        if (await self.workflow_state(session_id)).stage in {"homepage", "job_list", "job_detail", "auth_required", "registration_required", "verification_required"}:
+            raise ValueError("请先进入具体岗位的申请表，不能在招聘导航页上传简历")
         before = await self.snapshot()
         resume_fields = [field for field in before.fields if field.field_type == "file" and (
             any(hint in f"{field.label} {field.name}".lower()
@@ -1175,7 +1278,7 @@ class BrowserDemoService:
               primary: el.type === 'submit' || /submit/i.test(`${el.id} ${el.getAttribute('data-qa') || ''}`)}))
             .filter(item => /submit|apply|send application|提交|申请/i.test(item.text))
             .sort((a, b) => Number(b.primary) - Number(a.primary)).map(item => item.text).slice(0, 10);
-          return {required_total: requiredTotal, filled_count: filledCount, required_missing: missing,
+          return {field_count: candidates.length, required_total: requiredTotal, filled_count: filledCount, required_missing: missing,
             validation_errors: [...new Set(validationErrors)], human_challenges: humanChallenges,
             file_uploads: fileUploads, submit_labels: submitLabels};
         }
@@ -1183,7 +1286,9 @@ class BrowserDemoService:
         missing_rows = data["required_missing"]
         _finalize_field_metadata(missing_rows)
         missing = [RequiredFieldIssue.model_validate(item) for item in missing_rows]
-        return PreSubmitCheck(url=page.url, ready=not missing and not data["validation_errors"] and not data["human_challenges"],
+        workflow = await self.workflow_state(session_id)
+        recognized_form = data["field_count"] > 0 and workflow.stage in {"profile_form", "application_form", "review"}
+        return PreSubmitCheck(url=page.url, ready=recognized_form and not missing and not data["validation_errors"] and not data["human_challenges"],
                               required_total=data["required_total"], filled_count=data["filled_count"],
                               required_missing=missing, validation_errors=data["validation_errors"],
                               human_challenges=data["human_challenges"],
@@ -1276,7 +1381,11 @@ class BrowserDemoService:
                 continue
             value_match = _best_option(wanted, [item["value"] for item in options])
             if value_match:
-                selected.append(next(item["label"] for item in options if item["value"] == value_match))
+                selected_label = next(item["label"] for item in options if item["value"] == value_match)
+                if sum(_option_identity(item["label"]) == _option_identity(selected_label)
+                       for item in options) != 1:
+                    raise ValueError(f"网页中存在多个同名选项“{selected_label}”，请人工确认")
+                selected.append(selected_label)
                 continue
             raise ValueError(f"网页下拉选项中找不到“{wanted}”")
         await control.select_option(label=selected if field.multiple else selected[0], timeout=8000)
@@ -1304,6 +1413,8 @@ class BrowserDemoService:
     async def execute(self, session_id: str, request: ExecutePlanRequest,
                       resume_path: Path | None = None) -> ExecutionResult:
         page = self._require(session_id)
+        if (await self.workflow_state(session_id)).stage in {"homepage", "job_list", "job_detail", "auth_required", "registration_required", "verification_required"}:
+            raise ValueError("当前不是可填写的申请表；不会向首页、岗位筛选或登录控件写入个人资料")
         snapshot = await self.snapshot()
         fields = {field.selector: field for field in snapshot.fields}
         results: list[ActionResult] = []
@@ -1444,6 +1555,8 @@ class BrowserDemoService:
             except Exception:
                 pass
         self.playwright = None; self.browser = None; self.context = None; self.page = None; self.session_id = None
+        self.target = ApplicationTarget()
+        self._stalled_navigation.clear()
 
 
 browser_demo = BrowserDemoService()

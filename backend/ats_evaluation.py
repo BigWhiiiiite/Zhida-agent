@@ -121,7 +121,12 @@ async def run_case(browser, case) -> dict:
     async def respond(route):
         is_form = "/apply" in route.request.url
         content = application_html(vendor) if is_form else (
-            '<h1>测试岗位</h1><a href="/apply">立即申请</a>')
+            # A loaded detail fixture must contain actual job content. A URL,
+            # heading and Apply button alone may be an incomplete SPA shell.
+            '<h1>测试岗位</h1><section><h2>岗位职责</h2>'
+            '<p>开发智能体应用，并维护可靠的业务服务与自动化测试。</p></section>'
+            '<section><h2>任职要求</h2><p>熟悉 Python 与服务端工程开发。</p></section>'
+            '<a href="/apply">立即申请</a>')
         await route.fulfill(content_type="text/html; charset=utf-8", body=content)
 
     await context.route("**/*", respond)

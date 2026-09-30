@@ -23,13 +23,46 @@ from .form_agent import build_form_review, create_local_form_plan
 
 SAFE_EXECUTABLE_ACTIONS = {
     "start_application", "analyze_and_fill", "continue_application", "refresh",
+    "browse_jobs", "search_jobs", "open_job",
 }
+
+
+def _navigation_choice(workflow: ApplicationWorkflowState, kind: str):
+    from .job_navigation import choose_candidate
+    try:
+        return choose_candidate(workflow.navigation_candidates, kind, workflow.target)
+    except ValueError:
+        return None
+
+
+def _incomplete_job_detail(workflow: ApplicationWorkflowState) -> bool:
+    """A job identifier in a URL is not evidence that its SPA has rendered.
+
+    Use the workflow's application-field count, not all snapshot controls: a
+    half-loaded page can still expose the site's global search input.
+    """
+    return (workflow.stage == "unknown" and bool(workflow.job_id.strip())
+            and not workflow.job_title.strip() and workflow.form_fields == 0)
 
 
 def _allowed_actions(workflow: ApplicationWorkflowState,
                      check: PreSubmitCheck | None,
                      snapshot: BrowserSnapshot | None = None,
                      profile: CandidateProfile | None = None) -> list[AgentNextAction]:
+    if _incomplete_job_detail(workflow):
+        # Manual page reassessment remains available through the UI/API. It is
+        # not an automatic progress step while the same evidence is missing.
+        return ["stop"]
+    if workflow.navigation_blocker:
+        return ["stop", "refresh"]
+    if workflow.stage in {"homepage", "job_list"}:
+        if _navigation_choice(workflow, "open_job"):
+            return ["open_job", "refresh", "stop"]
+        if workflow.stage == "job_list" and _navigation_choice(workflow, "search_jobs"):
+            return ["search_jobs", "refresh", "stop"]
+        if _navigation_choice(workflow, "browse_jobs"):
+            return ["browse_jobs", "refresh", "stop"]
+        return ["stop", "refresh"]
     if workflow.stage == "job_detail":
         return ["start_application", "stop"]
     if workflow.stage == "registration_required":
@@ -40,6 +73,9 @@ def _allowed_actions(workflow: ApplicationWorkflowState,
         return ["wait_for_verification", "refresh"]
     if check and check.human_challenges:
         return ["wait_for_verification", "refresh"]
+    if (workflow.stage in {"profile_form", "application_form", "review"} or workflow.final_submit_present) and not (
+            workflow.form_fields or (snapshot and snapshot.fields)):
+        return ["refresh", "stop"]
     known_gaps = False
     if snapshot and profile and workflow.stage in {"profile_form", "application_form", "review"}:
         plan = create_local_form_plan(snapshot, profile)
@@ -69,6 +105,18 @@ def _local_decision(workflow: ApplicationWorkflowState,
     allowed = _allowed_actions(workflow, check, snapshot, profile)
     action = allowed[0]
     mapping: dict[AgentNextAction, tuple[str, str, str, bool, str]] = {
+        "browse_jobs": (
+            "找到官方岗位列表", "打开当前页面实际观察到的招聘入口",
+            "尚未选择岗位，只浏览官方页面入口，不填写个人资料。", False, "low",
+        ),
+        "search_jobs": (
+            "搜索目标岗位", f"使用网页搜索控件查找“{workflow.target.job_title}”",
+            "只输入任务目标岗位名；不把岗位筛选控件当申请表填写。", False, "low",
+        ),
+        "open_job": (
+            "核实目标岗位详情", "打开唯一符合目标的已观察岗位",
+            "岗位名称及已指定城市/批次有网页证据，仍需进入详情核验。", False, "low",
+        ),
         "start_application": (
             "进入正式申请流程", "打开申请入口并重新判断登录或注册状态",
             "当前是岗位详情页，可以执行不涉及提交的入口跳转。", False, "low",
@@ -109,6 +157,18 @@ def _local_decision(workflow: ApplicationWorkflowState,
     goal, summary, rationale, requires_user, risk = mapping[action]
     blockers: list[str] = []
     questions: list[str] = []
+    if workflow.navigation_blocker:
+        blockers.append(workflow.navigation_blocker)
+    if _incomplete_job_detail(workflow):
+        goal = "等待岗位详情完整显示"
+        summary = "尚未读到岗位标题或申请表，已暂停自动操作；请查看招聘网页后手动重新识别"
+        rationale = "网址含岗位编号，但页面证据不足，不能据此推断具体岗位、登录状态或已进入申请流程。"
+        if workflow.message and workflow.message not in blockers:
+            blockers.append(workflow.message)
+        blockers.append("尚未读取到具体岗位标题和有效申请字段；全局搜索框不属于申请表")
+        questions.append("请在招聘网页等待加载，确认具体岗位标题和申请入口已显示；若持续空白，请手动刷新招聘页或从官方岗位列表重新打开，再点击重新识别")
+    if workflow.stage in {"homepage", "job_list"} and action == "stop":
+        questions.append("请补充目标岗位，或从当前网页候选中选择一个明确入口；不会替你猜测岗位")
     if check:
         if check.required_missing:
             blockers.append(f"{len(check.required_missing)} 个必填项仍未填写")
@@ -131,6 +191,8 @@ def _local_decision(workflow: ApplicationWorkflowState,
         next_label=summary, rationale=rationale, blockers=blockers,
         user_questions=questions, can_execute=action in SAFE_EXECUTABLE_ACTIONS,
         requires_user=requires_user, risk_level=risk, model_status="local_fallback",
+        candidate_id=(choice.id if (choice := _navigation_choice(workflow, action)) else "")
+            if action in {"browse_jobs", "search_jobs", "open_job"} else "",
     )
 
 
@@ -173,7 +235,10 @@ async def decide_application_step(workflow: ApplicationWorkflowState,
                                   ) -> ApplicationAgentDecision:
     fallback = _local_decision(workflow, snapshot, check, profile)
     allowed = _allowed_actions(workflow, check, snapshot, profile)
-    if not use_model:
+    if not use_model or _incomplete_job_detail(workflow):
+        # More model calls cannot supply absent browser evidence. In particular,
+        # a stage-conflict response must not resurrect an endless refresh loop
+        # or a fabricated job/login/fill decision for a half-loaded detail page.
         return fallback
     try:
         model, settings = configured_model(reasoning_effort="low", timeout_seconds=float(
@@ -187,6 +252,8 @@ async def decide_application_step(workflow: ApplicationWorkflowState,
             instructions=(
                 "你是求职投递流程规划 Agent。请理解当前网页阶段，解释目标、阻塞项和下一步。"
                 "authoritative_stage 是代码识别的权威阶段，不得修改；next_action 必须严格取自 allowed_next_actions。"
+                "若网页证据与代码阶段矛盾，在 observed_stage 写你的判断并设置 stage_conflict=true，"
+                "stage_conflict_evidence 引用已提供的页面线索；系统仅会重新观察，不会按你的判断扩权。"
                 "你不操作浏览器，也不得建议绕过验证码、人机验证、隐私同意或最终提交。"
                 "不要索取或复述姓名、邮箱、手机号、密码、验证码等值。"
                 "表单阶段优先解释为什么可以自动填写、哪些内容仍需用户确认。"
@@ -198,11 +265,25 @@ async def decide_application_step(workflow: ApplicationWorkflowState,
         if not isinstance(result.final_output, ApplicationAgentDecision):
             return fallback
         draft = result.final_output
+        if draft.stage_conflict or (draft.observed_stage and draft.observed_stage != workflow.stage):
+            return fallback.model_copy(update={
+                "next_action": "refresh", "candidate_id": "", "can_execute": True,
+                "next_label": "页面阶段存在矛盾，重新观察后再操作", "requires_user": True,
+                "summary": "模型与规则对页面阶段判断不一致，已暂停导航和填写，仅允许重新观察。",
+                "rationale": draft.stage_conflict_evidence or "阶段证据不足，需重新观察",
+                "stage_conflict": True, "observed_stage": draft.observed_stage,
+                "stage_conflict_evidence": draft.stage_conflict_evidence,
+                "risk_level": "low", "model_status": "model",
+            })
         if draft.next_action not in allowed:
             # Reject the narrative as well as the action: do not display a
             # misleading 'auto-fill now' label for a blocked verification step.
             return fallback
         action = draft.next_action if draft.next_action in allowed else fallback.next_action
+        candidate = _navigation_choice(workflow, action) if action in {"browse_jobs", "search_jobs", "open_job"} else None
+        if action in {"browse_jobs", "search_jobs", "open_job"} and (
+                not candidate or draft.candidate_id and draft.candidate_id != candidate.id):
+            return fallback
         requires_user = action in {
             "wait_for_registration", "wait_for_login", "wait_for_verification",
             "review_before_submit", "stop",
@@ -210,6 +291,7 @@ async def decide_application_step(workflow: ApplicationWorkflowState,
         return draft.model_copy(update={
             "stage": workflow.stage,
             "next_action": action,
+            "candidate_id": candidate.id if candidate else "",
             "next_label": draft.next_label or fallback.next_label,
             "can_execute": action in SAFE_EXECUTABLE_ACTIONS,
             "requires_user": requires_user,
