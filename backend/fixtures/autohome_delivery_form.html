@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>汽车之家表单结构匿名回归</title>
+  <!-- Structure observed in recruit-delivery.html?pid=47900 and Select2's
+       public JS/CSS. Anonymous labels/options only; no remote scripts or
+       executable account, upload, save or delivery handlers.
+
+       Expected: 13 logical controls, including 5 logical Select2 selects.
+       Each native select and following combobox wrapper represent ONE field.
+       All inputs/selects with datatype (and no ignore="ignore") are required.
+       Two education records share their section but own separate dates.
+       agreechk is a user-only truthfulness attestation. The div.save is final
+       submission UI and never an editable field or safe continuation.
+  -->
+  <style>
+    body { font: 16px sans-serif; }
+    .delivery_card, .icard { padding: 16px; margin: 12px; border: 1px solid #aaa; }
+    .row { display: flex; gap: 24px; padding: 12px; }
+    .col { width: 360px; }
+    .labeltag { display: flex; gap: 4px; }
+    .requireTag, .requiretag { color: red; }
+    .select2-container { display: inline-block; position: relative; vertical-align: middle; }
+    .select2-selection--single { display: block; height: 28px; width: 240px; border: 1px solid #aaa; }
+    .select2-hidden-accessible {
+      border: 0 !important; clip: rect(0 0 0 0) !important;
+      clip-path: inset(50%) !important; height: 1px !important;
+      overflow: hidden !important; padding: 0 !important;
+      position: absolute !important; width: 1px !important;
+      white-space: nowrap !important;
+    }
+  </style>
+</head>
+<body>
+  <header><div id="header"><nav>汽车之家 招聘职位 校园招聘 关于我们 联系我们</nav></div></header>
+  <div class="body"><div class="card">
+    <div class="delivery_card">
+      <div class="title"><span class="requiretag">*</span><span>您是如何得知此次校园招聘信息的</span></div>
+      <div class="personDevCard">
+        <div style="float:left;margin-right:8px">
+          <select id="knowType" class="select2-hidden-accessible" tabindex="-1" aria-hidden="true"
+              data-bind="options:knowTypes, value:knowType, select2:{minimumResultsForSearch:-1}" datatype="*" nullmsg="请选择">
+            <option disabled selected value="">请选择</option><option value="fixture-source">示例来源类型</option>
+          </select>
+          <span class="select2 select2-container"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" aria-haspopup="true" aria-expanded="false" tabindex="0" aria-labelledby="select2-knowType-container"><span class="select2-selection__rendered" id="select2-knowType-container" title="请选择">请选择</span><span class="select2-selection__arrow" role="presentation"><b role="presentation"></b></span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>
+        </div>
+        <div style="float:left">
+          <select class="select2-hidden-accessible" tabindex="-1" aria-hidden="true"
+              data-bind="options:knowSources, value:knowSource, select2:{minimumResultsForSearch:-1}" datatype="*" nullmsg="请选择">
+            <option disabled selected value="">请选择</option><option value="fixture-detail">示例来源详情</option>
+          </select>
+          <span class="select2 select2-container"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" aria-haspopup="true" aria-expanded="false" tabindex="0" aria-labelledby="select2-source-container"><span class="select2-selection__rendered" id="select2-source-container">请选择</span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>
+        </div>
+        <div style="clear:both"></div>
+      </div>
+    </div>
+    <div class="delivery_card">
+      <div class="title"><span class="requiretag">*</span><span>简历附件</span><span class="tip">（请先上传简历，再完善个人信息）</span></div>
+      <div class="jlcard"><div class="jlbox2" id="jlbox"><div class="uploadbox"><div class="input-box">
+        <input type="file" id="uploadFile" name="inputFile" class="inputfile">
+        <!-- The official template really spells this inputFlie; do not rely on it. -->
+        <label for="inputFlie" id="uploadFileLabel">点击上传</label>
+      </div></div></div></div>
+    </div>
+    <div class="delivery_card">
+      <div class="title">完善个人信息</div>
+      <div class="icards"><form class="validform">
+        <div class="icard">
+          <div class="title">基本信息</div>
+          <div class="content">
+            <div class="row">
+              <div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">姓名</div></div><div class="control"><input placeholder="请输入姓名" type="text" data-bind="value:resumeDetail().Name" datatype="*" nullmsg="【基本信息】请输入姓名"></div></div>
+              <div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">邮箱</div></div><div class="control"><input placeholder="请输入邮箱" type="text" data-bind="value:resumeDetail().Email" datatype="e" nullmsg="【基本信息】请输入邮箱"></div></div>
+            </div>
+            <div class="row"><div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">性别</div></div><div class="control">
+              <select class="select2-hidden-accessible" tabindex="-1" aria-hidden="true" datatype="*" nullmsg="【基本信息】请选择性别" data-bind="value:resumeDetail().Sex,select2:{minimumResultsForSearch:-1}"><option disabled selected value="">请选择</option><option>男</option><option>女</option></select>
+              <span class="select2 select2-container"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" aria-expanded="false" tabindex="0" aria-labelledby="select2-sex-container"><span class="select2-selection__rendered" id="select2-sex-container">请选择</span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>
+            </div></div></div>
+          </div>
+        </div>
+        <div class="icard">
+          <div class="title"><div>教育经历</div></div>
+          <div class="content">
+            <div class="contentFirstRow"><div class="numtxt"><div class="num">教育经历-1</div><div class="tip">（请从本科学历开始填写）</div></div></div>
+            <div data-bind="template:{name:'eduTemplate',foreach:resumeDetail().EducationInfo,as:'edut'}">
+              <div class="numtxt" style="display:none"><div class="num">教育经历-1</div></div>
+              <div class="row">
+                <div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">开始时间</div></div><div class="control"><input type="text" data-bind="value:StartDate" placeholder="请输入开始时间" datatype="*" nullmsg="【教育经历】请输入开始时间"></div></div>
+                <div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">结束时间</div></div><div class="control"><input type="text" data-bind="value:EndDate" placeholder="请输入结束时间" datatype="*" nullmsg="【教育经历】请输入结束时间"></div></div>
+              </div>
+              <div class="row"><div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">学历</div></div><div class="control">
+                <select class="select2-hidden-accessible" tabindex="-1" aria-hidden="true" datatype="*" nullmsg="【教育经历】请选择学历" data-bind="value:edut.Education,select2:{minimumResultsForSearch:-1}"><option disabled selected value="">请选择</option><option>本科</option><option>硕士</option></select>
+                <span class="select2 select2-container"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" aria-expanded="false" tabindex="0" aria-labelledby="select2-edu1-container"><span class="select2-selection__rendered" id="select2-edu1-container">请选择</span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>
+              </div></div></div>
+              <div class="option"><div class="del">删除教育经历</div><div class="add">增加教育经历</div></div><div class="splitline"></div>
+              <div class="numtxt"><div class="num">教育经历-2</div><div class="tip">（请从本科学历开始填写）</div></div>
+              <div class="row">
+                <div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">开始时间</div></div><div class="control"><input type="text" data-bind="value:StartDate" placeholder="请输入开始时间" datatype="*" nullmsg="【教育经历】请输入开始时间"></div></div>
+                <div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">结束时间</div></div><div class="control"><input type="text" data-bind="value:EndDate" placeholder="请输入结束时间" datatype="*" nullmsg="【教育经历】请输入结束时间"></div></div>
+              </div>
+              <div class="row"><div class="col"><div class="labeltag"><div class="requireTag">*</div><div class="label">学历</div></div><div class="control">
+                <select class="select2-hidden-accessible" tabindex="-1" aria-hidden="true" datatype="*" nullmsg="【教育经历】请选择学历" data-bind="value:edut.Education,select2:{minimumResultsForSearch:-1}"><option disabled selected value="">请选择</option><option>本科</option><option>硕士</option></select>
+                <span class="select2 select2-container"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" aria-expanded="false" tabindex="0" aria-labelledby="select2-edu2-container"><span class="select2-selection__rendered" id="select2-edu2-container">请选择</span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>
+              </div></div></div>
+              <div class="option"><div class="del">删除教育经历</div><div class="add">增加教育经历</div></div>
+            </div>
+          </div>
+        </div>
+      </form></div>
+      <div class="scard fixbottom">
+        <div><input type="checkbox" class="chk" id="agreechk"><div class="txt">我承诺所填简历真实可信，并对由于提供虚假信息而引发的结果承担相应的法律责任，如有虚假，责任自负。</div></div>
+        <div><div class="save">提交简历</div><div class="cancel">取消</div></div>
+      </div>
+    </div>
+  </div></div>
+</body>
+</html>

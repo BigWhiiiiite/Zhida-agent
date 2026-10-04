@@ -37,6 +37,7 @@ class Project(BaseModel):
     end_date: str = ""
     background: str = ""
     description: str = ""
+    responsibilities: str = ""
     achievements: list[str] = Field(default_factory=list)
     technologies: list[str] = Field(default_factory=list)
     project_url: str = ""
@@ -77,6 +78,8 @@ class ApplicationAnswerMemory(BaseModel):
     option_fingerprint: str = ""
     value: str
     source_host: str = ""
+    resume_id: str = ""
+    company_scope: str = ""
     confirmed_count: int = Field(default=1, ge=1)
     updated_at: datetime
 
@@ -134,6 +137,7 @@ class CandidateProfile(ResumeProfile):
 
 
 class ApplicationAnswerUpdate(BaseModel):
+    resume_id: str = Field(default="", max_length=200)
     question: str = Field(min_length=1, max_length=500)
     field_name: str = Field(default="", max_length=500)
     value: str = Field(min_length=1, max_length=5000)

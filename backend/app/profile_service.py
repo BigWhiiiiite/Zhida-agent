@@ -32,12 +32,14 @@ SEMANTIC_PROFILE_FIELDS = {
     "candidate.nationality": "nationality", "candidate.ethnicity": "ethnicity",
     "candidate.political_status": "political_status", "candidate.marital_status": "marital_status",
     "candidate.hukou_location": "hukou_location", "candidate.address": "address",
+    "candidate.hometown": "hometown",
     "candidate.current_location": "location", "candidate.campus_type": "campus_candidate_type",
     "candidate.skills": "skills", "candidate.languages": "languages",
     "preference.work_location": "target_cities",
     "preference.business_group": "preferred_business_groups",
     "preference.interview_location": "interview_preferences",
     "preference.relocation": "willing_to_relocate",
+    "preference.available_date": "available_date",
 }
 
 NON_REUSABLE_ANSWER_HINTS = (
@@ -45,6 +47,7 @@ NON_REUSABLE_ANSWER_HINTS = (
     "sponsorship", "salary", "compensation", "gender", "sex", "race", "ethnicity", "disability",
     "veteran", "referral", "available", "availability", "work permit", "right to work",
     "同意", "隐私", "条款", "声明", "工作许可", "签证", "担保", "薪资", "薪酬", "性别",
+    "承诺", "法律责任", "attestation", "certify",
     "种族", "族裔", "残障", "退伍", "内推", "政治面貌", "户口", "婚姻", "身份证",
     "到岗", "可入职",
     "身份证", "证件号码", "证件号", "护照号码", "护照号", "实名认证", "national id", "id number", "passport number",
@@ -67,6 +70,7 @@ def _answer_profile_field(question: str, field_name: str) -> str:
         (("政治面貌", "political status", "political affiliation"), "political_status"),
         (("婚姻状况", "marital status"), "marital_status"),
         (("户籍所在地", "户口所在地", "户籍地", "hukou"), "hukou_location"),
+        (("籍贯", "祖籍", "native place", "ancestral hometown"), "hometown"),
         (("通讯地址", "联系地址", "mailing address"), "address"),
         (("current location", "current city", "当前所在地", "当前所处地", "现居地", "居住地"), "location"),
         (("preferred location", "preferred city", "work city", "期望工作城市", "期望城市", "意向城市"), "target_cities"),
@@ -82,7 +86,7 @@ def _answer_profile_field(question: str, field_name: str) -> str:
 def save_application_answer(question: str, field_name: str, value: str, *, semantic_key: str = "",
                             entity_scope: str = "", field_signature: str = "",
                             field_type: str = "text", options: list[str] | None = None,
-                            source_url: str = ""):
+                            source_url: str = "", resume_id: str = ""):
     """Persist an explicit reusable answer without learning legal/sensitive decisions."""
     cleaned_question = re.sub(r"\s+", " ", question).strip().strip("*✱ ")
     cleaned_value = value.strip()
@@ -95,9 +99,21 @@ def save_application_answer(question: str, field_name: str, value: str, *, seman
     if not cleaned_question or not cleaned_value:
         raise ValueError("问题和答案不能为空")
     current = ResumeProfile.model_validate(get_profile().model_dump())
-    direct_field = SEMANTIC_PROFILE_FIELDS.get(semantic_key) or _answer_profile_field(cleaned_question, field_name)
-    if direct_field:
-        if direct_field == "age":
+    from .application_knowledge import company_scope
+    from .storage import get_resume
+    if resume_id and not get_resume(resume_id):
+        raise ValueError("选择的简历不存在或不属于当前用户")
+    scope = company_scope(source_url) if source_url else ""
+    direct_field = ('' if semantic_key.startswith('language.') else
+                    SEMANTIC_PROFILE_FIELDS.get(semantic_key) or _answer_profile_field(cleaned_question, field_name))
+    identity_fields = {"name", "english_name", "age", "birth_date", "phone", "email", "qq", "wechat",
+                       "location", "hometown", "address", "country_region", "nationality", "website", "github", "linkedin"}
+    if direct_field and (not resume_id or direct_field in identity_fields):
+        if direct_field == "hometown":
+            from .region_facts import merge_confirmed_hometown
+
+            current.hometown = merge_confirmed_hometown(current.hometown, cleaned_value, cleaned_question)
+        elif direct_field == "age":
             age_text = re.sub(r"(?:周岁|岁)$", "", cleaned_value).strip()
             if not age_text.isdecimal() or not 0 <= int(age_text) <= 120:
                 raise ValueError("年龄请填写 0 到 120 之间的整数周岁")
@@ -107,7 +123,7 @@ def save_application_answer(question: str, field_name: str, value: str, *, seman
             setattr(current, direct_field, values)
         else:
             setattr(current, direct_field, cleaned_value)
-    elif not semantic_key.startswith(("education.", "experience.", "project.")):
+    elif not resume_id and not scope and not semantic_key.startswith(("education.", "experience.", "project.")):
         current.application_answers[cleaned_question] = cleaned_value
     normalized_question = normalize_text(cleaned_question)
     fingerprint = option_fingerprint(options or [])
@@ -116,7 +132,8 @@ def save_application_answer(question: str, field_name: str, value: str, *, seman
     ))
     now = datetime.now(timezone.utc)
     existing = next((item for item in current.application_answer_memory
-                     if (item.field_signature or "|".join((
+                     if item.resume_id == resume_id and item.company_scope == scope
+                     and (item.field_signature or "|".join((
                          item.semantic_key, item.entity_scope, item.normalized_question,
                          item.field_type, item.option_fingerprint,
                      ))) == memory_key), None)
@@ -139,6 +156,7 @@ def save_application_answer(question: str, field_name: str, value: str, *, seman
             semantic_key=semantic_key, entity_scope=entity_scope,
             field_signature=field_signature.strip(), field_type=field_type,
             option_fingerprint=fingerprint, value=cleaned_value, source_host=source_host,
+            resume_id=resume_id, company_scope=scope,
             updated_at=now,
         ))
     current.application_answer_memory = sorted(

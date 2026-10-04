@@ -49,10 +49,10 @@ def run() -> None:
             # Creating a new task cannot close another in-progress session.
             with patch.object(main.browser_demo, "session_id", SESSION):
                 restored = client.get("/api/browser/current").json()
-                assert restored == {"session_id": SESSION, "occupied": True}
+                assert restored == {"session_id": SESSION, "occupied": True, "resume_id": ""}
                 with patch.dict(main.browser_session_owners, {SESSION: "some-other-user"}):
                     hidden = client.get("/api/browser/current").json()
-                    assert hidden == {"session_id": None, "occupied": True}
+                    assert hidden == {"session_id": None, "occupied": True, "resume_id": ""}
                 blocked = client.post("/api/browser/start", json={"url": URL})
                 assert blocked.status_code == 409, blocked.text
                 assert start.await_count == 1

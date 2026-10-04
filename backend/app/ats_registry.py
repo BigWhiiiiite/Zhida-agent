@@ -25,10 +25,12 @@ COMMON_OPTIONS = (
     '[role="option"]', 'option', '.ant-select-item-option', '.arco-select-option',
     '.el-select-dropdown__item', '.ivu-select-item', '.semi-select-option',
     '[class*="select-option"]', '[class*="dropdown-item"]',
+    '.select2-results__option[role="treeitem"]',
 )
 COMMON_POPUPS = (
     '[role="listbox"]', '.ant-select-dropdown', '.arco-select-popup',
     '.el-select-dropdown', '.ivu-select-dropdown', '.semi-select-option-list',
+    '.select2-results',
 )
 COMMON_TOOLS = ("observe_page", "map_profile", "fill_text", "select_native",
                 "select_scoped_options", "check_choice", "upload_resume", "verify_fields",
@@ -47,6 +49,7 @@ class ATSPolicy:
     control_selectors: tuple[str, ...] = ()
     option_selectors: tuple[str, ...] = ()
     popup_selectors: tuple[str, ...] = ()
+    radio_selectors: tuple[str, ...] = ()
     load_delay_ms: int = 500
     option_wait_ms: int = 900
 
@@ -56,6 +59,7 @@ class ATSPolicy:
                 "label_selectors": list(self.label_selectors),
                 "section_selectors": list(self.section_selectors),
                 "control_selectors": list(self.control_selectors),
+                "radio_selectors": list(self.radio_selectors),
                 "load_delay_ms": self.load_delay_ms}
 
     @property
@@ -95,8 +99,10 @@ POLICIES = (
         question_containers=(".beisen-form-item", ".ant-form-item", ".el-form-item", "[class*='form-item']", "[class*='formItem']"),
         label_selectors=(".beisen-form-label", ".ant-form-item-label", ".el-form-item__label", "[class*='form-label']", "[class*='field-label']"),
         section_selectors=("[class*='section-title']", "[class*='module-title']"),
-        control_selectors=(".beisen-select",),
-        option_selectors=(".beisen-select-option",), popup_selectors=(".beisen-select-dropdown",),
+        control_selectors=(".beisen-select", ".phoenix-select"),
+        option_selectors=(".beisen-select-option", ".phoenix-selectList__listItem", ".area-item-name"),
+        popup_selectors=(".beisen-select-dropdown", ".phoenix-selectList__list", ".area-data-container"),
+        radio_selectors=(".phoenix-radio",),
         load_delay_ms=1400, option_wait_ms=1800,
     ),
     ATSPolicy("lever", "Lever 招聘", ("lever.co",)),

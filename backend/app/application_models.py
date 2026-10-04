@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr
 
-from .browser_models import (ApplicationTarget, NavigationCandidate, BrowserSnapshot,
+from .browser_models import (ApplicationAssistResult, ApplicationTarget, NavigationCandidate, BrowserSnapshot,
                              ExecutionResult, FormReviewResult, PreSubmitCheck)
 from .ats_registry import SiteRoute
 
@@ -39,6 +39,7 @@ class ApplicationWorkflowState(BaseModel):
     job_title: str = ""
     job_id: str = ""
     authenticated: bool = False
+    entry_confirmation_required: bool = False
     authentication_evidence: list[str] = Field(default_factory=list)
     authentication_methods: list[str] = Field(default_factory=list)
     requires_consent: bool = False
@@ -56,6 +57,9 @@ class ApplicationWorkflowState(BaseModel):
     navigation_candidates: list[NavigationCandidate] = Field(default_factory=list)
     navigation_blocker: str = ""
     stage_evidence: list[str] = Field(default_factory=list)
+    # Untrusted public page text gives the planner context beyond search boxes.
+    # Never store passwords, OTPs or the body of a filled application form here.
+    page_evidence: str = ""
 
 
 class WorkflowAdvanceRequest(BaseModel):
@@ -139,5 +143,27 @@ class ApplicationAgentTurn(BaseModel):
     action_taken: AgentNextAction | Literal[""] = ""
     review: FormReviewResult | None = None
     execution: ExecutionResult | None = None
+    assistance: ApplicationAssistResult | None = None
     pre_submit: PreSubmitCheck | None = None
     checkpoint: ApplicationAgentCheckpoint
+
+
+class ApplicationJourneyRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    resume_id: str = Field(min_length=1, max_length=200)
+    max_steps: int = Field(default=4, ge=1, le=6)
+
+
+class ApplicationJourneyEvent(BaseModel):
+    action: str
+    stage: ApplicationStage
+    message: str
+
+
+class ApplicationJourneyResult(BaseModel):
+    status: Literal["waiting_login", "waiting_registration", "waiting_verification", "needs_user",
+                    "ready_for_review", "blocked", "partial"]
+    message: str
+    turn: ApplicationAgentTurn
+    steps: int = 0
+    events: list[ApplicationJourneyEvent] = Field(default_factory=list)

@@ -1,4 +1,6 @@
 import type { ApplicationTarget, ChatConversation, ChatConversationSummary, ApplicationAgentTurn, ApplicationKnowledgeInput, ApplicationKnowledgeRecord, KnowledgeMappingTarget, ApplicationQueueItem, ApplicationReadiness, ApplicationWorkflowState, AuthSession, AutofillPhaseResult, BrowserSnapshot, CandidateProfile, CompanySize, Conflict, DiscoveryAdapter, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobDiscoveryResult, JobEvidenceExplanation, JobVerification, ModelHealth, NativeResumeImportResult, OfficialJobSource, PreSubmitCheck, QueueStatus, RecommendationBatch, ResumeProfile, ResumeRecord, SmartJobSearchResult, UserAccount } from './types'
+import type {ApplicationAssistRequest, ApplicationAssistResult, ApplicationJourneyResult, ConfirmedResumeFact, ResumeFactTargets} from './types'
+import {resumeAttachmentRequest} from './resumeAttachment'
 
 export const API = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/api`
 const nativeFetch=window.fetch.bind(window)
@@ -26,7 +28,7 @@ export const api={
   saveApplicationKnowledge:(payload:ApplicationKnowledgeInput)=>fetch(`${API}/application-knowledge`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ApplicationKnowledgeRecord>),
   deleteApplicationKnowledge:(id:string)=>fetch(`${API}/application-knowledge/${encodeURIComponent(id)}`,{method:'DELETE'}).then(result<void>),
   saveProfile:(profile:ResumeProfile)=>fetch(`${API}/profile`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(profile)}).then(result<CandidateProfile>),
-  saveApplicationAnswer:(question:string,field_name:string,value:string,metadata:Partial<{semantic_key:string;entity_scope:string;field_signature:string;field_type:string;options:string[];source_url:string}>={})=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value,...metadata})}).then(result<CandidateProfile>),
+  saveApplicationAnswer:(question:string,field_name:string,value:string,metadata:Partial<{semantic_key:string;entity_scope:string;field_signature:string;field_type:string;options:string[];source_url:string;resume_id:string}>={})=>fetch(`${API}/profile/application-answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,field_name,value,...metadata})}).then(result<CandidateProfile>),
   recommendations:(location='')=>fetch(`${API}/jobs/recommendations${location?`?location=${encodeURIComponent(location)}`:''}`).then(result<RecommendationBatch>),
   ragRecommendations:(payload:{location:string;query:string;company_sizes:CompanySize[]})=>fetch(`${API}/jobs/recommendations/rag`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<RecommendationBatch>),
   explainJob:(id:string)=>fetch(`${API}/jobs/${encodeURIComponent(id)}/explain`,{method:'POST'}).then(result<JobEvidenceExplanation>),
@@ -43,6 +45,8 @@ export const api={
   updateQueuedJob:(id:string,patch:{status?:QueueStatus;notes?:string;application_id?:string;candidate_confirmed?:boolean})=>fetch(`${API}/jobs/queue/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(result<ApplicationQueueItem>),
   removeQueuedJob:(id:string)=>fetch(`${API}/jobs/queue/${id}`,{method:'DELETE'}).then(result<void>),
   list:()=>fetch(`${API}/resumes`).then(result<ResumeRecord[]>),
+  resumeFactTargets:(id:string)=>fetch(`${API}/resumes/${encodeURIComponent(id)}/fact-targets`).then(result<ResumeFactTargets>),
+  confirmResumeFact:(id:string,payload:ConfirmedResumeFact)=>fetch(`${API}/resumes/${encodeURIComponent(id)}/confirmed-fact`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ResumeRecord>),
   upload:(file:File)=>{const data=new FormData();data.append('file',file);return fetch(`${API}/resumes`,{method:'POST',body:data}).then(result<ResumeRecord>)},
   saveResume:(id:string,patch:Partial<ResumeRecord>)=>fetch(`${API}/resumes/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(result<ResumeRecord>),
   deleteResume:(id:string)=>fetch(`${API}/resumes/${id}`,{method:'DELETE'}).then(result<void>),
@@ -56,15 +60,17 @@ export const api={
   chatConversation:(id:string)=>fetch(`${API}/chat/conversations/${encodeURIComponent(id)}`).then(result<ChatConversation>),
   saveChatDraft:(id:string,draft:{company:string;job_title:string;city:string;recruitment_cycle:string;url:string;intent:'apply'|'recommend'|'profile'|'clarify'})=>fetch(`${API}/chat/conversations/${encodeURIComponent(id)}/draft`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(draft)}).then(result<ChatConversation>),
   sendChatMessage:(id:string,text:string,image:File|null,consent:boolean)=>{const data=new FormData();data.append('text',text);data.append('model_consent',String(consent));if(image)data.append('image',image);return fetch(`${API}/chat/conversations/${encodeURIComponent(id)}/messages`,{method:'POST',body:data}).then(result<ChatConversation>)},
-  startBrowser:(url:string,target?:ApplicationTarget)=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,target})}).then(result<BrowserSnapshot>),
-  currentBrowser:()=>fetch(`${API}/browser/current`).then(result<{session_id:string|null;occupied:boolean}>),
+  startBrowser:(url:string,target?:ApplicationTarget,resume_id='')=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,target,resume_id})}).then(result<BrowserSnapshot>),
+  currentBrowser:()=>fetch(`${API}/browser/current`).then(result<{session_id:string|null;occupied:boolean;resume_id:string;assistance_version?:number;journey_version?:number;record_completion_version?:number}>),
   browserSnapshot:(id:string)=>fetch(`${API}/browser/${id}/snapshot`).then(result<BrowserSnapshot>),
-  expandBrowserSection:(id:string,selector:string)=>fetch(`${API}/browser/${id}/expand`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector})}).then(result<BrowserSnapshot>),
+  selectTaskResume:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/resume`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id})}).then(result<{resume_id:string;context_token:string}>),
+  expandBrowserSection:(id:string,selector:string,candidate_id='')=>fetch(`${API}/browser/${id}/expand`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector,candidate_id})}).then(result<BrowserSnapshot>),
   inspectBrowserField:(id:string,selector:string)=>fetch(`${API}/browser/${id}/field/inspect`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector})}).then(result<FormReviewResult>),
-  importResumeWithSite:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/native-resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id})}).then(result<NativeResumeImportResult>),
+  importResumeWithSite:(id:string,resume_id:string,confirm_site_parse=false)=>fetch(`${API}/browser/${id}/native-resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id,confirm_site_parse})}).then(result<NativeResumeImportResult>),
   workflowState:(id:string)=>fetch(`${API}/browser/${id}/workflow`).then(result<ApplicationWorkflowState>),
   assessApplicationAgent:(id:string)=>fetch(`${API}/browser/${id}/agent/assess`,{method:'POST'}).then(result<ApplicationAgentTurn>),
   runApplicationAgentStep:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/agent/step`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id})}).then(result<ApplicationAgentTurn>),
+  runApplicationJourney:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/journey`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id,max_steps:4})}).then(result<ApplicationJourneyResult>),
   advanceWorkflow:(id:string,intent:'browse_jobs'|'search_jobs'|'open_job'|'start_application'|'create_account'|'continue_application'|'refresh',candidate_id?:string)=>fetch(`${API}/browser/${id}/workflow/advance`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({intent,candidate_id})}).then(result<ApplicationWorkflowState>),
   fillRegistration:(id:string,email:string,phone:string,password:string)=>fetch(`${API}/browser/${id}/workflow/registration`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,phone,password})}).then(result<ApplicationWorkflowState>),
   requestVerificationCode:(id:string,channel:'phone'|'email',value='')=>fetch(`${API}/browser/${id}/workflow/request-code`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel,value})}).then(result<ApplicationWorkflowState>),
@@ -72,7 +78,9 @@ export const api={
   planForm:(id:string)=>fetch(`${API}/browser/${id}/plan`,{method:'POST'}).then(result<FormPlan>),
   reviewForm:(id:string,useModel=false)=>fetch(`${API}/browser/${id}/review${useModel?'?use_model=true':''}`,{method:'POST'}).then(result<FormReviewResult>),
   autofillPhase:(id:string,phase:'rules'|'model')=>fetch(`${API}/browser/${id}/autofill`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phase})}).then(result<AutofillPhaseResult>),
-  executeForm:(id:string,actions:FillAction[],resume_id:string)=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actions,min_confidence:.85,resume_id})}).then(result<ExecutionResult>),
+  assistApplication:(id:string,payload:ApplicationAssistRequest)=>fetch(`${API}/browser/${id}/assist`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ApplicationAssistResult>),
+  executeForm:(id:string,actions:FillAction[],resume_id:string,context_token='')=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actions,min_confidence:.85,resume_id,context_token})}).then(result<ExecutionResult>),
+  uploadResumeAttachment:(id:string,resumeId:string,contextToken:string,confirmed=false)=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(resumeAttachmentRequest(resumeId,contextToken,confirmed))}).then(result<ExecutionResult>),
   checkForm:(id:string)=>fetch(`${API}/browser/${id}/check`).then(result<PreSubmitCheck>),
   closeBrowser:(id:string)=>fetch(`${API}/browser/${id}`,{method:'DELETE'}).then(result<void>),
 }

@@ -107,6 +107,15 @@ def initialize() -> None:
             "error_message": "TEXT NOT NULL DEFAULT ''", "user_id": "TEXT NOT NULL DEFAULT ''",
         })
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS confirmed_resume_facts (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, resume_id TEXT NOT NULL,
+                section TEXT NOT NULL, record_key TEXT NOT NULL, attribute TEXT NOT NULL,
+                audit_json TEXT NOT NULL, created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_confirmed_resume_facts_owner
+                        ON confirmed_resume_facts(user_id, resume_id, created_at)""")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS candidate_profiles (
                 id TEXT PRIMARY KEY, profile_json TEXT NOT NULL,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -232,7 +241,7 @@ def create_user_account(email: str, display_name: str, password_hash: str) -> sq
                          (LOCAL_USER_ID, claimable_profile["id"]))
             conn.execute("UPDATE candidate_profiles SET user_id=? WHERE id=?",
                          (user_id, claimable_profile["id"]))
-            for table in ("resumes", "conflicts", "application_queue", "job_sources"):
+            for table in ("resumes", "conflicts", "application_queue", "job_sources", "confirmed_resume_facts"):
                 conn.execute(f"UPDATE {table} SET user_id=? WHERE user_id IN ('', ?)",
                              (user_id, LOCAL_USER_ID))
         else:
@@ -261,7 +270,7 @@ def activate_local_user() -> None:
                     (id, user_id, profile_json, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?)""",
                     (LOCAL_USER_ID, LOCAL_USER_ID, ResumeProfile().model_dump_json(), now, now))
-        for table in ("resumes", "conflicts", "application_queue", "job_sources"):
+        for table in ("resumes", "conflicts", "application_queue", "job_sources", "confirmed_resume_facts"):
             conn.execute(f"UPDATE {table} SET user_id=? WHERE user_id=''", (LOCAL_USER_ID,))
 
 
@@ -398,6 +407,53 @@ def update_resume(resume_id: str, **changes: Any) -> ResumeRecord | None:
     return get_resume(resume_id)
 
 
+def update_confirmed_resume_fact(resume_id: str, request: Any) -> ResumeRecord:
+    """Tenant-scoped compare-and-swap for one explicitly confirmed CV fact.
+
+    Resolve identities under the same write transaction as the update. Never
+    accept caller-provided record indexes, raw paths or whole-profile patches.
+    """
+    from .confirmed_facts import ConfirmedFactRequest, FactRevisionConflict, prepare_confirmed_fact, resume_revision
+    payload = ConfirmedFactRequest.model_validate(request)
+    user_id = current_user_id()
+    with _connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM resumes WHERE id=? AND user_id=?", (resume_id, user_id)).fetchone()
+        if not row:
+            raise LookupError("简历不存在")
+        resume = _record(row)
+        profile, evidence, audit = prepare_confirmed_fact(resume, payload)
+        now = _now()
+        updated = conn.execute("""UPDATE resumes SET profile_json=?, evidence_json=?, updated_at=?
+            WHERE id=? AND user_id=? AND updated_at=? AND profile_json=? AND evidence_json=?""",
+            (profile.model_dump_json(), json.dumps([item.model_dump(mode="json") for item in evidence], ensure_ascii=False),
+             now, resume_id, user_id, row["updated_at"], row["profile_json"], row["evidence_json"]))
+        if updated.rowcount != 1:
+            raise FactRevisionConflict("简历已发生变化，请刷新后重新确认，旧记录不会被覆盖")
+        saved = conn.execute("SELECT * FROM resumes WHERE id=? AND user_id=?", (resume_id, user_id)).fetchone()
+        assert saved is not None
+        result = _record(saved)
+        audit["new_revision"] = resume_revision(result)
+        conn.execute("""INSERT INTO confirmed_resume_facts
+            (id, user_id, resume_id, section, record_key, attribute, audit_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid4()), user_id, resume_id, audit["section"], audit["record_key"], audit["attribute"],
+             json.dumps(audit, ensure_ascii=False), now))
+    return result
+
+
+def confirmed_resume_fact_history(resume_id: str) -> list[dict[str, Any]]:
+    """Internal audit read with ownership checked in the query, including deletion."""
+    user_id = current_user_id()
+    with _connection() as conn:
+        rows = conn.execute("""SELECT facts.id, facts.created_at, facts.audit_json
+            FROM confirmed_resume_facts AS facts JOIN resumes ON resumes.id=facts.resume_id
+            AND resumes.user_id=facts.user_id
+            WHERE facts.resume_id=? AND facts.user_id=? ORDER BY facts.created_at, facts.id""",
+            (resume_id, user_id)).fetchall()
+    return [{"id": row["id"], "created_at": row["created_at"], **json.loads(row["audit_json"])} for row in rows]
+
+
 def replace_parse_result(resume_id: str, profile: ResumeProfile, parser: str,
                          evidence: list[FieldEvidence], raw_text: str) -> ResumeRecord | None:
     user_id = current_user_id()
@@ -432,6 +488,7 @@ def delete_resume(resume_id: str) -> str | None:
         return None
     with _connection() as conn:
         conn.execute("DELETE FROM conflicts WHERE resume_id=? AND user_id=?", (resume_id, user_id))
+        conn.execute("DELETE FROM confirmed_resume_facts WHERE resume_id=? AND user_id=?", (resume_id, user_id))
         conn.execute("DELETE FROM resumes WHERE id=? AND user_id=?", (resume_id, user_id))
     return row["stored_filename"]
 

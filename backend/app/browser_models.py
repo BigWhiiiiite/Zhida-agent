@@ -27,14 +27,21 @@ class BrowserStart(BaseModel):
     model_config = {"extra": "forbid"}
     url: str = Field(min_length=1, max_length=2000)
     target: ApplicationTarget | None = None
+    resume_id: str = Field(default="", max_length=200)
+
+
+class TaskResumeUpdate(BaseModel):
+    resume_id: str = Field(default="", max_length=200)
 
 
 class ExpandSectionRequest(BaseModel):
     selector: str = Field(min_length=1, max_length=1000)
+    candidate_id: str = Field(default="", max_length=100)
 
 
 class NativeResumeImportRequest(BaseModel):
     resume_id: str = Field(min_length=1, max_length=200)
+    confirm_site_parse: bool = False
 
 
 class PageField(BaseModel):
@@ -71,10 +78,15 @@ class PageField(BaseModel):
     field_signature: str = ""
     signature_rank: int = 0
     container_key: str = ""
+    record_keys: list[str] = Field(default_factory=list)
     # All options belonging to one radio/checkbox question share this DOM-derived key.
     # It prevents option captions such as “是” and “否” from becoming separate questions.
     control_group_key: str = ""
     expected_input: str = ""
+    date_precision: Literal["", "date", "month"] = ""
+    # Proven from this control's own opened area menu, never label guessing.
+    region_picker: bool = False
+    region_value_path: str = ""
     recognition_evidence: str = ""
     # Server-derived knowledge references, never personal values or executable instructions.
     knowledge_profile_path: str = ""
@@ -139,6 +151,8 @@ class FormRoutingSummary(BaseModel):
 
 
 class FormPlan(BaseModel):
+    context_token: str = ""
+    resume_id: str = ""
     page_summary: str = ""
     site_type: str = "generic"
     actions: list[FillAction] = Field(default_factory=list)
@@ -188,9 +202,12 @@ class NativeResumeImportResult(BaseModel):
 
 
 class ExecutePlanRequest(BaseModel):
+    context_token: str = ""
     actions: list[FillAction]
     min_confidence: float = Field(default=0.85, ge=0, le=1)
     resume_id: str = ""
+    # Binding the task CV is not permission to re-upload it on every edit.
+    upload_resume: bool = False
 
 
 class ActionResult(BaseModel):
@@ -240,3 +257,49 @@ class HybridAutofillResult(BaseModel):
     phase: Literal["rules", "model"]
     review: FormReviewResult
     execution: ExecutionResult
+
+
+class ApplicationAssistRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    resume_id: str = Field(min_length=1, max_length=200)
+    allow_site_parse: bool = False
+    use_model: bool = True
+    max_rounds: int = Field(default=3, ge=1, le=5)
+    # Explicit per-run deferrals; never a value or a replacement for required checks.
+    defer_government_id: bool = False
+    deferred_fields: list[PageField] = Field(default_factory=list, max_length=50)
+
+
+class ApplicationRecordCoverage(BaseModel):
+    kind: Literal["education", "internships", "projects"]
+    label: str
+    source_total: int
+    website_records: int
+    matched_records: int
+    missing_names: list[str] = Field(default_factory=list)
+    ambiguous: bool = False
+    can_expand: bool = False
+
+
+class ApplicationAssistIssue(BaseModel):
+    label: str
+    message: str
+
+
+class ApplicationAssistEvent(BaseModel):
+    kind: str
+    message: str
+    completed: int = 0
+    failed: int = 0
+    issues: list[ApplicationAssistIssue] = Field(default_factory=list)
+
+
+class ApplicationAssistResult(BaseModel):
+    status: Literal["ready_for_review", "needs_user", "blocked", "partial"]
+    message: str
+    snapshot: BrowserSnapshot
+    review: FormReviewResult | None = None
+    pre_submit: PreSubmitCheck | None = None
+    events: list[ApplicationAssistEvent] = Field(default_factory=list)
+    rounds: int = 0
+    record_coverage: list[ApplicationRecordCoverage] = Field(default_factory=list)

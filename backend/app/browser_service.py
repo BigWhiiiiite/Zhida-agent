@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
+import mimetypes
 import os
 import re
 import socket
+import time
 import unicodedata
 from pathlib import Path
+from typing import Awaitable, Callable
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -25,16 +29,36 @@ from .browser_models import (ActionResult, BrowserSnapshot, ExecutePlanRequest, 
                              NativeResumeImportResult, PageField, PreSubmitCheck, RequiredFieldIssue)
 from .field_semantics import enrich_fields
 from .job_navigation import execute_navigation, choose_candidate, workflow_fingerprint
+from .target_identity import target_identity_blocker
+from .autohome_fields import refine_autohome_fields
+from .autohome_sections import discover_autohome_sections, expand_autohome_section
+from .phoenix_sections import discover_phoenix_sections, expand_phoenix_section, inspect_phoenix_sections
+from .autohome_attachment import (inspect_autohome_attachment,
+                                 confirm_autohome_resume_parse)
+from .recognition_diagnostics import inspect_recognition_structure, inspect_component_shapes
+from .phoenix_fields import refine_phoenix_fields, CHOICE_STATE_JS, PHOENIX_SELECT_VALUE_JS
+from .phoenix_calendar import (calendar_ids, calendar_for, calendar_precision,
+                               select_calendar_date)
+from .phoenix_region import select_region, read_open_region_path, audited_region_path
+from .region_facts import region_values_match
 
 
 SENSITIVE_FIELD_HINTS = {
     "authorization", "authorized", "sponsorship", "sponsor", "visa", "salary", "compensation",
     "gender", "sex", "race", "ethnicity", "disability", "veteran", "consent", "agree", "agreement",
     "privacy", "terms", "legal", "work permit", "right to work",
-    "性别", "薪资", "期望薪资", "签证", "担保", "工作许可", "残障", "退伍", "族裔", "种族", "同意", "隐私", "条款", "法律声明",
+    "性别", "薪资", "期望薪资", "签证", "担保", "工作许可", "残障", "退伍", "族裔", "种族", "同意", "隐私", "条款", "法律声明", "承诺", "声明",
     "身份证", "证件号码", "证件号", "护照号码", "护照号", "实名认证", "national id", "id number", "passport number",
     "emergency contact", "next of kin", "guardian", "referee", "recommender",
     "紧急联系人", "紧急联络人", "家属联系人", "监护人", "推荐人", "证明人",
+}
+
+# Legal acknowledgement is not a profile fact. Even a forged/old
+# user_confirmed flag must not turn it into an automated browser action.
+LEGAL_ACKNOWLEDGEMENT_HINTS = {
+    "承诺", "声明", "真实可信", "真实性", "我保证", "法律责任", "协议", "条款", "隐私",
+    "consent", "privacy", "terms", "legal", "declaration", "attest", "certify",
+    "acknowledge", "undertaking",
 }
 
 MANUAL_CONFIRM_FIELD_HINTS = {
@@ -65,6 +89,37 @@ SAFE_RESUME_PARSE_LABEL = re.compile(
     r"使用简历填写|一键填充|自动填充)(?:并填充|并导入)?$",
     re.I,
 )
+
+# Read only native question ownership, never values/options or arbitrary form
+# text. A label wrapping a select must not change identity as choices hydrate.
+NATIVE_WRITE_IDENTITIES = r"""selectors => Object.fromEntries(selectors.map(selector => {
+  const matches = document.querySelectorAll(selector), el = matches[0];
+  if (matches.length !== 1 || !el.matches('input,textarea,select') ||
+      el.getAttribute('role') === 'combobox') return [selector, null];
+  const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+  const caption = node => {
+    if (!node || node === el || el.contains(node)) return '';
+    const copy = node.cloneNode(true);
+    copy.querySelectorAll('input,textarea,select,button,[role="combobox"],[role="listbox"],[role="option"]')
+      .forEach(control => control.remove());
+    return clean(copy.textContent);
+  };
+  const labelledBy = clean(el.getAttribute('aria-labelledby'));
+  const container = el.closest('[data-zhida-container]');
+  const section = el.closest('fieldset,section,[role="group"]');
+  return [selector, {
+    tag: el.tagName, type: el.getAttribute('type') || '', name: el.getAttribute('name') || '',
+    role: el.getAttribute('role') || '', binding: el.getAttribute('data-bind') || '',
+    label: [...(el.labels || [])].map(caption), ariaLabel: el.getAttribute('aria-label') || '',
+    labelledBy, labelledText: labelledBy.split(' ').filter(Boolean).map(id => caption(document.getElementById(id))),
+    container: container?.getAttribute('data-zhida-container') || '',
+    section: section ? [section.tagName, section.id, caption(section.querySelector('legend,h1,h2,h3,h4,[role="heading"]'))] : [],
+  }];
+}))"""
+
+
+class _ExecutionTargetChanged(ValueError):
+    """An observed target change must stop the batch, not skip one action."""
 
 
 def _normalized_option(value: str) -> str:
@@ -340,6 +395,7 @@ class BrowserDemoService:
         self.session_id: str | None = None
         self.target = ApplicationTarget()
         self._stalled_navigation: set[str] = set()
+        self._option_probe_shapes: dict[str, list[dict]] = {}
 
     @staticmethod
     def profile_directory(user_id: str) -> Path:
@@ -424,6 +480,10 @@ class BrowserDemoService:
     async def workflow_state(self, session_id: str) -> ApplicationWorkflowState:
         page = self._require(session_id)
         state = await inspect_application_page(page, session_id, self.target)
+        conflict = target_identity_blocker(state)
+        if conflict:
+            state.navigation_blocker = conflict
+            return state
         if any(key.startswith(workflow_fingerprint(state) + "|") for key in self._stalled_navigation):
             state.navigation_blocker = "上一次导航未观察到页面进展，已停止重复操作。请更换真实候选或手动导航后重新识别。"
         return state
@@ -432,6 +492,8 @@ class BrowserDemoService:
                                request: WorkflowAdvanceRequest) -> ApplicationWorkflowState:
         page = self._require(session_id)
         before = await self.workflow_state(session_id)
+        if before.navigation_blocker and request.intent not in {"refresh", "browse_jobs", "search_jobs", "open_job"}:
+            raise ValueError(before.navigation_blocker)
         candidate = None
         if request.intent in {"browse_jobs", "search_jobs", "open_job"}:
             if before.stage not in {"homepage", "job_list", "unknown"}:
@@ -448,7 +510,7 @@ class BrowserDemoService:
         elif request.intent == "start_application":
             if before.stage != "job_detail":
                 raise ValueError("只能从明确识别的岗位详情页进入申请，不能在首页或预览页点击投递")
-            await start_application(page)
+            await start_application(page, self.target)
         elif request.intent == "create_account":
             await create_account(page)
         elif request.intent == "continue_application":
@@ -471,6 +533,18 @@ class BrowserDemoService:
             if pages:
                 self.page = page = pages[-1]
         after = await self.workflow_state(session_id)
+        # Search/navigation results may arrive after the control's event. Wait
+        # briefly for observable state, without clicking/typing a second time.
+        # Input text alone is not evidence of progress; keep the stalled guard.
+        if candidate:
+            deadline = time.monotonic() + 4
+            while workflow_fingerprint(before) == workflow_fingerprint(after) and time.monotonic() < deadline:
+                await asyncio.sleep(0.35)
+                if self.context:
+                    pages = [item for item in self.context.pages if not item.is_closed()]
+                    if pages:
+                        self.page = pages[-1]
+                after = await self.workflow_state(session_id)
         if request.intent != "refresh" and workflow_fingerprint(before) == workflow_fingerprint(after):
             self._stalled_navigation.add(operation)
             raise ValueError("已尝试操作，但未观察到网址、阶段、岗位或候选列表变化；未确认流程前进，已停止自动重复")
@@ -507,7 +581,7 @@ class BrowserDemoService:
         await request_verification_code(page, request.channel, value)
         return await inspect_application_page(page, session_id, self.target)
 
-    async def snapshot(self) -> BrowserSnapshot:
+    async def snapshot(self, *, probe_options: bool = True) -> BrowserSnapshot:
         if not self.page or not self.session_id:
             raise LookupError("浏览器会话尚未启动")
         site_route = await route_for_page(self.page)
@@ -519,7 +593,7 @@ class BrowserDemoService:
           const labelText = node => {
             if (!node) return '';
             const clone = node.cloneNode(true);
-            clone.querySelectorAll('input, select, textarea, option, button, [role="option"], [role="radio"], [role="checkbox"]').forEach(item => item.remove());
+            clone.querySelectorAll('input, select, textarea, option, button, script, style, svg, [hidden], [aria-hidden="true"], [role="option"], [role="radio"], [role="checkbox"]').forEach(item => item.remove());
             return clean(clone.innerText || clone.textContent);
           };
           const normalizeFieldText = value => clean(value).replace(/[＊*]+\s*$/g, '').trim();
@@ -571,8 +645,43 @@ class BrowserDemoService:
             '[class*="cascader-picker"]', '[class*="picker-input"]'
           ].join(', ');
           const customSelector = '[role="combobox"], [aria-haspopup="listbox"], ' + customWrapperSelector;
-          const controlSelector = 'input, select, textarea, [role="radio"], [role="checkbox"], [role="combobox"], [aria-haspopup="listbox"]';
-          const fieldContainer = el => el.closest([
+          const radioSelector = ['input[type="radio"]', '[role="radio"]', ...(profile?.radio_selectors || [])].join(', ');
+          const controlSelector = 'input, select, textarea, [role="checkbox"], [role="combobox"], [aria-haspopup="listbox"], ' + radioSelector;
+          const rendered = el => {
+            if (!el || el.closest('[hidden], [aria-hidden="true"]')) return false;
+            for (let node = el; node && node !== document; node = node.parentElement) {
+              const style = getComputedStyle(node);
+              if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility)) return false;
+            }
+            return el.getClientRects().length > 0;
+          };
+          // Deeply wrapped controls often have no label[for]. Find the smallest
+          // owner with exactly one logical control and its own distinct caption.
+          // A placeholder, dropdown option, sibling question or section heading
+          // is never promoted to a verified question merely by proximity.
+          const ownedQuestion = el => {
+            const excluded = /^(?:请输入|请填写|请选择|选择|select|choose|男|女|是|否|至今|上传文件|个人信息|教育经历|实习经历|项目经历|语言能力|证书|技能|获奖情况|简历附件)[.\\s…:：*＊]*$/i;
+            let node = el.parentElement;
+            for (let depth = 0; node && depth < 14 && node !== document.body; depth += 1, node = node.parentElement) {
+              if (node.matches('header, nav, [role="navigation"], [role="search"]')) return null;
+              const logical = [...new Set([...node.querySelectorAll(controlSelector + ', ' + customSelector)]
+                .filter(item => item.type !== 'hidden' && !item.disabled && rendered(canonical(item)))
+                .map(canonical))];
+              if (logical.length !== 1 || logical[0] !== canonical(el)) continue;
+              const captions = [...node.children].filter(child => child !== el && !child.contains(el) &&
+                !child.querySelector(controlSelector + ', ' + customSelector) && rendered(child))
+                .map(child => ({node: child, text: normalizeFieldText(labelText(child))}))
+                .filter(item => meaningfulFieldText(item.text) && item.text.length <= 220 && !excluded.test(item.text));
+              const distinct = [...new Map(captions.map(item => [normalizedToken(item.text), item])).values()];
+              if (distinct.length !== 1) continue;
+              const caption = distinct[0];
+              if (!caption.node.matches('label, legend, [class*="label" i], [class*="caption" i], [class*="title" i]') &&
+                  !caption.node.querySelector('label, legend, [class*="label" i], [class*="caption" i], [class*="title" i]')) continue;
+              return {node, caption: caption.text};
+            }
+            return null;
+          };
+          const fieldContainer = el => el.closest('.form-item.form-item--phoenix') || el.closest([
             ...(profile?.question_containers || []),
             '.application-question', '.application-additional', 'fieldset', '[role="radiogroup"]', '[role="group"]',
             '.form-field', '.field', '.ant-form-item', '.arco-form-item', '.el-form-item',
@@ -581,6 +690,8 @@ class BrowserDemoService:
             '[data-qa*="question"]', '[data-field]'
           ].join(', '));
           const semanticContainer = el => {
+            const owned = ownedQuestion(el);
+            if (owned) return owned.node;
             const known = fieldContainer(el);
             if (known) return known;
             let node = el.parentElement;
@@ -610,7 +721,12 @@ class BrowserDemoService:
             }
             return semantic;
           };
-          const inputFor = el => el.matches('input, select, textarea') ? el : el.querySelector('input, select, textarea');
+          const select2Input = el => {
+            const wrapper = el.closest('.select2-container');
+            const native = wrapper?.previousElementSibling;
+            return native?.matches('select.select2-hidden-accessible') ? native : null;
+          };
+          const inputFor = el => select2Input(el) || (el.matches('input, select, textarea') ? el : el.querySelector('input, select, textarea'));
           const labelledBy = el => clean((el.getAttribute('aria-labelledby') || '').split(/\\s+/)
             .map(id => document.getElementById(id)?.innerText || '').join(' '));
           const nearbyLabel = el => {
@@ -713,7 +829,7 @@ class BrowserDemoService:
             return [...new Set([...described, ...nearby])].join(' / ').slice(0, 500);
           };
           const choiceSelectorFor = fieldType => fieldType === 'radio'
-            ? 'input[type="radio"], [role="radio"]'
+            ? radioSelector
             : 'input[type="checkbox"], [role="checkbox"]';
           const visibleChoices = (root, fieldType) => [...(root?.querySelectorAll(choiceSelectorFor(fieldType)) || [])]
             .filter(item => !item.disabled && (item.getClientRects().length || item.closest('label')?.getClientRects().length || item.parentElement?.getClientRects().length));
@@ -731,7 +847,7 @@ class BrowserDemoService:
                 .filter(item => !item.disabled);
               if (named.length) return named;
             }
-            const declared = el.closest(fieldType === 'radio' ? '[role="radiogroup"]' : '[role="group"]');
+            const declared = el.closest(fieldType === 'radio' ? '.phoenix-radio-group, [role="radiogroup"]' : '[role="group"]');
             const declaredMembers = visibleChoices(declared, fieldType);
             if (declaredMembers.length >= 2) return declaredMembers;
             let node = el.parentElement;
@@ -795,6 +911,7 @@ class BrowserDemoService:
               '[class*="question-title"]', '[data-testid*="question"]'
             ].join(', ');
             const candidates = [
+              {text: el.closest('.form-item.form-item--phoenix')?.querySelector(':scope > .form-item__title')?.innerText, source:'container-owned'},
               {text: labelledBy(group), source: 'aria-labelledby'},
               {text: group?.getAttribute('aria-label'), source: 'aria'},
               ...[...(group?.querySelectorAll(questionSelector) || [])]
@@ -847,6 +964,7 @@ class BrowserDemoService:
             if (choiceInfo?.question) {
               return {text: clean(choiceInfo.question), source: choiceInfo.source || 'nearby', confidence: .96};
             }
+            const owned = ownedQuestion(el);
             // ATS components often use a div instead of label[for]. Treat it
             // as owned only when this question container has exactly one
             // logical control and one distinct label belonging to that same
@@ -879,7 +997,7 @@ class BrowserDemoService:
               {text: labelText(explicit), source: 'explicit'},
               {text: labelText(wrapping), source: 'explicit'},
               {text: labelledBy(target) || labelledBy(el), source: 'aria-labelledby'},
-              {text: ownedContainerLabel(), source: 'container-owned'},
+              {text: owned?.caption || ownedContainerLabel(), source: 'container-owned'},
               {text: groupLabel || nearbyLabel(el), source: 'nearby'},
               {text: precedingLabel(el), source: 'preceding'},
               ...nearbyLabelCandidates(el).map(text => ({text, source: 'nearby'})),
@@ -893,7 +1011,8 @@ class BrowserDemoService:
               candidates.unshift({text: groupLabel, source: 'nearby'});
             }
             const candidate = bestFieldText(candidates, choiceInfo?.options || []);
-            const confidence = Math.max(.1, Math.min(.99, (candidate.score + 20) / 85));
+            const confidence = candidate.source === 'container-owned' ? .96 :
+              Math.max(.1, Math.min(.99, (candidate.score + 20) / 85));
             return {text: candidate.text, source: candidate.source, confidence};
           };
           const groupLabelFor = (el, choiceInfo) => {
@@ -915,9 +1034,15 @@ class BrowserDemoService:
             return clean(heading?.innerText);
           };
           const candidates = [...document.querySelectorAll(
-            'input, select, textarea, [role="radio"], [role="checkbox"], ' + customSelector
+            controlSelector + ', ' + customSelector
           )];
           const canonical = el => {
+            // Select2's hidden native select is 1px, not display:none. It and
+            // the adjacent visible combobox are one logical control.
+            if (el.matches('select.select2-hidden-accessible') && el.nextElementSibling?.matches('.select2-container')) {
+              const widget = el.nextElementSibling.querySelector('[role="combobox"]');
+              if (widget) return widget;
+            }
             const wrapper = el.closest(customWrapperSelector);
             if (wrapper) return wrapper;
             if (el.matches(customSelector)) return el;
@@ -937,7 +1062,15 @@ class BrowserDemoService:
               const optionInput = ['radio', 'checkbox'].includes(type) || ['radio', 'checkbox'].includes(role);
               if (!customSelect && !optionInput && ['hidden','submit','button','image','reset','password'].includes(type)) return false;
               const optionVisible = optionInput && (el.closest('label')?.getClientRects().length || el.parentElement?.getClientRects().length);
-              return !el.disabled && (type === 'file' || el.getClientRects().length > 0 || optionVisible);
+              const target = inputFor(el) || el;
+              if (el.closest('.phoenix-date-picker, .phoenix-selectList__list')) return false;
+              const search = /^(?:搜索职位关键词|搜索職位關鍵詞|搜索岗位|search for job keywords)$/i.test(clean(target.getAttribute('placeholder'))) || type === 'search';
+              if (search && (el.closest('header, nav, [role="search"], [role="navigation"]') ||
+                  (!fieldContainer(el) && !ownedQuestion(el)))) return false;
+              if (target.tagName === 'TEXTAREA' && target.readOnly && !target.labels?.length &&
+                  !fieldContainer(el) && !ownedQuestion(el)) return false;
+              return !el.disabled && !target.disabled && !el.closest('[hidden],[aria-hidden="true"]') &&
+                (type === 'file' || rendered(el) || (optionVisible && rendered(el.parentElement)));
             });
           let containerSequence = 0;
           const fields = elements.map((el, index) => {
@@ -947,7 +1080,7 @@ class BrowserDemoService:
             const input = inputFor(el);
             const role = (el.getAttribute('role') || '').toLowerCase();
             const customSelect = role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox' || el.matches(customSelector);
-            const fieldType = customSelect ? 'combobox' : (['radio', 'checkbox'].includes(role) ? role : (el.type || el.tagName).toLowerCase());
+            const fieldType = customSelect ? 'combobox' : (el.matches(radioSelector) ? 'radio' : (role === 'checkbox' ? role : (el.type || el.tagName).toLowerCase()));
             const choiceInfo = choiceGroupInfoFor(el, fieldType);
             const labelInfo = labelInfoFor(el, fieldType, choiceInfo);
             const label = labelInfo.text.slice(0, 500);
@@ -959,24 +1092,26 @@ class BrowserDemoService:
             if (entityContainer && containerMarker) entityContainer.setAttribute('data-zhida-container', containerMarker);
             const context = clean(choiceInfo?.question || contextFor(el)).slice(0, 600);
             const placeholderText = clean(input?.getAttribute('placeholder') || el.getAttribute('placeholder')).slice(0, 300);
-            let options = el.tagName === 'SELECT' ? [...el.options].filter(o => !o.disabled && !o.parentElement?.disabled).map(o => clean(o.text)).filter(value => value && !placeholder(value)) : [];
+            let options = input?.tagName === 'SELECT' ? [...input.options].filter(o => !o.disabled && !o.parentElement?.disabled).map(o => clean(o.text)).filter(value => value && !placeholder(value)) : [];
             if (['radio', 'checkbox'].includes(fieldType)) {
               options = choiceInfo?.options || [];
             }
             // Custom options are read through the same scoped tool used by execution.
             const selectedItems = customSelect ? [...el.querySelectorAll('[class*="selection-item"], [class*="selected-value"], [class*="selected-item"]')]
               .map(item => clean(item.innerText || item.textContent)).filter(value => value && !placeholder(value)) : [];
-            const customValue = selectedItems.join(', ') || clean(el.getAttribute('aria-valuetext') || el.querySelector('input')?.value || el.innerText);
+            const phoenixContent = el.matches('.phoenix-select') ? el.querySelector('.phoenix-select__content') : null;
+            const customValue = phoenixContent ? clean(phoenixContent.innerText) :
+              selectedItems.join(', ') || clean(el.getAttribute('aria-valuetext') || el.querySelector('input')?.value || el.innerText);
             return {
               selector: `[data-zhida-field="${marker}"]`, label, question_text: label,
               label_source: labelInfo.source, recognition_confidence: labelInfo.confidence || 0,
               context, help_text: helpTextFor(el), nearby_labels: nearbyLabels,
               section_path: sectionPath, placeholder: placeholderText, ordinal: index + 1,
               name: el.getAttribute('name') || el.querySelector('input')?.getAttribute('name') || el.getAttribute('id') || '', field_type: fieldType,
-              required: el.required || el.querySelector('input')?.required || el.getAttribute('aria-required') === 'true' ||
+              required: el.required || input?.required || el.getAttribute('aria-required') === 'true' ||
                 choiceInfo?.group?.getAttribute('aria-required') === 'true' || choiceInfo?.members.some(item => item.required) || /[*✱]/.test(label), options,
               current_value: el.type === 'file' ? [...(el.files || [])].map(file => file.name).join(', ') :
-                (el.tagName === 'SELECT' ? [...el.selectedOptions]
+                (input?.tagName === 'SELECT' ? [...input.selectedOptions]
                   .map(option => clean(option.textContent || option.value)).filter(value => value && !placeholder(value)).join(', ') :
                 (['checkbox','radio'].includes(fieldType) ? String(el.checked ?? el.getAttribute('aria-checked') === 'true') :
                   clean(el.value || (customSelect ? customValue : '')))),
@@ -1033,24 +1168,82 @@ class BrowserDemoService:
         """, recognition_profile)
         # Component libraries often render options only after the combobox opens.
         # Opening a list is read-only and lets the review UI present the real choices.
+        self._option_probe_shapes = {}
         for item in data:
-            if item.get("field_type") != "combobox" or item.get("options"):
+            locator = self.page.locator(item["selector"]).first
+            if policy.name == "beisen-italent" and item.get("field_type") == "combobox":
+                item["region_picker"] = await locator.get_attribute("data-zhida-region-picker") == "true"
+                if item['region_picker']:
+                    item['region_value_path'] = await audited_region_path(locator, item.get('current_value', ''))
+                    if item['region_value_path']:
+                        # Do not reopen a known reset-on-open tree and destroy
+                        # its transient operation evidence. Later user input or
+                        # value/question changes invalidate the audit.
+                        item['options'] = []
+                        continue
+                item["date_precision"] = await locator.get_attribute("data-zhida-date-precision") or ""
+                if item["date_precision"]:
+                    item["options"] = []
+                    item["help_text"] = "网页使用日历输入，填写真实日期后核验外层控件的已选值"
+                    continue
+            if not probe_options or item.get("field_type") != "combobox" or item.get("options"):
                 continue
             try:
-                locator = self.page.locator(item["selector"]).first
+                if policy.name == "beisen-italent":
+                    await self._dismiss_options(locator, policy)
+                calendars_before = await calendar_ids(self.page) if policy.name == "beisen-italent" else set()
                 before_open = await visible_popup_ids(self.page, policy)
                 already_open = await scoped_option_entries(self.page, locator, policy)
                 if already_open:
                     entries = already_open
                 else:
                     await locator.click(timeout=1800)
+                    if policy.name == "beisen-italent":
+                        await self.page.wait_for_timeout(150)
+                        panel = await calendar_for(locator, self.page, calendars_before)
+                        precision = await calendar_precision(panel)
+                        if precision:
+                            await locator.evaluate("(el, value) => el.dataset.zhidaDatePrecision = value", precision)
+                            item["date_precision"] = precision
+                            item["help_text"] = "网页日历要求" + ("年月日" if precision == "date" else "年月") + "；不会用日历单格作为完整日期"
+                            item["options"] = []
+                            self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
+                            await self._dismiss_options(locator, policy)
+                            continue
                     entries = await self._wait_for_options(locator, policy, before_open)
                 item["options"] = list(dict.fromkeys(text for text, _ in entries))
-                await self.page.keyboard.press("Escape")
+                if policy.name == "beisen-italent" and entries and any([
+                        await option.evaluate("el=>el.matches('.area-item-name')") for _, option in entries]):
+                    item["region_picker"] = True
+                    await locator.evaluate("el=>el.dataset.zhidaRegionPicker='true'")
+                    item['region_value_path'] = await read_open_region_path(
+                        self.page, locator, entries, item.get('current_value', ''))
+                    self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
+                if policy.name == "beisen-italent" and not entries:
+                    self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
+                await self._dismiss_options(locator, policy)
             except Exception:
                 item["options"] = item.get("options", [])
         _finalize_field_metadata(data)
         _finalize_choice_metadata(data)
+        if policy.name == "beisen-italent":
+            data = await refine_phoenix_fields(self.page, data)
+        data = await refine_autohome_fields(self.page, data)
+        attachment = await inspect_autohome_attachment(self.page)
+        for item in data:
+            if item.get("container_key") == "autohome:attachment" and attachment.get("attachment_present"):
+                item["current_value"] = attachment["attachment_label"]
+        for candidate in await discover_autohome_sections(self.page):
+            data.append({**candidate, "name": "autohome-section:" + candidate["id"],
+                         "question_text": candidate["label"], "label_source": "explicit",
+                         "recognition_confidence": .99, "context": candidate["section"],
+                         "current_value": "", "required": False})
+        for candidate in await discover_phoenix_sections(self.page):
+            data.append({**candidate, "name": "phoenix-section:" + candidate["id"],
+                         "question_text": candidate["label"], "label_source": "explicit",
+                         "recognition_confidence": .99, "context": candidate["section"],
+                         "current_value": "", "required": False})
+        _finalize_field_metadata(data)
         fields = enrich_fields([PageField.model_validate(item) for item in data], self.page.url)
         return BrowserSnapshot(
             session_id=self.session_id, url=self.page.url, title=await self.page.title(),
@@ -1060,6 +1253,123 @@ class BrowserDemoService:
     async def snapshot_for(self, session_id: str) -> BrowserSnapshot:
         self._require(session_id)
         return await self.snapshot()
+
+    async def recognition_diagnostics(self, session_id: str) -> dict:
+        result = await inspect_recognition_structure(self._require(session_id))
+        result["option_probe_shapes"] = self._option_probe_shapes
+        return result
+
+    async def settled_snapshot(self, session_id: str) -> BrowserSnapshot:
+        """Observe a bounded, stable form without navigating or writing values.
+
+        Stability only means that the observed structure/options stopped
+        changing, not that an unknown ATS has rendered every possible field.
+        The known Autohome template additionally requires a rendered school
+        record; its stable first shell contains personal fields but is partial.
+        """
+        page = self._require(session_id)
+        initial_url = page.url
+        deadline = time.monotonic() + 5.0
+        previous = None
+        parsed = urlparse(initial_url)
+        autohome = (parsed.scheme == "https" and parsed.netloc.casefold() in {
+            "talent.autohome.com.cn", "talent.autohome.com.cn:443"
+        } and parsed.path == "/recruit-delivery.html")
+
+        async def bounded(awaitable):
+            # wait_for also bounds a slow snapshot/ATS inspector, not only the
+            # polling sleeps. No network request, reload or click retry follows.
+            try:
+                return await asyncio.wait_for(awaitable, timeout=max(.001, deadline - time.monotonic()))
+            except asyncio.TimeoutError as exc:
+                raise ValueError("申请表仍在加载或选项尚未稳定，请稍后重试；本次未执行填写") from exc
+
+        for attempt in range(8):
+            state = await bounded(self.workflow_state(session_id))
+            snapshot = await bounded(self.snapshot(probe_options=False))
+            latest_state = await bounded(self.workflow_state(session_id))
+            # A changed URL or a login/verification page belongs to the caller's
+            # stage gate, never to the previous form's fill plan. Clear fields
+            # on navigation because a snapshot could straddle two documents.
+            if (page.url != initial_url or snapshot.url != initial_url or state.url != initial_url
+                    or latest_state.url != initial_url):
+                snapshot.fields = []
+                return snapshot
+            if latest_state.stage not in {"profile_form", "application_form", "review", "unknown"}:
+                return snapshot
+            fields = [field for field in snapshot.fields if field.field_type != "section-button"]
+            personal = any(field.semantic_key.startswith((
+                "candidate.", "education.", "experience.", "project.",
+            )) for field in fields)
+            ready = personal and bool(fields)
+            if autohome:
+                rendered = await bounded(page.evaluate(r"""() => {
+                  const roots = [...document.querySelectorAll('form.validform div[data-bind]')]
+                    .filter(el => /name\s*:\s*['\"]eduTemplate['\"]/.test(el.getAttribute('data-bind') || ''));
+                  if (roots.length !== 1) return false;
+                  return [...roots[0].querySelectorAll('input[data-bind]')].some(el =>
+                    /(?:^|,)\s*value\s*:\s*School\s*(?:,|$)/.test(el.getAttribute('data-bind') || '') &&
+                    el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden' && !el.disabled);
+                }"""))
+                ready = ready and rendered and any(
+                    field.container_key.startswith("autohome:education:") and
+                    field.semantic_key == "education.school" for field in fields)
+            signature = (latest_state.stage, tuple(
+                (field.field_type, field.name, field.question_text, field.label, field.required,
+                 tuple(field.options), field.semantic_key, field.entity_scope, field.container_key)
+                for field in snapshot.fields
+            ))
+            if ready and signature == previous:
+                # Menu discovery is an active, bounded preview after structural
+                # stability. It must not consume the 5-second loading detector
+                # and falsely classify a rendered multi-select form as loading.
+                try:
+                    enriched = await asyncio.wait_for(self.snapshot(), timeout=45)
+                except asyncio.TimeoutError as exc:
+                    raise ValueError("表单已加载，但读取网页选项超时；已停止填写，请重新核对选项") from exc
+                if page.url != initial_url or enriched.url != initial_url:
+                    enriched.fields = []
+                else:
+                    def structure(sample):
+                        return tuple((f.selector, f.field_type, f.name, f.question_text, f.required,
+                                      f.section, f.container_key, f.entity_scope) for f in sample.fields)
+                    after_probe = await self.workflow_state(session_id)
+                    if after_probe.stage not in {"profile_form", "application_form", "review", "unknown"}:
+                        enriched.fields = []
+                    elif structure(snapshot) != structure(enriched):
+                        raise ValueError("读取选项时表单题目或记录归属已变化，已停止旧计划，请重新识别")
+                return enriched
+            previous = signature if ready else None
+            if attempt < 7:
+                await bounded(asyncio.sleep(.35))
+        raise ValueError("申请表关键栏目或选项尚未稳定，请稍后重试；本次未执行填写")
+
+    async def expandable_sections(self, session_id: str) -> list[dict]:
+        """Expose only site-proven, read-only expansion candidates.
+
+        Unknown ATS add buttons deliberately do not enter this automatic
+        contract. record_keys use exactly the same keys as snapshot metadata.
+        """
+        return [item for item in await self.record_inventory(session_id) if item["selector"]]
+
+    async def record_inventory(self, session_id: str) -> list[dict]:
+        page = self._require(session_id)
+        kinds = {"education": "education", "experience": "internships", "project": "projects"}
+        return [{
+            "id": item["id"], "selector": item["selector"],
+            "kind": kinds[item["semantic_section"]], "record_count": item["record_count"],
+            "container_key": item["container_key"], "record_keys": list(item["record_keys"]),
+            "label": item["label"],
+        } for item in [*await discover_autohome_sections(page), *await inspect_phoenix_sections(page)]
+            if item["semantic_section"] in kinds]
+
+    async def expand_missing_section(self, session_id: str, candidate: dict) -> BrowserSnapshot:
+        """Expand once from a fresh exact candidate, without guessing a record."""
+        current = next((item for item in await self.expandable_sections(session_id)
+                        if item["id"] == candidate.get("id")), None)
+        if not current or any(candidate.get(key) != value for key, value in current.items()):
+            raise ValueError("新增经历入口或记录数量已变化，请重新识别，避免重复增加")
+        return await self.expand_section(session_id, current["selector"], candidate_id=current["id"])
 
     async def inspect_field(self, session_id: str, selector: str) -> BrowserSnapshot:
         """Bring one collected field into view and retry read-only option discovery."""
@@ -1104,12 +1414,24 @@ class BrowserDemoService:
             pass
         return refreshed
 
-    async def expand_section(self, session_id: str, selector: str) -> BrowserSnapshot:
+    async def expand_section(self, session_id: str, selector: str, candidate_id: str = "") -> BrowserSnapshot:
         page = self._require(session_id)
         snapshot = await self.snapshot()
         field = next((item for item in snapshot.fields if item.selector == selector), None)
         if not field or field.field_type != "section-button":
             raise ValueError("这不是可以安全展开的资料栏目")
+        if field.name.startswith("autohome-section:"):
+            expected = field.name.removeprefix("autohome-section:")
+            if not candidate_id or candidate_id != expected:
+                raise ValueError("新增经历入口已变化，请重新识别后再增加，避免重复记录")
+            await expand_autohome_section(page, candidate_id)
+            return await self.snapshot()
+        if field.name.startswith("phoenix-section:"):
+            expected = field.name.removeprefix("phoenix-section:")
+            if not candidate_id or candidate_id != expected:
+                raise ValueError("新增经历入口已变化，请重新识别后再增加")
+            await expand_phoenix_section(page, candidate_id)
+            return await self.snapshot()
         text = f"{field.section} {field.group_label} {field.label}"
         if not re.search(r"技能|语言|教育|学历|经历|项目|证书|奖项|skill|language|education|experience|project|certificate|award", text, re.I):
             raise ValueError("只允许展开教育、经历、项目、技能、语言、证书或奖项栏目")
@@ -1121,16 +1443,22 @@ class BrowserDemoService:
         return await self.snapshot()
 
     async def import_resume_with_site_parser(self, session_id: str,
-                                             resume_path: Path) -> NativeResumeImportResult:
+                                             resume_path: Path, confirm_site_parse: bool = False) -> NativeResumeImportResult:
         """Upload a resume and let the ATS parser produce a first draft.
 
         Only narrowly named resume-parse/import controls may be clicked. Generic
         confirm/next/save/apply buttons remain a manual gate.
         """
         page = self._require(session_id)
-        if (await self.workflow_state(session_id)).stage in {"homepage", "job_list", "job_detail", "auth_required", "registration_required", "verification_required"}:
+        workflow = await self.workflow_state(session_id)
+        if workflow.navigation_blocker:
+            raise ValueError(workflow.navigation_blocker)
+        if workflow.stage in {"homepage", "job_list", "job_detail", "auth_required", "registration_required", "verification_required"}:
             raise ValueError("请先进入具体岗位的申请表，不能在招聘导航页上传简历")
         before = await self.snapshot()
+        attachment_before = await inspect_autohome_attachment(page)
+        if attachment_before.get("blocking_dialog"):
+            raise ValueError("招聘网页仍有待处理弹窗，请先完成或取消当前操作，再上传简历")
         resume_fields = [field for field in before.fields if field.field_type == "file" and (
             any(hint in f"{field.label} {field.name}".lower()
                 for hint in ("resume", "cv", "curriculum", "简历"))
@@ -1143,15 +1471,36 @@ class BrowserDemoService:
         uploaded = await upload.evaluate(
             "el => [...(el.files || [])].map(file => file.name).join(', ')"
         )
-        if resume_path.name not in uploaded:
+        if resume_path.name not in uploaded and not attachment_before.get("supported"):
             raise RuntimeError("简历已选择，但招聘网页没有保留该文件")
 
         await page.wait_for_timeout(1800)
+        attachment = await inspect_autohome_attachment(page, attachment_before)
+        if attachment.get("supported"):
+            for _ in range(240):
+                if attachment.get("error") or attachment.get("upload_verified"):
+                    break
+                await page.wait_for_timeout(500)
+                attachment = await inspect_autohome_attachment(page, attachment_before)
+            if attachment.get("error"):
+                raise ValueError("招聘网站拒绝简历上传：" + attachment["error"])
+            if not attachment.get("upload_verified"):
+                raise ValueError("等待120秒仍未观察到招聘网站接收新附件的证据，请先核对官网处理状态，不要立即重复上传")
+            if attachment.get("requires_parse_confirmation") and confirm_site_parse:
+                await confirm_autohome_resume_parse(page)
+                await page.wait_for_timeout(500)
         after = await self.snapshot()
         changed = _changed_field_count(before, after)
         trigger_clicked = False
         trigger_label = ""
-        if changed == 0:
+        if attachment.get("requires_parse_confirmation"):
+            if not confirm_site_parse:
+                return NativeResumeImportResult(snapshot=after, uploaded_file=resume_path.name,
+                    status="needs_user_action", changed_fields=changed,
+                    message="官网已接收附件，正等待确认是否用简历解析结果覆盖个人信息；尚未完成解析填写")
+            trigger_clicked = True
+            trigger_label = "是否变更个人信息？—确定（仅导入解析结果）"
+        if changed == 0 and not trigger_clicked:
             controls = page.locator('button, [role="button"], input[type="button"]')
             for index in range(min(await controls.count(), 200)):
                 control = controls.nth(index)
@@ -1259,7 +1608,7 @@ class BrowserDemoService:
               if (!filled) missing.push({selector: marker ? `[data-zhida-field="${marker}"]` : '', label, field_type: fieldType});
             }
           }
-          const validationErrors = [...document.querySelectorAll('[aria-invalid="true"], .error-message, .field-error, .application-error')]
+          const validationErrors = [...document.querySelectorAll('[aria-invalid="true"], .error-message, .field-error, .application-error, .Validform_wrong, #file-err-msg')]
             .filter(el => el.getClientRects().length > 0).map(el => clean(el.innerText)).filter(Boolean).slice(0, 30);
           const humanChallenges = [];
           const challengePresent = document.querySelector(
@@ -1284,9 +1633,48 @@ class BrowserDemoService:
         }
         """, policy.field_profile())
         missing_rows = data["required_missing"]
+        parsed = urlparse(page.url)
+        phoenix_form = policy.name == "beisen-italent" and await page.locator('.form-item.form-item--phoenix').count() > 0
+        if phoenix_form or (parsed.hostname == "talent.autohome.com.cn" and parsed.path == "/recruit-delivery.html"):
+            # Share the verified field metadata with planning; the legacy
+            # DOM check misses Validform datatype and counts Select2 twice.
+            observed = await self.snapshot(probe_options=False)
+            attachment = await inspect_autohome_attachment(page)
+            if attachment.get("attachment_present"):
+                data["file_uploads"] = [attachment["attachment_label"]]
+            if attachment.get("error"):
+                data["validation_errors"].append(attachment["error"])
+            if attachment.get("blocking_dialog"):
+                data["human_challenges"].append("官网仍有待处理弹窗，尚未完成核对")
+            def filled(item):
+                value = item.current_value.strip()
+                if item.field_type in {"checkbox", "radio"}:
+                    return value.lower() == "true"
+                return bool(value) and not re.fullmatch(r"请选择(?:一项)?|暂未选择", value)
+            logical_fields = []
+            grouped = set()
+            for item in observed.fields:
+                if item.field_type == "radio" and item.control_group_key:
+                    if item.control_group_key in grouped:
+                        continue
+                    grouped.add(item.control_group_key)
+                    members = [peer for peer in observed.fields if peer.field_type == "radio" and
+                               peer.control_group_key == item.control_group_key]
+                    item = item.model_copy(update={"required": any(peer.required for peer in members),
+                        "current_value": "true" if any(filled(peer) for peer in members) else "false"})
+                logical_fields.append(item)
+            missing_rows = [dict(selector=item.selector, label=item.question_text or item.label,
+                                 field_type=item.field_type) for item in logical_fields
+                            if item.required and not filled(item)]
+            data["required_total"] = sum(item.required for item in logical_fields)
+            data["filled_count"] = sum(filled(item) for item in logical_fields)
+            data["field_count"] = len(logical_fields)
         _finalize_field_metadata(missing_rows)
         missing = [RequiredFieldIssue.model_validate(item) for item in missing_rows]
         workflow = await self.workflow_state(session_id)
+        if (parsed.hostname == "talent.autohome.com.cn" and parsed.path == "/recruit-delivery.html"
+                and workflow.final_submit_present and "提交简历" not in data["submit_labels"]):
+            data["submit_labels"].append("提交简历")
         recognized_form = data["field_count"] > 0 and workflow.stage in {"profile_form", "application_form", "review"}
         return PreSubmitCheck(url=page.url, ready=recognized_form and not missing and not data["validation_errors"] and not data["human_challenges"],
                               required_total=data["required_total"], filled_count=data["filled_count"],
@@ -1327,28 +1715,76 @@ class BrowserDemoService:
                 await self.page.wait_for_timeout(100)
         return entries
 
+    async def _dismiss_options(self, control, policy) -> None:
+        await self.page.keyboard.press("Escape")
+        if policy.name != "beisen-italent":
+            return
+        # Phoenix does not consistently close a portalled menu on Escape.
+        # Click only this control's own noninteractive title (never another
+        # input, consent, navigation or submission control).
+        caption = await control.evaluate_handle("""el => {
+          const q=el.closest('.form-item.form-item--phoenix');
+          const title=q?.querySelector(':scope > .form-item__title');
+          return title&&!title.querySelector('input,select,textarea,button,a[href],[role="button"]')?title:null;
+        }""")
+        try:
+            node = caption.as_element()
+            if node:
+                # Deep Phoenix region panels can cover the owning caption.
+                # Dispatch only an outside-click to this verified, noninteractive
+                # caption; never force a coordinate click through the overlay.
+                await node.evaluate("""el=>{
+                  el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
+                  el.click();
+                }""")
+        finally:
+            await caption.dispose()
+
     async def _visible_option_entries(self, control):
         if not self.page:
             return []
         policy = policy_for((await route_for_page(self.page)).adapter)
         return await scoped_option_entries(self.page, control, policy)
 
-    async def _select_custom(self, field: PageField, values: list[str]) -> list[str]:
+    async def _select_custom(self, field: PageField, values: list[str], *,
+                             before_write: Callable[[], Awaitable[None]] | None = None) -> list[str]:
         selected: list[str] = []
         policy = policy_for((await route_for_page(self.page)).adapter)
+        if field.date_precision:
+            if policy.name != 'beisen-italent' or len(values) != 1:
+                raise ValueError("日期控件来源或目标不明确，已停止填写")
+            _, control = await self._resolve_field(field)
+            await self._dismiss_options(control, policy)
+            value = await select_calendar_date(self.page, control, values[0], field.date_precision, before_write)
+            await self._dismiss_options(control, policy)
+            return [value]
+        if field.region_picker and policy.name == 'beisen-italent':
+            if len(values) != 1:
+                raise ValueError('地区只能填写一个明确的行政区路径')
+            _, control = await self._resolve_field(field)
+            await self._dismiss_options(control, policy)
+            return await select_region(self.page, control, values[0], policy, _best_option, before_write)
         targets = values if field.multiple else values[:1]
         for wanted in targets:
             live_field, control = await self._resolve_field(field)
+            if before_write:
+                await before_write()
             await control.scroll_into_view_if_needed(timeout=3000)
+            if policy.name == "beisen-italent" and await control.evaluate("el=>el.matches('.phoenix-select')"):
+                await self._dismiss_options(control, policy)
             before_open = await visible_popup_ids(self.page, policy)
             entries = await scoped_option_entries(self.page, control, policy)
             if not entries:
+                if before_write:
+                    await before_write()
                 await control.click(timeout=8000)
                 entries = await self._wait_for_options(control, policy, before_open, wanted)
             match = _best_option(wanted, [text for text, _ in entries])
             if not match:
                 search = control if await control.evaluate("el => el.tagName === 'INPUT'") else control.locator("input").first
                 if await search.count() and await search.is_editable():
+                    if before_write:
+                        await before_write()
                     await search.fill(wanted)
                     entries = await self._wait_for_options(control, policy, before_open, wanted)
                     match = _best_option(wanted, [text for text, _ in entries])
@@ -1361,13 +1797,25 @@ class BrowserDemoService:
                 await self.page.keyboard.press("Escape")
                 raise ValueError(f"“{wanted}”对应多个网页选项，请在网页中核对层级后选择")
             option = matches[0]
-            await option.click(timeout=8000)
+            if before_write:
+                await before_write()
+            # In the observed region picker, clicking the row text enters the
+            # next geographic level. Its explicit radio icon commits that region.
+            radio_icon = option.locator('.icon-container.visible').filter(
+                has=self.page.locator('svg.area-icon-RadioUnchecked,svg.area-icon-RadioChecked'))
+            if (policy.name == 'beisen-italent'
+                    and await option.evaluate("el=>el.matches('.area-item-name')")
+                    and await radio_icon.count() == 1 and await radio_icon.is_visible()):
+                await radio_icon.click(timeout=8000)
+            else:
+                await option.click(timeout=8000)
             selected.append(match)
             await self.page.wait_for_timeout(250)
             field = live_field
         return selected
 
-    async def _select_native(self, field: PageField, values: list[str]) -> list[str]:
+    async def _select_native(self, field: PageField, values: list[str], *,
+                             before_write: Callable[[], Awaitable[None]] | None = None) -> list[str]:
         _, control = await self._resolve_field(field)
         options = await control.locator("option").evaluate_all(
             "items => items.filter(item => !item.disabled && !item.parentElement?.disabled).map(item => ({label: String(item.textContent || '').trim(), value: item.value}))"
@@ -1388,20 +1836,36 @@ class BrowserDemoService:
                 selected.append(selected_label)
                 continue
             raise ValueError(f"网页下拉选项中找不到“{wanted}”")
+        if before_write:
+            await before_write()
         await control.select_option(label=selected if field.multiple else selected[0], timeout=8000)
         return selected
 
     async def _read_field_value(self, field: PageField) -> str:
         live_field, control = await self._resolve_field(field)
         if live_field.field_type in {"checkbox", "radio"}:
-            checked = await control.evaluate(
-                "el => 'checked' in el ? Boolean(el.checked) : el.getAttribute('aria-checked') === 'true'"
-            )
-            return str(bool(checked)).lower()
+            return await control.evaluate(CHOICE_STATE_JS)
         if live_field.field_type in {"select-one", "select-multiple"}:
             selected = [item.strip() for item in await control.locator("option:checked").all_text_contents()]
             return ", ".join(item for item in selected if item) or await control.input_value()
         if live_field.field_type == "combobox":
+            if await control.evaluate("el=>el.matches('.phoenix-select')"):
+                actual = await control.evaluate(PHOENIX_SELECT_VALUE_JS)
+                if live_field.region_picker and actual:
+                    audit = await audited_region_path(control, actual)
+                    if audit:
+                        return audit
+                    policy = policy_for((await route_for_page(self.page)).adapter)
+                    await self._dismiss_options(control, policy)
+                    before = await visible_popup_ids(self.page, policy)
+                    await control.click(timeout=3000)
+                    entries = await self._wait_for_options(control, policy, before)
+                    try:
+                        path = await read_open_region_path(self.page, control, entries, actual)
+                        return path or actual
+                    finally:
+                        await self._dismiss_options(control, policy)
+                return actual
             return await control.evaluate("""el => {
               const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
               const selected = [...el.querySelectorAll('[class*="selection-item"], [class*="selected-value"], [class*="selected-item"]')]
@@ -1411,36 +1875,106 @@ class BrowserDemoService:
         return await control.input_value()
 
     async def execute(self, session_id: str, request: ExecutePlanRequest,
-                      resume_path: Path | None = None) -> ExecutionResult:
+                      resume_path: Path | None = None, *,
+                      resume_filename: str = '',
+                      before_action: Callable[[], None] | None = None) -> ExecutionResult:
         page = self._require(session_id)
-        if (await self.workflow_state(session_id)).stage in {"homepage", "job_list", "job_detail", "auth_required", "registration_required", "verification_required"}:
+        workflow = await self.workflow_state(session_id)
+        if workflow.navigation_blocker:
+            raise ValueError(workflow.navigation_blocker)
+        if workflow.stage in {"homepage", "job_list", "job_detail", "auth_required", "registration_required", "verification_required"}:
             raise ValueError("当前不是可填写的申请表；不会向首页、岗位筛选或登录控件写入个人资料")
+        # Keep entry blockers first. A reload can reuse both URL and selectors;
+        # browser-owned timeOrigin identifies its document without DOM markers.
+        document_origin = await page.evaluate("() => performance.timeOrigin")
+
+        def execution_identity(state: ApplicationWorkflowState) -> tuple:
+            # Field counts, options and values are deliberately excluded:
+            # reactive forms may change them while the same step is filled.
+            return (state.url, state.stage, state.job_id, state.job_title,
+                    state.page_step_current, state.entry_confirmation_required)
+
+        async def ensure_current_page() -> None:
+            message = "填写期间页面、岗位或申请步骤已变化，已停止旧填写计划；请重新识别当前页面后再继续"
+            if self._require(session_id) is not page:
+                raise _ExecutionTargetChanged(message)
+            current = await self.workflow_state(session_id)
+            if current.navigation_blocker:
+                raise _ExecutionTargetChanged(current.navigation_blocker)
+            if execution_identity(current) != execution_identity(workflow) or page.url != workflow.url:
+                raise _ExecutionTargetChanged(message)
+            try:
+                same_document = await page.evaluate("origin => performance.timeOrigin === origin", document_origin)
+            except Exception as exc:
+                raise _ExecutionTargetChanged(message) from exc
+            if not same_document or self.page is not page:
+                raise _ExecutionTargetChanged(message)
+
         snapshot = await self.snapshot()
         fields = {field.selector: field for field in snapshot.fields}
+        native_identities = await page.evaluate(NATIVE_WRITE_IDENTITIES, list(fields))
+        execution_policy = policy_for(workflow.adapter)
+
+        async def ensure_native_field(original: PageField, current: PageField) -> None:
+            expected = native_identities.get(original.selector)
+            if expected is None or original.field_type == "combobox":
+                return
+            metadata = ("name", "field_type", "label", "section", "group_label", "container_key", "entity_scope")
+            live = await page.evaluate(NATIVE_WRITE_IDENTITIES, [current.selector])
+            if (live.get(current.selector) != expected or any(
+                    getattr(original, key) != getattr(current, key) for key in metadata)):
+                raise _ExecutionTargetChanged(
+                    "填写期间字段题干、类型或所属记录已变化，已停止旧填写计划；请重新识别后再继续")
+
         results: list[ActionResult] = []
+        applied_selectors: set[str] = set()
+        if before_action:
+            before_action()
         if resume_path:
             resume_fields = [field for field in snapshot.fields if field.field_type == "file" and
                              any(hint in f"{field.label} {field.name}".lower()
                                  for hint in ("resume", "cv", "curriculum", "简历"))]
             for field in resume_fields[:1]:
                 try:
-                    await page.locator(field.selector).first.set_input_files(str(resume_path), timeout=10000)
+                    await ensure_current_page()
+                    await ensure_native_field(field, field)
+                    if before_action:
+                        before_action()
+                    name=Path(resume_filename.replace('\\','/')).name if resume_filename else resume_path.name
+                    if not name or Path(name).suffix.casefold()!=resume_path.suffix.casefold():
+                        raise ValueError('简历原始文件名与所选原件格式不一致，未上传')
+                    upload=({'name':name,'mimeType':mimetypes.guess_type(name)[0] or 'application/octet-stream',
+                             'buffer':resume_path.read_bytes()} if resume_filename else str(resume_path))
+                    await page.locator(field.selector).first.set_input_files(upload, timeout=10000)
                     actual = await page.locator(field.selector).first.evaluate(
                         "el => [...(el.files || [])].map(file => file.name).join(', ')")
-                    verified = resume_path.name in actual
+                    verified = actual == name
                     results.append(ActionResult(selector=field.selector, label=field.label or "Resume/CV",
                                                 status="filled" if verified else "failed", verified=verified,
-                                                actual_value=actual, message="简历已上传" if verified else "简历上传后未能验证"))
+                                                actual_value=actual, message="附件选择已回读核验；尚不代表官网接收或申请提交" if verified else "简历上传后未能验证"))
+                except _ExecutionTargetChanged:
+                    raise
                 except Exception as exc:
                     results.append(ActionResult(selector=field.selector, label=field.label or "Resume/CV",
                                                 status="failed", message=str(exc)[:240]))
         for action in request.actions:
+            # Profile updates can arrive through a different API while this
+            # batch awaits browser I/O. Stop before the next old-value write.
+            await ensure_current_page()
+            if before_action:
+                before_action()
             field = fields.get(action.selector)
             field_description = " ".join(filter(None, (
                 field.section, field.group_label, field.label, field.name
             ))).lower() if field else ""
             deterministically_sensitive = any(hint in field_description for hint in SENSITIVE_FIELD_HINTS)
             deterministically_manual = any(hint in field_description for hint in MANUAL_CONFIRM_FIELD_HINTS)
+            acknowledgement = " ".join(filter(None, (
+                field.label, field.question_text, field.group_label, field.option_label, field.name,
+            ))).casefold() if field else ""
+            legal_acknowledgement = bool(field and field.field_type in {"checkbox", "radio"} and
+                                        (any(hint in acknowledgement for hint in LEGAL_ACKNOWLEDGEMENT_HINTS)
+                                         or field.name.casefold() in {"agreechk", "agreement", "consent"}))
             compatible = bool(field) and (
                 (action.action == "fill" and field.field_type not in {"checkbox", "radio", "select-one", "select-multiple", "combobox"})
                 or (action.action == "select" and field.field_type in {"select-one", "select-multiple", "combobox"})
@@ -1448,6 +1982,7 @@ class BrowserDemoService:
             )
             unsafe = (
                 field is None
+                or legal_acknowledgement
                 or action.action not in {"fill", "select", "check"}
                 or not compatible
                 or (action.action in {"fill", "select"} and not str(action.value).strip())
@@ -1458,40 +1993,60 @@ class BrowserDemoService:
             )
             if unsafe:
                 results.append(ActionResult(selector=action.selector, label=action.label, status="skipped",
-                                            message="需要确认、敏感或置信度不足"))
+                                            message="声明、承诺或协议必须由本人在招聘网页阅读并勾选" if legal_acknowledgement
+                                            else "需要确认、敏感或置信度不足"))
                 continue
             try:
                 field, locator = await self._resolve_field(field)
-                expected_values = _split_values(action.value)
+                if execution_policy.name == 'beisen-italent':
+                    await self._dismiss_options(locator, execution_policy)
+
+                async def ensure_write_target() -> None:
+                    await ensure_current_page()
+                    await ensure_native_field(fields[action.selector], field)
+
+                await ensure_write_target()
+                if before_action:
+                    before_action()
+                expected_values = ([str(action.value)] if field.region_picker else _split_values(action.value))
                 if action.action == "fill":
                     await locator.fill(str(action.value), timeout=8000)
                 elif action.action == "select":
                     if field.field_type == "combobox":
-                        await self._select_custom(field, expected_values[:20])
+                        await self._select_custom(field, expected_values[:20], before_write=ensure_write_target)
                     else:
-                        await self._select_native(field, expected_values)
+                        await self._select_native(field, expected_values, before_write=ensure_write_target)
                 elif action.action == "check":
                     native_check = await locator.evaluate("el => el.tagName === 'INPUT'")
                     if native_check:
                         try:
+                            await ensure_write_target()
                             await locator.set_checked(bool(action.value), timeout=8000)
                         except Exception:
+                            await ensure_write_target()
                             await locator.evaluate("""(el, checked) => {
                               el.checked = checked;
                               el.dispatchEvent(new Event('input', {bubbles: true}));
                               el.dispatchEvent(new Event('change', {bubbles: true}));
                             }""", bool(action.value))
                     else:
-                        checked = await locator.get_attribute("aria-checked") == "true"
+                        state = await locator.evaluate(CHOICE_STATE_JS)
+                        if state not in {"true", "false"}:
+                            raise ValueError("无法核实自定义选项的选中状态，已停止填写，请在网页中确认")
+                        checked = state == "true"
                         if checked != bool(action.value):
+                            await ensure_write_target()
                             await locator.click(timeout=8000)
+                applied_selectors.add(action.selector)
+                await ensure_native_field(fields[action.selector], field)
                 actual = await self._read_field_value(field)
                 if field.field_type in {"checkbox", "radio"}:
                     expected = str(bool(action.value)).lower()
                     verified = actual.strip() == expected.strip()
                 elif field.field_type in {"select-one", "select-multiple", "combobox"}:
                     expected = str(action.value)
-                    verified = _selected_values_match(expected_values, actual)
+                    verified = (region_values_match(expected, actual) if field.region_picker
+                                else _selected_values_match(expected_values, actual))
                 else:
                     expected = str(action.value)
                     verified = actual.strip() == expected.strip()
@@ -1499,10 +2054,15 @@ class BrowserDemoService:
                                             status="filled" if verified else "failed", verified=verified,
                                             actual_value=actual,
                                             message="回读验证成功" if verified else f"回读值不一致，期望 {expected}"))
+            except _ExecutionTargetChanged:
+                raise
             except Exception as exc:
                 results.append(ActionResult(selector=action.selector, label=action.label, status="failed",
                                             message=str(exc)[:240]))
+        if before_action:
+            before_action()
         await page.wait_for_timeout(800)
+        await ensure_current_page()
         # A reactive ATS may normalize or clear a value after the input event.
         # Re-read every planned action after the page settles so the result is
         # based on final DOM state instead of an optimistic immediate read.
@@ -1510,22 +2070,33 @@ class BrowserDemoService:
         for result in results:
             action = actions_by_selector.get(result.selector)
             field = fields.get(result.selector)
-            if result.status != "filled" or not action or not field:
+            if (result.status not in {"filled", "failed"} or result.selector not in applied_selectors
+                    or not action or not field):
                 continue
             try:
+                await ensure_native_field(field, field)
                 expected = str(action.value)
                 if field.field_type in {"checkbox", "radio"}:
                     result.actual_value = await self._read_field_value(field)
                     result.verified = result.actual_value == str(bool(action.value)).lower()
                 elif field.field_type in {"select-one", "select-multiple", "combobox"}:
                     result.actual_value = await self._read_field_value(field)
-                    result.verified = _selected_values_match(_split_values(action.value), result.actual_value)
+                    result.verified = (region_values_match(str(action.value), result.actual_value)
+                                       if field.region_picker else
+                                       _selected_values_match(_split_values(action.value), result.actual_value))
                 else:
                     result.actual_value = await self._read_field_value(field)
                     result.verified = result.actual_value.strip() == expected.strip()
                 if not result.verified:
                     result.status = "failed"
                     result.message = f"页面稳定后回读值不一致，期望 {expected}"
+                else:
+                    # React selection state and Phoenix radio animations may
+                    # commit after the first read. Only completed operations
+                    # are eligible for this settled-state verification; a click
+                    # exception cannot be reclassified as a successful write.
+                    result.status = "filled"
+                    result.message = "页面稳定后回读验证成功"
             except Exception as exc:
                 result.status = "failed"
                 result.verified = False

@@ -17,6 +17,12 @@ export function modelPending(plan:FormPlan|null) {
   return plan?.routing_summary?.model_pending ?? plan?.actions.filter(action=>action.needs_model).length ?? 0
 }
 
+// For UI only: a local, explicit blank choice is not an unanswered model task.
+// This does not alter server required-field checks or approve any transition.
+export function pendingActionSelectors(actions:readonly Pick<FillAction,'selector'|'action'|'needs_model'>[]) {
+  return new Set(actions.filter(action=>action.needs_model&&action.action!=='skip').map(action=>action.selector))
+}
+
 // Preserve the first phase's audit results; the latest attempt wins for a field.
 // These are execution records, not a claim that untouched dynamic fields were re-read.
 export function mergePhaseExecutions(previous:ExecutionResult|null, next:ExecutionResult):ExecutionResult {

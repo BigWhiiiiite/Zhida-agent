@@ -33,6 +33,7 @@ export function workbenchView({workflow,snapshot,hasPlan,hasDraftEdits,unresolve
   if(workflow.stage==='job_list')return {...base,title:'还没有读取到可进入的岗位',description:workflow.navigation_blocker||'请切到招聘浏览器，确认职位列表已加载；必要时先搜索或打开目标岗位，再回来重新识别。若列表一直空白，请提供招聘网页截图。'}
   if(workflow.stage==='homepage')return {...base,title:'请先在招聘网站打开岗位列表',description:workflow.navigation_blocker||'当前仍在招聘首页，尚未找到可靠的岗位入口。请在招聘浏览器打开校招或职位列表，再回来重新识别。'}
   if(workflow.stage==='unknown'&&workflow.form_fields>0)return {...base,label:'同步当前页面',title:`已读取到 ${workflow.form_fields} 个控件，页面类型仍待核对`,description:'网站可能已经打开申请表，但职达尚未确认页面类型。请先同步当前页面，不必重复登录或重新找岗位；如果同步后仍未识别，请提供当前招聘网页截图供核对。'}
+  if(workflow.job_id&&workflow.job_title)return {...base,label:'重新核对申请入口',title:'岗位已识别，申请入口仍需核对',description:workflow.message||'已经读到真实岗位标题，但还没有确认可安全进入的申请入口。不会让你重新找岗位，也不会猜测或点击提交。'}
   if(workflow.job_id)return {...base,title:'岗位链接已识别，但申请页面还没准备好',description:'网址中有岗位编号，不代表岗位内容或申请表单已经加载。请切到招聘浏览器查看是否空白、需要登录或出现弹窗；完成操作后再重新识别，仍异常时请提供该页截图。'}
   return base
 }

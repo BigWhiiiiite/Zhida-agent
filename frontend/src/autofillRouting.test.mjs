@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import {actionReviewTitle,mergePhaseExecutions,modelPending,routeLabel,runAutofillPhases} from './autofillRouting.ts'
+import {actionReviewTitle,mergePhaseExecutions,modelPending,pendingActionSelectors,routeLabel,runAutofillPhases} from './autofillRouting.ts'
 
 const result=(selector,status='filled',verified=true)=>({selector,label:'示例字段',status,verified,actual_value:'示例值',message:''})
 const execution=(results,tag)=>({url:'https://careers.example.test/form',results,completed:results.filter(row=>row.status==='filled').length,verified:results.filter(row=>row.verified).length,failed:results.filter(row=>row.status==='failed').length,skipped:0,unverified:0,pre_submit:{tag}})
@@ -11,6 +11,13 @@ assert.equal(routeLabel({needs_model:true,resolution_source:'user'}),'待模型�
 assert.equal(routeLabel({user_confirmed:true,resolution_source:'model'}),'用户已确认')
 assert.equal(modelPending({actions:[{needs_model:true},{needs_model:false}]}),1)
 assert.equal(modelPending({actions:[{needs_model:true}],routing_summary:{model_pending:0}}),0)
+assert.deepEqual([...pendingActionSelectors([
+  {selector:'blank-award',action:'skip',needs_model:true},
+  {selector:'confirmed-summary',action:'fill',needs_model:false},
+  {selector:'unknown',action:'ask_user',needs_model:true},
+  {selector:'sensitive-id',action:'ask_user',needs_model:false},
+])],['unknown'],'Explicit blanks and human answers must not be counted as pending model tasks')
+assert.deepEqual([...pendingActionSelectors([])],[])
 const merged=mergePhaseExecutions(execution([result('#name'),result('#city','failed',false)],'rules'),execution([result('#city'),result('#college','failed',false)],'model'))
 assert.equal(merged.results.length,3)
 assert.equal(merged.verified,2)

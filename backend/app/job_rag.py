@@ -83,6 +83,9 @@ def split_profile_evidence(profile: CandidateProfile) -> list[EvidenceChunk]:
             pieces: list[tuple[str, int, str, float]] = []
             for fact_index, fact in enumerate(_facts(record.description)):
                 pieces.append(("description", fact_index, fact, .9))
+            if source_kind == "project":
+                for fact_index, fact in enumerate(_facts(record.responsibilities)):
+                    pieces.append(("responsibilities", fact_index, fact, .9))
             for item_index, achievement in enumerate(record.achievements):
                 for fact_index, fact in enumerate(_facts(achievement)):
                     pieces.append((f"achievements[{item_index}]", fact_index, fact, 1.0))

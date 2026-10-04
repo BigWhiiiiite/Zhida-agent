@@ -22,10 +22,12 @@ from .agent import get_resume_extractor
 from .auth_models import AuthSession, LoginRequest, RegisterRequest, UserAccount
 from .auth_service import SESSION_DAYS, local_user, login, register, token_hash, user_for_token
 from .application_agent import decide_application_step
+from .application_journey import continue_journey
 from .application_knowledge import (KnowledgeCreate, KnowledgeRecord, MappingTarget,
                                     delete_knowledge, initialize as initialize_application_knowledge,
                                     list_knowledge, mapping_targets, save_knowledge)
 from .application_models import (ApplicationAgentCheckpoint, ApplicationAgentStepRequest,
+                                 ApplicationJourneyRequest, ApplicationJourneyResult,
                                  ApplicationAgentTurn, ApplicationWorkflowState,
                                  RegistrationCredentialsRequest, VerificationCodeRequest,
                                  VerificationRequest, WorkflowAdvanceRequest)
@@ -34,9 +36,16 @@ from .browser_models import (BrowserSnapshot, BrowserStart, ExecutePlanRequest, 
                              HybridAutofillRequest, HybridAutofillResult,
                              NativeResumeImportRequest, NativeResumeImportResult, PreSubmitCheck)
 from .browser_service import browser_demo
+from .task_profile import compose_task_profile, context_token
+from .application_knowledge import company_scope
+from .browser_models import TaskResumeUpdate
+from .browser_models import ApplicationAssistRequest, ApplicationAssistResult
+from .application_assist import prepare_application
 from .chat_api import router as chat_router
 from .chat_storage import initialize as initialize_chat
 from .extractors import extract_text, preview_html
+from .confirmed_facts import (ConfirmedFactRequest, FactRevisionConflict, FactTargets,
+                              get_fact_targets, save_confirmed_fact)
 from .form_agent import build_form_review, create_form_plan, create_local_form_plan
 from .job_discovery import (official_job_sources, register_job_source,
                             remove_job_source, sync_official_source)
@@ -77,6 +86,49 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 SESSION_COOKIE = "zhida_session"
 PUBLIC_API_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login"}
 browser_session_owners: dict[str, str] = {}
+browser_task_resumes: dict[str, str] = {}
+browser_task_epochs: dict[str, str] = {}
+
+
+def _task_context(session_id: str) -> tuple[CandidateProfile, str]:
+    resume_id = browser_task_resumes.get(session_id, "")
+    resume = get_resume(resume_id) if resume_id else None
+    if resume_id and not resume:
+        raise HTTPException(409, "本次投递绑定的简历已删除，请重新选择简历")
+    url = browser_demo.page.url if browser_demo.page else ""
+    profile = compose_task_profile(get_profile(), resume, company_scope(url) if url else "")
+    revision = "|".join((context_token(profile, resume), session_id, url,
+                         browser_task_epochs.get(session_id, "")))
+    return profile, hashlib.sha256(revision.encode()).hexdigest()
+
+
+def _task_profile(session_id: str) -> CandidateProfile:
+    return _task_context(session_id)[0]
+
+
+def _stamp_plan(session_id: str, plan: FormPlan) -> FormPlan:
+    plan.context_token = _task_context(session_id)[1]
+    plan.resume_id = browser_task_resumes.get(session_id, "")
+    if plan.resume_id:
+        from .task_profile import VERSION_FIELDS
+        resume = get_resume(plan.resume_id)
+        for action in plan.actions:
+            if any(action.value_source.startswith(f"主档案.{field}") for field in VERSION_FIELDS):
+                action.value_source = action.value_source.replace("主档案.", f"简历「{resume.label}」.", 1)
+    return plan
+
+
+async def _model_task_plan(session_id: str, snapshot: BrowserSnapshot) -> FormPlan:
+    profile, revision = _task_context(session_id)
+    plan = await create_form_plan(snapshot, profile)
+    if revision != _task_context(session_id)[1]:
+        raise HTTPException(409, "模型分析期间资料发生变化，请重新分析，未执行旧计划")
+    return _stamp_plan(session_id, plan)
+
+
+def _require_task_resume(session_id: str, resume_id: str) -> None:
+    if session_id in browser_task_resumes and resume_id != browser_task_resumes[session_id]:
+        raise HTTPException(409, "简历版本与当前任务不一致，请切换简历后重新分析")
 
 
 def _local_access_allowed(request: Request) -> bool:
@@ -206,7 +258,7 @@ def remember_application_answer(payload: ApplicationAnswerUpdate) -> CandidatePr
             payload.question, payload.field_name, payload.value,
             semantic_key=payload.semantic_key, entity_scope=payload.entity_scope,
             field_signature=payload.field_signature, field_type=payload.field_type,
-            options=payload.options, source_url=payload.source_url,
+            options=payload.options, source_url=payload.source_url, resume_id=payload.resume_id,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -443,10 +495,32 @@ async def upload_resume(file: UploadFile = File(...)) -> ResumeRecord:
 
 @app.patch("/api/resumes/{resume_id}", response_model=ResumeRecord)
 def save_resume_route(resume_id: str, payload: ResumeUpdate) -> ResumeRecord:
-    changes = {key: value for key, value in payload.model_dump().items() if value is not None}
+    changes = payload.model_dump(exclude={"profile"}, exclude_none=True)
+    if payload.profile is not None:
+        changes["profile"] = payload.profile
     record = update_resume(resume_id, **changes)
     if not record: raise HTTPException(404, "简历不存在")
     return record
+
+
+@app.get("/api/resumes/{resume_id}/fact-targets", response_model=FactTargets)
+def resume_fact_targets(resume_id: str) -> FactTargets:
+    try:
+        return get_fact_targets(resume_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/resumes/{resume_id}/confirmed-fact", response_model=ResumeRecord)
+def confirm_resume_fact(resume_id: str, payload: ConfirmedFactRequest) -> ResumeRecord:
+    try:
+        return save_confirmed_fact(resume_id, payload)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except FactRevisionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.delete("/api/resumes/{resume_id}", status_code=204, response_class=Response)
@@ -558,7 +632,26 @@ async def current_browser_session() -> dict[str, Any]:
     session_id = browser_demo.session_id
     owns_session = bool(session_id and browser_session_owners.get(session_id) == current_user_id())
     # Recover task UI on refresh without exposing another user's URL or target.
-    return {"session_id": session_id if owns_session else None, "occupied": bool(session_id)}
+    return {"session_id": session_id if owns_session else None, "occupied": bool(session_id),
+            "assistance_version": 1,
+            "record_completion_version": 1,
+            "journey_version": 1,
+            "resume_id": browser_task_resumes.get(session_id, "") if owns_session else ""}
+
+
+@app.put("/api/browser/{session_id}/resume")
+async def select_task_resume(session_id: str, payload: TaskResumeUpdate) -> dict:
+    _require_browser_owner(session_id)
+    resume = get_resume(payload.resume_id) if payload.resume_id else None
+    if payload.resume_id and not resume:
+        raise HTTPException(404, "选择的简历不存在")
+    try:
+        compose_task_profile(get_profile(), resume)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    browser_task_resumes[session_id] = payload.resume_id
+    browser_task_epochs[session_id] = str(uuid4())
+    return {"resume_id": payload.resume_id, "context_token": _task_context(session_id)[1]}
 
 
 @app.post("/api/browser/start", response_model=BrowserSnapshot)
@@ -568,7 +661,15 @@ async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
             # A new chat task must not silently close another task or user's
             # browser, including their in-progress application and login.
             raise HTTPException(409, "已有投递浏览器会话正在进行，请先结束当前会话，再打开新的任务")
+        resume = get_resume(payload.resume_id) if payload.resume_id else None
+        if payload.resume_id and not resume:
+            raise HTTPException(404, "选择的简历不存在")
+        compose_task_profile(get_profile(), resume)
         result = await browser_demo.start(payload.url, current_user_id(), target=payload.target)
+        browser_task_resumes.clear()
+        browser_task_resumes[result.session_id] = payload.resume_id
+        browser_task_epochs.clear()
+        browser_task_epochs[result.session_id] = str(uuid4())
         browser_session_owners.clear()
         browser_session_owners[result.session_id] = current_user_id()
         return result
@@ -593,11 +694,21 @@ async def browser_snapshot(session_id: str) -> BrowserSnapshot:
 async def expand_browser_section(session_id: str, payload: ExpandSectionRequest) -> BrowserSnapshot:
     try:
         _require_browser_owner(session_id)
-        return await browser_demo.expand_section(session_id, payload.selector)
+        return await browser_demo.expand_section(session_id, payload.selector, payload.candidate_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/browser/{session_id}/recognition-diagnostics")
+async def browser_recognition_diagnostics(session_id: str) -> dict:
+    """Owner-only structural diagnosis; no input values, credentials or model."""
+    _require_browser_owner(session_id)
+    try:
+        return await browser_demo.recognition_diagnostics(session_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/browser/{session_id}/field/inspect", response_model=FormReviewResult)
@@ -605,7 +716,7 @@ async def inspect_browser_field(session_id: str, payload: ExpandSectionRequest) 
     try:
         _require_browser_owner(session_id)
         snapshot = await browser_demo.inspect_field(session_id, payload.selector)
-        plan = create_local_form_plan(snapshot, get_profile())
+        plan = _stamp_plan(session_id, create_local_form_plan(snapshot, _task_profile(session_id)))
         return build_form_review(snapshot, plan)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -620,6 +731,7 @@ async def import_resume_with_site_parser(session_id: str,
                                          payload: NativeResumeImportRequest) -> NativeResumeImportResult:
     try:
         _require_browser_owner(session_id)
+        _require_task_resume(session_id, payload.resume_id)
         await _require_application_form(session_id)
         row = get_resume_internal(payload.resume_id)
         if not row:
@@ -627,7 +739,7 @@ async def import_resume_with_site_parser(session_id: str,
         candidate = UPLOAD_DIR / Path(row["stored_filename"]).name
         if not candidate.exists():
             raise HTTPException(404, "选择的简历原始文件不存在")
-        return await browser_demo.import_resume_with_site_parser(session_id, candidate)
+        return await browser_demo.import_resume_with_site_parser(session_id, candidate, payload.confirm_site_parse)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
@@ -650,6 +762,8 @@ async def _require_application_form(session_id: str) -> ApplicationWorkflowState
     failure is a reason to inspect the page, never evidence of completion.
     """
     workflow = await browser_demo.workflow_state(session_id)
+    if workflow.navigation_blocker:
+        raise HTTPException(409, workflow.navigation_blocker)
     if workflow.stage not in {"profile_form", "application_form", "review"} or workflow.form_fields < 1:
         raise HTTPException(409, "当前尚未确认有效的简历/申请表，请先选择具体岗位并完成必要登录；不会向搜索或筛选控件填写个人资料")
     return workflow
@@ -681,7 +795,7 @@ async def _assess_application_agent(session_id: str,
     workflow = await browser_demo.workflow_state(session_id)
     check = (await browser_demo.pre_submit_check(session_id)
              if workflow.stage in {"profile_form", "application_form", "review"} else None)
-    decision = await decide_application_step(workflow, snapshot, get_profile(), check)
+    decision = await decide_application_step(workflow, snapshot, _task_profile(session_id), check)
     saved = save_application_agent_checkpoint(
         session_id, _agent_checkpoint_status(workflow, decision.requires_user),
         workflow.stage, snapshot.url, snapshot.title, event_action, decision.summary,
@@ -710,14 +824,16 @@ async def run_application_agent_step(session_id: str,
     """Execute one bounded, reversible application step and then checkpoint it."""
     try:
         _require_browser_owner(session_id)
+        _require_task_resume(session_id, payload.resume_id)
         snapshot = await browser_demo.snapshot_for(session_id)
         workflow = await browser_demo.workflow_state(session_id)
         check = (await browser_demo.pre_submit_check(session_id)
                  if workflow.stage in {"profile_form", "application_form", "review"} else None)
-        decision = await decide_application_step(workflow, snapshot, get_profile(), check)
+        decision = await decide_application_step(workflow, snapshot, _task_profile(session_id), check)
         action = decision.next_action
         review = None
         execution = None
+        assisted = None
         action_taken = ""
 
         if decision.can_execute and action in {"start_application", "browse_jobs", "search_jobs", "open_job"}:
@@ -726,17 +842,12 @@ async def run_application_agent_step(session_id: str,
             )
             action_taken = action
         elif decision.can_execute and action == "analyze_and_fill":
+            if not payload.resume_id:
+                raise ValueError("请先选择本次投递使用的简历，再开始填写")
             await _require_application_form(session_id)
-            snapshot = await browser_demo.snapshot_for(session_id)
-            plan = await create_form_plan(snapshot, get_profile())
-            review = build_form_review(snapshot, plan)
-            execution = await browser_demo.execute(
-                session_id,
-                ExecutePlanRequest(actions=plan.actions, min_confidence=.85,
-                                   resume_id=payload.resume_id),
-                _selected_resume_path(payload.resume_id),
-            )
-            check = execution.pre_submit
+            assisted = await _run_application_assist(session_id, ApplicationAssistRequest(
+                resume_id=payload.resume_id, allow_site_parse=False))
+            snapshot, review, check = assisted.snapshot, assisted.review, assisted.pre_submit
             action_taken = action
         elif decision.can_execute and action == "continue_application":
             # Recheck immediately before navigation; the page may have changed
@@ -757,10 +868,22 @@ async def run_application_agent_step(session_id: str,
         workflow = await browser_demo.workflow_state(session_id)
         check = (await browser_demo.pre_submit_check(session_id)
                  if workflow.stage in {"profile_form", "application_form", "review"} else None)
-        result_summary = (f"已执行：{decision.next_label}" if action_taken
+        result_summary = assisted.message if assisted else (f"已执行：{decision.next_label}" if action_taken
                           else f"等待用户：{decision.next_label}")
         # Return a decision for the new page, not the stale pre-navigation plan.
-        decision = await decide_application_step(workflow, snapshot, get_profile(), check, use_model=False)
+        decision = await decide_application_step(workflow, snapshot, _task_profile(session_id), check, use_model=False)
+        if review is None and workflow.stage in {"profile_form", "application_form", "review"}:
+            # Human-only missing facts must be visible to the product UI even
+            # when no automatic action was safe. Do not require a separate
+            # analysis click just to discover what the agent needs to ask.
+            plan = _stamp_plan(session_id, create_local_form_plan(snapshot, _task_profile(session_id)))
+            review = build_form_review(snapshot, plan)
+        if assisted and assisted.status != "ready_for_review":
+            decision = decision.model_copy(update={
+                "summary": assisted.message, "next_action": "stop", "next_label": "查看本轮未完成原因并重新核对",
+                "can_execute": False, "requires_user": True,
+                "blockers": list(dict.fromkeys([assisted.message, *decision.blockers]))[:12],
+            })
         status = _agent_checkpoint_status(workflow, decision.requires_user)
         saved = save_application_agent_checkpoint(
             session_id, status, workflow.stage, snapshot.url, snapshot.title,
@@ -769,6 +892,7 @@ async def run_application_agent_step(session_id: str,
         return ApplicationAgentTurn(
             decision=decision, workflow=workflow, snapshot=snapshot,
             action_taken=action_taken, review=review, execution=execution,
+            assistance=assisted,
             pre_submit=check, checkpoint=ApplicationAgentCheckpoint.model_validate(saved),
         )
     except LookupError as exc:
@@ -837,7 +961,9 @@ async def plan_form(session_id: str) -> FormPlan:
     try:
         _require_browser_owner(session_id)
         snapshot = await browser_demo.snapshot_for(session_id)
-        return await create_form_plan(snapshot, get_profile())
+        return await _model_task_plan(session_id, snapshot)
+    except HTTPException:
+        raise
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except Exception as exc:
@@ -849,9 +975,12 @@ async def review_current_form(session_id: str, use_model: bool = False) -> FormR
     try:
         _require_browser_owner(session_id)
         snapshot = await browser_demo.snapshot_for(session_id)
-        plan = (await create_form_plan(snapshot, get_profile()) if use_model
-                else create_local_form_plan(snapshot, get_profile()))
+        plan = (await _model_task_plan(session_id, snapshot) if use_model
+                else create_local_form_plan(snapshot, _task_profile(session_id)))
+        _stamp_plan(session_id, plan)
         return build_form_review(snapshot, plan)
+    except HTTPException:
+        raise
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except Exception as exc:
@@ -862,15 +991,22 @@ async def review_current_form(session_id: str, use_model: bool = False) -> FormR
 async def execute_form_plan(session_id: str, payload: ExecutePlanRequest) -> ExecutionResult:
     try:
         _require_browser_owner(session_id)
+        _require_task_resume(session_id, payload.resume_id)
+        if session_id in browser_task_resumes and payload.context_token != _task_context(session_id)[1]:
+            raise HTTPException(409, "档案、已确认答案或简历版本已变化，请重新分析后再填写")
         await _require_application_form(session_id)
         resume_path: Path | None = None
-        if payload.resume_id:
+        resume_filename = ''
+        if payload.resume_id and payload.upload_resume:
             row = get_resume_internal(payload.resume_id)
             if not row: raise HTTPException(404, "选择的简历不存在")
             candidate = UPLOAD_DIR / Path(row["stored_filename"]).name
             if not candidate.exists(): raise HTTPException(404, "选择的简历原始文件不存在")
             resume_path = candidate
-        return await browser_demo.execute(session_id, payload, resume_path)
+            # Storage returns sqlite3.Row, not dict (it has no .get method).
+            resume_filename = str(row['filename'] or candidate.name)
+        return await browser_demo.execute(session_id, payload, resume_path,
+                                          **({'resume_filename':resume_filename} if resume_filename else {}))
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -888,9 +1024,10 @@ async def autofill_current_form(session_id: str,
         _require_browser_owner(session_id)
         await _require_application_form(session_id)
         snapshot = await browser_demo.snapshot_for(session_id)
-        profile = get_profile()
+        profile = _task_profile(session_id)
         plan = (create_local_form_plan(snapshot, profile) if payload.phase == "rules"
-                else await create_form_plan(snapshot, profile))
+                else await _model_task_plan(session_id, snapshot))
+        _stamp_plan(session_id, plan)
         review = build_form_review(snapshot, plan)
         fields = {field.selector: field for field in snapshot.fields}
         actions = [action for action in review.plan.actions
@@ -930,6 +1067,87 @@ async def check_form_before_submit(session_id: str) -> PreSubmitCheck:
         raise HTTPException(404, str(exc)) from exc
 
 
+async def _run_application_assist(session_id: str, payload: ApplicationAssistRequest) -> ApplicationAssistResult:
+    _require_browser_owner(session_id)
+    _require_task_resume(session_id, payload.resume_id)
+    if browser_task_resumes.get(session_id) != payload.resume_id:
+        raise HTTPException(409, "请先为本次任务绑定所选简历，再开始自动补齐")
+    await _require_application_form(session_id)
+    resume = get_resume(payload.resume_id)
+    if not resume:
+        raise HTTPException(404, "本次简历不存在")
+    profile, revision = _task_context(session_id)
+
+    def guard():
+        _require_browser_owner(session_id)
+        _require_task_resume(session_id, payload.resume_id)
+        if _task_context(session_id)[1] != revision:
+            raise ValueError("任务、档案或已确认答案发生变化，已停止旧计划，请重新核对")
+
+    names = {"education": "教育经历", "internships": "实习/工作经历", "projects": "项目经历",
+             "skills": "技能", "languages": "语言", "certificates": "证书", "awards": "奖项"}
+    pending = [names[key] for key in names if getattr(resume.profile, key)
+               and any(item.field_path == key and item.status not in {"confirmed", "edited"}
+                       for item in resume.evidence)]
+    return await prepare_application(browser_demo, session_id, payload, profile, guard=guard,
+        model_plan=lambda snapshot: _model_task_plan(session_id, snapshot),
+        stamp_plan=lambda plan: _stamp_plan(session_id, plan),
+        resume_path=_selected_resume_path(payload.resume_id) if payload.allow_site_parse else None,
+        pending_sections=pending)
+
+
+@app.post("/api/browser/{session_id}/assist", response_model=ApplicationAssistResult)
+async def assist_application(session_id: str, payload: ApplicationAssistRequest) -> ApplicationAssistResult:
+    try:
+        return await _run_application_assist(session_id, payload)
+    except HTTPException:
+        raise
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "自动补齐暂时中断，已完成的填写保留；请重新核对当前网页") from exc
+
+
+@app.post("/api/browser/{session_id}/journey", response_model=ApplicationJourneyResult)
+async def continue_application_journey(session_id: str, payload: ApplicationJourneyRequest) -> ApplicationJourneyResult:
+    """The same product agent carries on until the next human/safety boundary."""
+    try:
+        _require_browser_owner(session_id)
+        if browser_task_resumes.get(session_id) != payload.resume_id:
+            raise HTTPException(409, "请先绑定本次简历，再让职达继续")
+
+        def source_revision():
+            _require_browser_owner(session_id)
+            _require_task_resume(session_id, payload.resume_id)
+            resume = get_resume(payload.resume_id)
+            if not resume:
+                raise HTTPException(409, "本次简历不存在，请重新选择")
+            # Unlike a single-page plan, this identity excludes page URL so
+            # approved entry/next-page navigation does not invalidate itself.
+            raw = "|".join((resume.model_dump_json(), get_profile().model_dump_json(),
+                            browser_task_epochs.get(session_id, "")))
+            return hashlib.sha256(raw.encode()).hexdigest()
+
+        revision = source_revision()
+        def guard():
+            if source_revision() != revision:
+                raise ValueError("本轮推进期间资料或任务发生变化，已停止后续步骤，请重新核对")
+
+        return await continue_journey(max_steps=payload.max_steps, guard=guard,
+            run_step=lambda: run_application_agent_step(session_id,
+                ApplicationAgentStepRequest(resume_id=payload.resume_id)))
+    except HTTPException:
+        raise
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "职达推进暂时中断；已填写内容保留，请重新同步当前网页") from exc
+
+
 @app.delete("/api/browser/{session_id}", status_code=204, response_class=Response)
 async def close_browser(session_id: str) -> Response:
     _require_browser_owner(session_id)
@@ -937,4 +1155,6 @@ async def close_browser(session_id: str) -> Response:
         raise HTTPException(404, "浏览器会话不存在")
     await browser_demo.close()
     browser_session_owners.pop(session_id, None)
+    browser_task_resumes.pop(session_id, None)
+    browser_task_epochs.pop(session_id, None)
     return Response(status_code=204)

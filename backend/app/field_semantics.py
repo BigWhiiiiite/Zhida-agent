@@ -19,7 +19,7 @@ EDUCATION_ATTRIBUTE_HINTS = (
     ("education.college", ("学院名称", "院系名称", "所属学院", "院系", "学院", "faculty", "college", "department")),
     ("education.school", ("学校名称", "院校名称", "毕业院校", "就读院校", "学校", "院校", "university", "school")),
     ("education.major", ("专业名称", "所学专业", "就读专业", "专业", "field of study", "major")),
-    ("education.study_mode", ("培养方式", "学习形式", "就读方式", "全日制", "非全日制", "study mode", "training mode")),
+    ("education.study_mode", ("培养方式", "学习形式", "就读方式", "是否统招", "是否为统招", "全日制", "非全日制", "study mode", "training mode")),
     ("education.academic_system", ("学制", "修业年限", "program length", "academic system")),
     ("education.student_id", ("学号", "student id", "student number")),
     ("education.advisor", ("导师", "supervisor", "advisor")),
@@ -43,8 +43,9 @@ EXPERIENCE_ATTRIBUTE_HINTS = (
 )
 
 PROJECT_ATTRIBUTE_HINTS = (
+    ("project.responsibilities", ("项目中职责", "项目职责", "个人贡献", "project responsibilities", "my contribution")),
     ("project.name", ("项目名称", "project name")),
-    ("project.role", ("项目角色", "项目职责", "project role")),
+    ("project.role", ("项目角色", "project role")),
     ("project.start_date", ("开始时间", "start date")),
     ("project.end_date", ("结束时间", "end date")),
     ("project.description", ("项目描述", "项目内容", "project description")),
@@ -69,6 +70,7 @@ SEMANTIC_HINTS = (
     ("candidate.political_status", ("政治面貌", "政治身份", "political status", "political affiliation")),
     ("candidate.marital_status", ("婚姻状况", "婚姻状态", "marital status")),
     ("candidate.hukou_location", ("户籍所在地", "户口所在地", "户籍地", "户口地", "hukou", "household registration")),
+    ("candidate.hometown", ("籍贯", "祖籍", "native place", "ancestral hometown")),
     ("candidate.address", ("通讯地址", "联系地址", "现居住地址", "mailing address", "contact address")),
     ("candidate.country_region", ("国家/地区", "国家或地区", "所在国家", "country/region", "country or region", "country")),
     ("candidate.current_location", ("当前所处地", "当前所在地", "现居地", "居住地", "current location", "current city")),
@@ -76,6 +78,9 @@ SEMANTIC_HINTS = (
     ("preference.interview_location", ("参加面试城市", "面试城市", "面试地点", "interview city", "interview location")),
     ("preference.business_group", ("感兴趣的事业群", "意向事业群", "事业群志愿", "preferred business group", "business group")),
     ("preference.relocation", ("接受其他城市分配", "服从城市分配", "接受调剂", "服从调剂", "willing to relocate", "relocation")),
+    # Future availability is a candidate decision, not a past internship's
+    # start date, even when the question itself contains “实习 / 入职时间”.
+    ("preference.available_date", ("最早可实习入职时间", "最早可实习时间", "最早入职时间", "可入职时间", "可到岗时间", "预计到岗时间", "earliest start date", "available start date", "availability date")),
     ("candidate.campus_type", ("应届生类型", "毕业生类型", "招聘对象", "校招类型", "campus candidate type")),
     ("candidate.skills", ("ai应用技能", "ai技能", "技术技能", "专业技能", "skill set", "technical skills", "skills")),
     ("candidate.languages", ("语言能力", "外语能力", "掌握语言", "language ability", "language skills", "languages")),
@@ -286,11 +291,14 @@ def expected_input_for(field: PageField, semantic_key: str = "", entity_scope: s
             "project.name": "项目名称", "project.role": "项目角色",
             "project.start_date": "开始时间", "project.end_date": "结束时间",
             "project.description": "项目描述",
+            "project.responsibilities": "你在这个项目中实际承担的职责（不是项目角色名称）",
         }.get(key, "项目信息")
         return f"请先确认该题对应哪个项目，再填写{attribute}"
     hints = {
         "third_party.contact": "请填写网页指定的第三方联系人真实信息，不能使用候选人本人资料",
         "candidate.government_id": "请本人核对后填写真实证件信息；该答案只用于本次页面，不会被学习",
+        "candidate.hometown": "请填写真实籍贯（省、市、区县按网页要求），不是现居住地或户籍所在地；确认后保存到个人资料复用",
+        "preference.available_date": "请提供你本人确认的最早可入职日期，不使用过去实习的开始时间",
         "preference.interview_location": "请根据本次招聘网站提供的真实选项选择面试方式或城市",
         "preference.work_location": "请从网页真实选项中选择期望工作地点",
         "preference.business_group": "请从网页真实选项中选择意向事业群",

@@ -3,9 +3,9 @@ import type { FormPlan } from './types'
 import { modelPending } from './autofillRouting'
 import './autofill-routing.css'
 
-export default function AutofillRoutingSummary({plan,busy,userQuestions,phaseProgress}:{plan:FormPlan|null;busy:string;userQuestions:number;phaseProgress:{rules:number|null;model:number|null}}) {
+export default function AutofillRoutingSummary({plan,busy,userQuestions,phaseProgress,pendingOverride}:{plan:FormPlan|null;busy:string;userQuestions:number;phaseProgress:{rules:number|null;model:number|null};pendingOverride?:number}) {
   const summary=plan?.routing_summary
-  const pending=modelPending(plan)
+  const pending=pendingOverride??modelPending(plan)
   return <div className="autofill-routing" aria-live="polite">
     <div className={busy==='autofill-rules'?'active':''}><b>01</b><span><strong>规则先填</strong><small>{phaseProgress.rules!==null?`本轮 ${phaseProgress.rules} 项已回读验证`:summary?`${summary.rules_ready} 项有确定依据`:'主档案、已确认记忆与安全规则'}</small></span>{busy==='autofill-rules'?<LoaderCircle className="spin" size={17}/>:phaseProgress.rules!==null?<Check size={17}/>:null}</div>
     <div className={busy==='autofill-model'?'active':''}><b>02</b><span><strong>模型处理歧义</strong><small>{phaseProgress.model!==null?`本轮 ${phaseProgress.model} 项已回读验证`:summary?`${summary.model_resolved} 项已解释 · ${pending} 项待分析`:'只分析仍无法确定的字段'}</small></span>{busy==='autofill-model'?<LoaderCircle className="spin" size={17}/>:<Sparkles size={17}/>}</div>

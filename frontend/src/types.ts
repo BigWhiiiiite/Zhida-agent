@@ -1,5 +1,5 @@
 export type Experience = { organization:string; department:string; role:string; employment_type:string; location:string; start_date:string; end_date:string; current:boolean; description:string; achievements:string[]; technologies:string[] }
-export type Project = { name:string; role:string; start_date:string; end_date:string; background:string; description:string; achievements:string[]; technologies:string[]; project_url:string; github_url:string }
+export type Project = { name:string; role:string; start_date:string; end_date:string; background:string; description:string; responsibilities?:string; achievements:string[]; technologies:string[]; project_url:string; github_url:string }
 export type Education = { school:string; college:string; degree:string; major:string; study_mode:string; academic_system:string; student_id:string; advisor:string; laboratory:string; research_direction:string; location:string; start_date:string; end_date:string; gpa:string; ranking:string; courses:string[]; description:string; current:boolean }
 export type ApplicationAnswerMemory = { id:string;question:string;normalized_question:string;semantic_key:string;entity_scope:string;field_signature:string;field_type:string;option_fingerprint:string;value:string;source_host:string;confirmed_count:number;updated_at:string }
 export type ResumeProfile = {
@@ -14,12 +14,16 @@ export type UserAccount = { id:string; email:string; display_name:string; create
 export type AuthSession = { user:UserAccount }
 export type Evidence = { id:string; field_path:string; value:unknown; confidence:number; source_text:string; source_page:number|null; status:'pending_review'|'confirmed'|'edited'|'rejected' }
 export type ResumeRecord = { id:string; filename:string; label:string; profile:ResumeProfile; parser:string; status:string; language:string; tags:string[]; target_role:string; is_default:boolean; file_size:number; content_hash:string; error_message:string; evidence:Evidence[]; created_at:string; updated_at:string }
+export type ResumeFactTargets = { resume_id:string;revision:string;records:{record_key:string;section:'education'|'internships'|'projects';label:string;attributes:{key:string;label:string;value:string}[]}[];warnings:string[] }
+export type ConfirmedResumeFact = { revision:string;record_key:string;attribute:string;value:string;confirmed:true }
 export type Conflict = { id:string; field_path:string; current_value:unknown; incoming_value:unknown; resume_id:string; resume_label:string; status:string; resolution:unknown; created_at:string }
 export type PageField = {
+  date_precision?:''|'date'|'month';
+  region_picker?:boolean;region_value_path?:string;
   selector:string; label:string; question_text:string; label_source:string; context:string; help_text:string; nearby_labels:string[]; section_path:string[]; recognition_confidence:number; placeholder:string; ordinal:number; name:string; field_type:string; required:boolean; options:string[];
   current_value:string; accept:string; role:string; group_label:string; option_label:string;
   option_value:string; multiple:boolean; readonly:boolean; autocomplete:string; section:string;
-  semantic_key:string; entity_scope:string; field_signature:string; signature_rank:number; container_key:string; control_group_key:string; expected_input:string; recognition_evidence:string;
+  semantic_key:string; entity_scope:string; field_signature:string; signature_rank:number; container_key:string; record_keys?:string[]; control_group_key:string; expected_input:string; recognition_evidence:string;
 }
 export type SiteRoute = { adapter:string;label:string;matched_by:'host'|'dom'|'fallback';evidence:string[];tools:string[];note:string }
 export type BrowserSnapshot = { session_id:string; url:string; title:string; recognition_profile:string; site_route:SiteRoute; fields:PageField[] }
@@ -36,19 +40,23 @@ export type AgentNextAction = 'browse_jobs'|'search_jobs'|'open_job'|'start_appl
 export type ApplicationAgentDecision = { stage:WorkflowStage;goal:string;summary:string;next_action:AgentNextAction;next_label:string;rationale:string;blockers:string[];user_questions:string[];can_execute:boolean;requires_user:boolean;risk_level:'low'|'medium'|'high';model_status:'model'|'local_fallback';model:string;candidate_id?:string }
 export type ApplicationAgentEvent = { action:string;stage:WorkflowStage;summary:string;created_at:string }
 export type ApplicationAgentCheckpoint = { run_id:string;session_id:string;status:'active'|'waiting_user'|'review'|'completed'|'stopped';stage:WorkflowStage;url:string;title:string;updated_at:string;events:ApplicationAgentEvent[] }
-export type ApplicationAgentTurn = { decision:ApplicationAgentDecision;workflow:ApplicationWorkflowState;snapshot:BrowserSnapshot;action_taken:AgentNextAction|'';review:FormReviewResult|null;execution:ExecutionResult|null;pre_submit:PreSubmitCheck|null;checkpoint:ApplicationAgentCheckpoint }
+export type ApplicationAgentTurn = { decision:ApplicationAgentDecision;workflow:ApplicationWorkflowState;snapshot:BrowserSnapshot;action_taken:AgentNextAction|'';review:FormReviewResult|null;execution:ExecutionResult|null;pre_submit:PreSubmitCheck|null;checkpoint:ApplicationAgentCheckpoint;assistance?:ApplicationAssistResult|null }
+export type ApplicationJourneyResult = { status:'waiting_login'|'waiting_registration'|'waiting_verification'|'needs_user'|'ready_for_review'|'blocked'|'partial';message:string;turn:ApplicationAgentTurn;steps:number;events:{action:string;stage:WorkflowStage;message:string}[] }
 export type FillAction = { selector:string; label:string; action:'fill'|'select'|'check'|'skip'|'ask_user'; value:string|boolean; value_source:string; confidence:number; reason:string; sensitive:boolean; user_confirmed:boolean; resolution_source?:'rules'|'model'|'user'|'blocked'; review_question?:string;review_hint?:string;needs_model?:boolean }
 export type KnowledgeMappingTarget = { path:string;label:string;semantic_key:string;requires_entity_scope:boolean }
 export type ApplicationKnowledgeInput = { kind:'mapping'|'rule';question:string;aliases?:string[];source_url:string;section?:string;profile_path?:string;entity_scope?:string;field_signature?:string;field_type?:string;note?:string;confirmed:boolean;expires_at?:string|null }
 export type ApplicationKnowledgeRecord = ApplicationKnowledgeInput & { id:string;site_scope:string;semantic_key:string;created_at:string;updated_at:string }
 export type ApplicationKnowledgeMatch = { selector:string;knowledge_id:string;question:string;profile_path:string;entity_scope:string;score:number;usable:boolean;reason:string;retrieval_mode:string }
 export type FormRoutingSummary = { rules_ready:number;model_resolved:number;needs_user:number;model_pending:number }
-export type FormPlan = { page_summary:string; site_type:string; actions:FillAction[]; missing_questions:string[]; knowledge_matches?:ApplicationKnowledgeMatch[]; routing_summary?:FormRoutingSummary }
+export type FormPlan = { context_token?:string; resume_id?:string; page_summary:string; site_type:string; actions:FillAction[]; missing_questions:string[]; knowledge_matches?:ApplicationKnowledgeMatch[]; routing_summary?:FormRoutingSummary }
 export type ComparisonStatus = 'matched'|'missing'|'conflict'|'manual_review'|'unmapped'|'option_unavailable'
 export type FieldComparison = { key:string;selector:string;label:string;field_type:string;required:boolean;options:string[];site_value:string;expected_value:string;value_source:string;status:ComparisonStatus;recommendation:string }
 export type ComparisonSummary = { matched:number;missing:number;conflict:number;manual_review:number;unmapped:number;option_unavailable:number }
 export type FormReviewResult = { snapshot:BrowserSnapshot;plan:FormPlan;comparisons:FieldComparison[];summary:ComparisonSummary }
 export type AutofillPhaseResult = { phase:'rules'|'model';review:FormReviewResult;execution:ExecutionResult }
+export type ApplicationAssistRequest = { resume_id:string;allow_site_parse:boolean;use_model:boolean;max_rounds:number;defer_government_id?:boolean;deferred_fields?:PageField[] }
+export type ApplicationRecordCoverage = {kind:'education'|'internships'|'projects';label:string;source_total:number;website_records:number;matched_records:number;missing_names:string[];ambiguous:boolean;can_expand:boolean}
+export type ApplicationAssistResult = { status:'ready_for_review'|'needs_user'|'blocked'|'partial';message:string;snapshot:BrowserSnapshot;review:FormReviewResult|null;pre_submit:PreSubmitCheck|null;events:{kind:string;message:string;completed:number;failed:number;issues?:{label:string;message:string}[]}[];rounds:number;record_coverage?:ApplicationRecordCoverage[] }
 export type NativeResumeImportResult = { snapshot:BrowserSnapshot;uploaded_file:string;trigger_clicked:boolean;trigger_label:string;changed_fields:number;status:'parsed'|'uploaded'|'needs_user_action';message:string }
 export type RequiredFieldIssue = { selector:string; label:string; field_type:string }
 export type PreSubmitCheck = { url:string; ready:boolean; required_total:number; filled_count:number; required_missing:RequiredFieldIssue[]; validation_errors:string[]; human_challenges:string[]; file_uploads:string[]; submit_labels:string[] }

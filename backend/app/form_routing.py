@@ -74,6 +74,13 @@ def _has_question_evidence(field: PageField) -> bool:
 
 def question_for_user(field: PageField) -> str:
     if meaningful_question(_question(field)):
+        kind = semantic_key_for(field).split('.', 1)[0]
+        if kind=='language':
+            language=entity_scope_for(field).removeprefix('language:')
+            return f"语言能力{('（'+language+'）') if language!='unspecified' else ''}：{_question(field)}"
+        if kind in {'experience', 'project'}:
+            section = field.section or {'experience':'实习/工作经历', 'project':'项目经历'}[kind]
+            return f'{section}：{_question(field)}'
         return _question(field)
     section = field.section or " / ".join(field.section_path) or "当前页面"
     kind = "选择题" if field.options or field.field_type in {"radio", "checkbox", "combobox"} else "输入项"
@@ -115,6 +122,9 @@ def route_local_plan(plan: FormPlan, snapshot: BrowserSnapshot, profile: Candida
         action.review_question = question_for_user(field)
         action.review_hint = action.reason
         action.needs_model = False
+        if action.action == "ask_user" and action.resolution_source == "user":
+            action.value = ""
+            continue  # Missing personal precision cannot be supplied by a model.
         action.resolution_source = "rules"
         boundary = _hard_boundary(field)
         confirmed_gender = (semantic_key_for(field) == "candidate.gender" and action.user_confirmed

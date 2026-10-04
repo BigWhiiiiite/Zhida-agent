@@ -51,6 +51,7 @@ _ROOT_TARGETS = (
     ("qq", "QQ 号", "candidate.qq"),
     ("wechat", "微信号", "candidate.wechat"),
     ("location", "当前所在地", "candidate.current_location"),
+    ("hometown", "籍贯（不是当前所在地）", "candidate.hometown"),
     ("hukou_location", "户籍所在地", "candidate.hukou_location"),
     ("address", "通讯地址", "candidate.address"),
     ("website", "个人网站/作品集", "candidate.website"),
@@ -60,6 +61,7 @@ _ROOT_TARGETS = (
     ("preferred_business_groups", "意向事业群", "preference.business_group"),
     ("interview_preferences", "面试城市/方式", "preference.interview_location"),
     ("willing_to_relocate", "是否接受城市调剂", "preference.relocation"),
+    ("available_date", "最早可入职日期（本人确认）", "preference.available_date"),
     ("campus_candidate_type", "应届生类型", "candidate.campus_type"),
     ("skills", "技能", "candidate.skills"),
     ("languages", "语言能力", "candidate.languages"),
@@ -123,7 +125,7 @@ def company_scope(source_url: str) -> str:
         return f"host:{host}"
     if (host == "mokahr.com" or host.endswith(".mokahr.com") or
             host == "moka.com" or host.endswith(".moka.com")):
-        if len(parts) >= 2 and parts[0] in {"campus-recruitment", "social-recruitment"}:
+        if len(parts) >= 2 and parts[0] in {"campus-recruitment", "social-recruitment", "apply"}:
             return f"tenant:{host}:moka:{parts[1]}"
     if host in {"jobs.lever.co", "jobs.eu.lever.co"} and parts:
         return f"tenant:{host}:lever:{parts[0]}"
