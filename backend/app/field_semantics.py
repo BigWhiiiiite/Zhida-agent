@@ -5,6 +5,7 @@ import re
 from urllib.parse import urlparse
 
 from .browser_models import PageField
+from .form_field_policy import family_scope, family_subject
 
 
 EDUCATION_LEVEL_ALIASES = {
@@ -34,12 +35,12 @@ EDUCATION_ATTRIBUTE_HINTS = (
 )
 
 EXPERIENCE_ATTRIBUTE_HINTS = (
-    ("experience.organization", ("实习公司", "工作单位", "公司名称", "雇主", "employer", "company", "organization")),
+    ("experience.organization", ("实习公司", "实习单位", "工作单位", "公司名称", "雇主", "employer", "company", "organization")),
     ("experience.department", ("所在部门", "实习部门", "部门", "department", "division")),
-    ("experience.role", ("职位名称", "实习职位", "岗位名称", "职位", "job title", "position", "role")),
+    ("experience.role", ("职位名称", "实习职位", "实习岗位", "岗位名称", "职位", "job title", "position", "role")),
     ("experience.start_date", ("入职时间", "开始时间", "start date", "from date")),
     ("experience.end_date", ("离职时间", "结束时间", "end date", "to date")),
-    ("experience.description", ("工作内容", "职责描述", "工作描述", "responsibilities", "job description")),
+    ("experience.description", ("实习内容", "工作内容", "职责描述", "工作描述", "responsibilities", "job description")),
 )
 
 PROJECT_ATTRIBUTE_HINTS = (
@@ -69,9 +70,14 @@ SEMANTIC_HINTS = (
     ("candidate.ethnicity", ("民族", "族别", "ethnicity", "ethnic group")),
     ("candidate.political_status", ("政治面貌", "政治身份", "political status", "political affiliation")),
     ("candidate.marital_status", ("婚姻状况", "婚姻状态", "marital status")),
+    ("candidate.height_cm", ("身高（cm）", "身高(cm)", "身高（厘米）", "height (cm)", "height(cm)")),
+    ("candidate.weight_kg", ("体重（kg）", "体重(kg)", "体重（千克）", "weight (kg)", "weight(kg)")),
+    ("candidate.student_origin", ("生源地", "高考所在地", "高考所在地区", "student origin")),
+    ("candidate.study_continuity", ("学习时间是否连续", "学习经历是否连续", "study continuity")),
+    ("candidate.veteran_status", ("是否为退役军人", "是否退役军人", "veteran status")),
     ("candidate.hukou_location", ("户籍所在地", "户口所在地", "户籍地", "户口地", "hukou", "household registration")),
     ("candidate.hometown", ("籍贯", "祖籍", "native place", "ancestral hometown")),
-    ("candidate.address", ("通讯地址", "联系地址", "现居住地址", "mailing address", "contact address")),
+    ("candidate.address", ("通讯地址", "通信地址", "联系地址", "现居住地址", "mailing address", "contact address")),
     ("candidate.country_region", ("国家/地区", "国家或地区", "所在国家", "country/region", "country or region", "country")),
     ("candidate.current_location", ("当前所处地", "当前所在地", "现居地", "居住地", "current location", "current city")),
     ("preference.work_location", ("期望工作城市", "期望城市", "意向城市", "工作地点志愿", "preferred location", "preferred city", "work city")),
@@ -144,6 +150,9 @@ def field_identity_text(field: PageField) -> str:
 
 
 def semantic_key_for(field: PageField) -> str:
+    # A cached/model-supplied candidate key cannot change a parent's subject.
+    if family_subject(field):
+        return "third_party.contact"
     if field.semantic_key:
         return field.semantic_key
     text = field_text(field)
@@ -185,6 +194,8 @@ def semantic_key_for(field: PageField) -> str:
 
 
 def entity_scope_for(field: PageField, semantic_key: str = "") -> str:
+    if scope := family_scope(field):
+        return scope
     if field.entity_scope:
         return field.entity_scope
     key = semantic_key or semantic_key_for(field)
@@ -216,12 +227,29 @@ def option_fingerprint(options: list[str]) -> str:
     return hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()[:16] if normalized else ""
 
 
+CHECKBOX_OPTION_SIGNATURE_PREFIX = "checkbox-option-v1:"
+CHECKBOX_AMBIGUOUS_MEMORY_PREFIX = "复选题记忆归属不明确："
+
+
+def checkbox_option_group(field: PageField) -> bool:
+    """A native checkbox option, not an independent yes/no checkbox.
+
+    The DOM extractor supplies the actual group and shared option list. Native
+    checkbox inputs still have multiple=False, so that flag is not evidence of
+    a standalone question. Caption/name equality alone cannot create a group.
+    """
+    option = normalize_text(field.option_label or field.option_value)
+    return bool(field.field_type == "checkbox" and field.control_group_key
+                and len(field.options) > 1 and option
+                and option in {normalize_text(value) for value in field.options})
+
+
 def field_signature_for(field: PageField, source_url: str, rank: int = 0) -> str:
     parsed = urlparse(source_url)
     site_scope = f"{(parsed.hostname or '').casefold()}{parsed.path.rstrip('/')}"
     semantic_key = semantic_key_for(field)
     entity_scope = entity_scope_for(field, semantic_key)
-    identity = "|".join((
+    parts = (
         site_scope,
         semantic_key,
         entity_scope,
@@ -230,10 +258,16 @@ def field_signature_for(field: PageField, source_url: str, rank: int = 0) -> str
         normalize_text(field.name),
         field.autocomplete.casefold(),
         field.field_type,
-        # Lazy-loading options must not turn the same question into a new field.
-        # Answer reuse checks option_fingerprint independently of this identity.
-        str(rank),
-    ))
+    )
+    if checkbox_option_group(field):
+        # An option's position is not its identity. Keep an explicit version so
+        # old rank-based boolean memories cannot be interpreted as this option.
+        identity = "|".join((*parts, "checkbox-option-v1",
+                             normalize_text(field.option_label), normalize_text(field.option_value)))
+        return CHECKBOX_OPTION_SIGNATURE_PREFIX + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    # Lazy-loading options must not turn the same question into a new field.
+    # Answer reuse checks option_fingerprint independently of this identity.
+    identity = "|".join((*parts, str(rank)))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
@@ -352,4 +386,21 @@ def enrich_fields(fields: list[PageField], source_url: str) -> list[PageField]:
             "expected_input": expected_input_for(field, key, scope),
             "recognition_evidence": recognition_evidence_for(field),
         }))
+    # A stable option caption/value does not distinguish two independent
+    # questions with otherwise identical semantic provenance. DOM group keys
+    # identify that collision ONLY within this snapshot; they must not enter
+    # the persistent identity. Disable every member of both groups instead.
+    option_groups: dict[str, set[tuple[str, str]]] = {}
+    for field in enriched:
+        if checkbox_option_group(field):
+            owner = (field.container_key, field.control_group_key)
+            option_groups.setdefault(field.field_signature, set()).add(owner)
+    ambiguous_owners = {owner for owners in option_groups.values() if len(owners) > 1 for owner in owners}
+    for index, field in enumerate(enriched):
+        if checkbox_option_group(field) and (field.container_key, field.control_group_key) in ambiguous_owners:
+            reason = (CHECKBOX_AMBIGUOUS_MEMORY_PREFIX +
+                      "同页有多个独立复选题共享题干与选项，尚无稳定记录归属；本轮不复用或保存选项记忆")
+            if field.knowledge_block_reason and not field.knowledge_block_reason.startswith(CHECKBOX_AMBIGUOUS_MEMORY_PREFIX):
+                reason += "；" + field.knowledge_block_reason
+            enriched[index] = field.model_copy(update={"field_signature": "", "knowledge_block_reason": reason})
     return enriched

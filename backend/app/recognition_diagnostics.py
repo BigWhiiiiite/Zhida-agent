@@ -26,7 +26,7 @@ async def inspect_recognition_structure(page):
       const fields=[...document.querySelectorAll(controls)].filter(el=>visible(el)&&
         !['hidden','password','submit','button','reset'].includes(el.type)&&el.autocomplete!=='one-time-code');
       const components=[...document.querySelectorAll('[class]')].filter(el=>visible(el)&&[...el.classList].some(c=>
-        /^phoenix-/.test(c)));
+        /^(phoenix-|ant-)/.test(c)));
       const unique=[]; const signatures=new Set();
       for(const el of components){
         const signature=[el.tagName,[...el.classList].join(' '),[...el.children].map(n=>[...n.classList].join(' ')).join('|')].join(':');
@@ -89,7 +89,7 @@ async def inspect_component_shapes(page):
         // Fixed widget-action captions only. Never arbitrary form values.
         ...(/^(确定|确认|完成|取消|清空|返回|上一级)$/.test(caption(n))?{caption:caption(n)}:{})});
       const seen=new Set(), result=[];
-      const nodes=new Set([...document.querySelectorAll('[class]')].filter(n=>[...n.classList].some(c=>c.startsWith('phoenix-'))));
+      const nodes=new Set([...document.querySelectorAll('[class]')].filter(n=>[...n.classList].some(c=>/^(phoenix-|ant-)/.test(c))));
       // Region pickers embed Phoenix breadcrumbs inside a separate widget.
       // Capture its bounded class-only shape, not its HTML or input values.
       for(const crumb of document.querySelectorAll('.phoenix-breadcrumb')){
@@ -99,7 +99,14 @@ async def inspect_component_shapes(page):
       }
       for(const n of nodes){
         if(!n.getClientRects().length)continue;
-        const item={...shape(n),children:[...n.children].slice(0,8).map(shape)};
+        const item={...shape(n),children:[...n.children].slice(0,8).map(shape),
+          focused:n===document.activeElement, owns:[n,...n.querySelectorAll('[aria-controls],[aria-owns]')]
+            .flatMap(el=>(String(el.getAttribute('aria-controls')||'')+' '+String(el.getAttribute('aria-owns')||''))
+              .trim().split(/\s+/).filter(Boolean)).map(id=>{
+                const target=document.getElementById(id);
+                return {exists:Boolean(target),target:target?shape(target):null,
+                  ancestors:(()=>{const a=[];for(let p=target?.parentElement,d=0;p&&p!==document.body&&d<4;p=p.parentElement,d++)a.push(shape(p));return a;})()};
+              }).slice(0,5)};
         const signature=JSON.stringify(item);if(seen.has(signature))continue;
         seen.add(signature);result.push(item);if(result.length>=160)break;
       }

@@ -7,6 +7,7 @@ import unicodedata
 from .browser_models import BrowserSnapshot
 from .field_semantics import semantic_key_for
 from .models import CandidateProfile
+from .form_field_policy import formal_employment_only
 
 
 def _identity(value: str) -> str:
@@ -19,7 +20,8 @@ def resolve_repeated_records(snapshot: BrowserSnapshot, profile: CandidateProfil
                                   ("project", profile.projects, "name")):
         groups = {}
         for field in snapshot.fields:
-            if field.container_key and semantic_key_for(field).startswith(kind + "."):
+            if (field.container_key and not formal_employment_only(field)
+                    and semantic_key_for(field).startswith(kind + ".")):
                 groups.setdefault(field.container_key, []).append(field)
         candidates = {}
         empty_groups = []

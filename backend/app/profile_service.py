@@ -14,6 +14,7 @@ from .storage import create_conflict, get_profile, get_resume, save_profile, upd
 SCALAR_FIELDS = [
     "name", "english_name", "gender", "birth_date", "age", "phone", "email", "qq", "wechat",
     "location", "country_region", "nationality", "ethnicity", "political_status", "marital_status",
+    "height_cm", "weight_kg", "student_origin", "veteran_status", "study_continuity", "formal_employment_status",
     "hometown", "hukou_location", "address", "website", "github", "linkedin", "target_role",
     "available_date", "internship_duration", "days_per_week", "expected_salary", "remote_preference",
     "willing_to_relocate", "campus_candidate_type", "summary",
@@ -31,6 +32,8 @@ SEMANTIC_PROFILE_FIELDS = {
     "candidate.website": "website", "candidate.country_region": "country_region",
     "candidate.nationality": "nationality", "candidate.ethnicity": "ethnicity",
     "candidate.political_status": "political_status", "candidate.marital_status": "marital_status",
+    "candidate.height_cm": "height_cm", "candidate.weight_kg": "weight_kg",
+    "candidate.student_origin": "student_origin", "candidate.study_continuity": "study_continuity",
     "candidate.hukou_location": "hukou_location", "candidate.address": "address",
     "candidate.hometown": "hometown",
     "candidate.current_location": "location", "candidate.campus_type": "campus_candidate_type",
@@ -107,12 +110,24 @@ def save_application_answer(question: str, field_name: str, value: str, *, seman
     direct_field = ('' if semantic_key.startswith('language.') else
                     SEMANTIC_PROFILE_FIELDS.get(semantic_key) or _answer_profile_field(cleaned_question, field_name))
     identity_fields = {"name", "english_name", "age", "birth_date", "phone", "email", "qq", "wechat",
+                       "height_cm", "weight_kg", "student_origin", "study_continuity",
                        "location", "hometown", "address", "country_region", "nationality", "website", "github", "linkedin"}
     if direct_field and (not resume_id or direct_field in identity_fields):
         if direct_field == "hometown":
             from .region_facts import merge_confirmed_hometown
 
             current.hometown = merge_confirmed_hometown(current.hometown, cleaned_value, cleaned_question)
+        elif direct_field in {"height_cm", "weight_kg"}:
+            # Unit-converting model guesses must not become persistent facts.
+            # The matched question has to explicitly require these units.
+            unit = "cm" if direct_field == "height_cm" else "kg"
+            number = re.sub(rf"\s*(?:{unit}|{'厘米' if unit == 'cm' else '千克|公斤'})$", "", cleaned_value, flags=re.I)
+            try:
+                value_number = float(number)
+                validated = ResumeProfile.model_validate({direct_field: value_number})
+            except (ValueError, TypeError):
+                raise ValueError("身高、体重请按题目单位填写有效数值")
+            setattr(current, direct_field, getattr(validated, direct_field))
         elif direct_field == "age":
             age_text = re.sub(r"(?:周岁|岁)$", "", cleaned_value).strip()
             if not age_text.isdecimal() or not 0 <= int(age_text) <= 120:

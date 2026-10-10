@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, Request, Response as FastAPIResponse, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, Response as FastAPIResponse, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
@@ -35,18 +35,25 @@ from .browser_models import (BrowserSnapshot, BrowserStart, ExecutePlanRequest, 
                              ExpandSectionRequest, FormPlan, FormReviewResult,
                              HybridAutofillRequest, HybridAutofillResult,
                              NativeResumeImportRequest, NativeResumeImportResult, PreSubmitCheck)
-from .browser_service import browser_demo
+from .browser_service import browser_demo, NavigationNoProgressError, configured_browser_engine
+from .external_browser import (ExternalWebsiteOpen, ExistingSafariPreview,
+                               ExistingSafariConfirmation, open_external_website)
+from .safari_window_registry import safari_windows
 from .task_profile import compose_task_profile, context_token
 from .application_knowledge import company_scope
 from .browser_models import TaskResumeUpdate
-from .browser_models import ApplicationAssistRequest, ApplicationAssistResult
+from .browser_models import ApplicationAssistRequest, ApplicationAssistResult, ApplicationAssistProgress
 from .application_assist import prepare_application
+from .assist_runs import assist_runs
 from .chat_api import router as chat_router
 from .chat_storage import initialize as initialize_chat
 from .extractors import extract_text, preview_html
 from .confirmed_facts import (ConfirmedFactRequest, FactRevisionConflict, FactTargets,
                               get_fact_targets, save_confirmed_fact)
 from .form_agent import build_form_review, create_form_plan, create_local_form_plan
+from .extraction_audit import (ExtractionAuditRequest, ExtractionAuditResult,
+                               audit_extraction, document_fingerprint)
+from .page_observation import PageObservationRequest, PageRegionObservation, ObservationConsentRequest
 from .job_discovery import (official_job_sources, register_job_source,
                             remove_job_source, sync_official_source)
 from .job_models import (ApplicationQueueItem, ApplicationQueueUpdate,
@@ -88,6 +95,7 @@ PUBLIC_API_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login"}
 browser_session_owners: dict[str, str] = {}
 browser_task_resumes: dict[str, str] = {}
 browser_task_epochs: dict[str, str] = {}
+browser_image_consents: dict[str, str] = {}  # task-context token, not a global preference
 
 
 def _task_context(session_id: str) -> tuple[CandidateProfile, str]:
@@ -120,7 +128,31 @@ def _stamp_plan(session_id: str, plan: FormPlan) -> FormPlan:
 
 async def _model_task_plan(session_id: str, snapshot: BrowserSnapshot) -> FormPlan:
     profile, revision = _task_context(session_id)
-    plan = await create_form_plan(snapshot, profile)
+    observation_workflow = await browser_demo.workflow_state(session_id)
+    observation_snapshot = snapshot.model_copy(deep=True)
+    observation_lock = asyncio.Lock()
+    async def observe_controls(selectors):
+        async with observation_lock:
+            _require_browser_owner(session_id)
+            if revision != _task_context(session_id)[1]:
+                raise HTTPException(409, '资料已变化，停止模型控件观察')
+            result = await browser_demo.observe_form_controls(session_id, selectors,
+                expected_snapshot=observation_snapshot, expected_workflow=observation_workflow)
+            if revision != _task_context(session_id)[1]:
+                raise HTTPException(409, '观察期间资料已变化，丢弃结果')
+            return result
+    async def observe_page_region(selector):
+        async with observation_lock:
+            _require_browser_owner(session_id)
+            if revision != _task_context(session_id)[1]:
+                raise HTTPException(409, '资料已变化，停止题目观察')
+            result = await browser_demo.observe_page_region(session_id, selector,
+                include_image=browser_image_consents.get(session_id) == revision, expected_snapshot=snapshot)
+            if revision != _task_context(session_id)[1]:
+                raise HTTPException(409, '观察期间资料已变化，丢弃结果')
+            return result
+    plan = await create_form_plan(snapshot, profile, observe_controls=observe_controls,
+                                  observe_page_region=observe_page_region)
     if revision != _task_context(session_id)[1]:
         raise HTTPException(409, "模型分析期间资料发生变化，请重新分析，未执行旧计划")
     return _stamp_plan(session_id, plan)
@@ -172,7 +204,14 @@ async def require_account(request: Request, call_next):
     request.state.user = user
     context_token = set_current_user(user.id)
     try:
-        if request.url.path == "/api/browser" or request.url.path.startswith("/api/browser/"):
+        # Run receipts never touch the browser. They must remain readable while
+        # the single browser operation lock is held by a long model/fill run.
+        receipt_path = request.url.path.split('/')
+        receipt_only = (len(receipt_path) in {7,8} and receipt_path[1:3] == ['api','browser']
+            and receipt_path[4:6] == ['assist','progress']
+            and (request.method == 'GET' and len(receipt_path) == 7
+                 or request.method == 'POST' and len(receipt_path) == 8 and receipt_path[7] == 'cancel'))
+        if not receipt_only and (request.url.path == "/api/browser" or request.url.path.startswith("/api/browser/")):
             # The current service owns one active browser. Background inspection
             # also opens menus, so serialize it with filling and navigation.
             async with app.state.browser_operation_lock:
@@ -194,7 +233,8 @@ def _require_browser_owner(session_id: str) -> None:
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]: return {"status": "ok", "product": "Zhida"}
+def health() -> dict[str, str]:
+    return {"status": "ok", "product": "Zhida", "browser_engine": configured_browser_engine()}
 
 
 @app.post("/api/auth/register", response_model=AuthSession, status_code=201)
@@ -231,8 +271,10 @@ async def logout_account(request: Request) -> Response:
                       if user_id == current_user_id()]
     if browser_demo.session_id in owned_sessions:
         await browser_demo.close()
+    safari_windows.forget_owner(current_user_id())
     for session_id in owned_sessions:
         browser_session_owners.pop(session_id, None)
+        browser_image_consents.pop(session_id, None)
     response = Response(status_code=204)
     response.delete_cookie(SESSION_COOKIE, path="/")
     return response
@@ -651,12 +693,21 @@ async def select_task_resume(session_id: str, payload: TaskResumeUpdate) -> dict
         raise HTTPException(422, str(exc)) from exc
     browser_task_resumes[session_id] = payload.resume_id
     browser_task_epochs[session_id] = str(uuid4())
+    browser_image_consents.pop(session_id, None)
     return {"resume_id": payload.resume_id, "context_token": _task_context(session_id)[1]}
 
 
 @app.post("/api/browser/start", response_model=BrowserSnapshot)
-async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
+async def start_browser(payload: BrowserStart, request: Request) -> BrowserSnapshot:
     try:
+        if configured_browser_engine() == "safari":
+            host = request.client.host if request.client else ""
+            try:
+                local = host == "testclient" or ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                local = host == "localhost"
+            if not local:
+                raise HTTPException(403, "Safari 使用本机浏览器登录状态，只允许本机使用。多用户部署请设置 APP_BROWSER_ENGINE=chromium，以隔离各用户招聘账号。")
         if browser_demo.session_id:
             # A new chat task must not silently close another task or user's
             # browser, including their in-progress application and login.
@@ -665,7 +716,14 @@ async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
         if payload.resume_id and not resume:
             raise HTTPException(404, "选择的简历不存在")
         compose_task_profile(get_profile(), resume)
-        result = await browser_demo.start(payload.url, current_user_id(), target=payload.target)
+        if configured_browser_engine() == "safari":
+            browser_demo._validate_url(payload.url)
+            window = await safari_windows.for_connection(current_user_id(), payload.url, payload.safari_window_token)
+            result = await browser_demo.start(payload.url, current_user_id(), target=payload.target, safari_page=window.page)
+        else:
+            if payload.safari_window_token:
+                raise ValueError("当前后端不是 Safari 模式，不能连接 Safari 窗口")
+            result = await browser_demo.start(payload.url, current_user_id(), target=payload.target)
         browser_task_resumes.clear()
         browser_task_resumes[result.session_id] = payload.resume_id
         browser_task_epochs.clear()
@@ -675,10 +733,91 @@ async def start_browser(payload: BrowserStart) -> BrowserSnapshot:
         return result
     except HTTPException:
         raise
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(502, f"打开网站失败：{exc}") from exc
+        raise HTTPException(502, f"自动填写连接失败：{exc}") from exc
+
+
+def _require_local_browser_request(request: Request) -> None:
+    """Local authenticated frontend gesture, not an arbitrary web origin."""
+    host = request.client.host if request.client else ""
+    try:
+        local = host == "testclient" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = host == "localhost"
+    if not local:
+        raise HTTPException(403, "打开本机浏览器只允许本机使用")
+    origin = request.headers.get("origin")
+    if origin not in {"http://127.0.0.1:5173", "http://localhost:5173"}:
+        raise HTTPException(403, "请从本机职达前端主动点击打开浏览器")
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        raise HTTPException(403, "不能从其他网站启动本机浏览器")
+
+
+@app.post("/api/websites/safari/preview-existing")
+async def preview_existing_safari(payload: ExistingSafariPreview, request: Request):
+    _require_local_browser_request(request)
+    if configured_browser_engine() != 'safari' or browser_demo.session_id:
+        raise HTTPException(409, '请先结束现有会话，且后端需处于 Safari 模式')
+    try:
+        browser_demo._validate_url(payload.url)
+        # This is an explicit UI handoff, not an automatic front-window attach.
+        # A short fixed interval lets the user bring the stated target forward.
+        await asyncio.sleep(10)
+        if browser_demo.session_id:
+            raise HTTPException(409, '已有投递会话，未另行连接窗口')
+        token, url = await safari_windows.preview_existing(current_user_id(), payload.url)
+        return {'preview_token': token, 'url': url, 'expires_in_seconds': 120}
+    except HTTPException:
+        raise
+    except (ValueError, LookupError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.post("/api/websites/safari/confirm-existing")
+async def confirm_existing_safari(payload: ExistingSafariConfirmation, request: Request):
+    _require_local_browser_request(request)
+    if configured_browser_engine() != 'safari' or browser_demo.session_id:
+        raise HTTPException(409, '已有投递会话或后端不是 Safari 模式，未连接窗口')
+    try:
+        browser_demo._validate_url(payload.url)
+        entry = await safari_windows.confirm_existing(current_user_id(), payload.url, payload.preview_token)
+        return {'status': 'requested', 'browser': 'safari', 'automation_connected': False,
+                'safari_window_token': entry.token, 'window_reused': True}
+    except (ValueError, LookupError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.post("/api/websites/open")
+async def open_normal_website(payload: ExternalWebsiteOpen, request: Request):
+    """Only an authenticated local user may launch apps on this computer."""
+    _require_local_browser_request(request)
+    try:
+        if payload.browser == "safari":
+            if browser_demo.session_id:
+                raise HTTPException(409, "已有自动填写会话，请在当前招聘窗口继续，或先结束该会话")
+            entry, reused = await safari_windows.open(current_user_id(), payload.url)
+            return {"status": "requested", "browser": "safari", "automation_connected": False,
+                    "safari_window_token": entry.token, "window_reused": reused}
+        return await open_external_website(payload)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        # Transport errors are fixed sanitized diagnostics, not raw stderr.
+        # Ownership failures and timeouts are not necessarily missing consent.
+        raise HTTPException(502, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "本机浏览器打开未完成。Safari 需要 macOS 允许职达启动程序控制 Safari；"
+                                 "可先复制网址手动打开，但手动窗口不会被自动接管。") from exc
 
 
 @app.get("/api/browser/{session_id}/snapshot", response_model=BrowserSnapshot)
@@ -709,6 +848,91 @@ async def browser_recognition_diagnostics(session_id: str) -> dict:
         return await browser_demo.recognition_diagnostics(session_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/browser/{session_id}/observation-consent")
+async def observation_consent(session_id: str) -> dict:
+    _require_browser_owner(session_id)
+    revision = _task_context(session_id)[1]
+    return {"enabled": browser_image_consents.get(session_id) == revision, "context_token": revision}
+
+
+@app.post("/api/browser/{session_id}/extraction-audit", response_model=ExtractionAuditResult)
+async def extraction_audit(session_id: str, payload: ExtractionAuditRequest) -> ExtractionAuditResult:
+    """Read/model-review the entire collected document. Never compile or execute a fill plan."""
+    _require_browser_owner(session_id)
+    revision = _task_context(session_id)[1]
+    if payload.context_token != revision:
+        raise HTTPException(409, "页面或资料已变化，请重新同步只读检查")
+    if payload.include_images and browser_image_consents.get(session_id) != revision:
+        raise HTTPException(409, "本轮题目截图尚未授权，未发送图片")
+    if payload.include_images and not payload.use_model:
+        raise HTTPException(422, "仅本地检查请关闭模型截图，未采集图片")
+    snapshot = await browser_demo.snapshot_for(session_id)
+    baseline = document_fingerprint(snapshot)
+    observation_workflow = await browser_demo.workflow_state(session_id) if payload.inspect_controls else None
+    observation_snapshot = snapshot.model_copy(deep=True)
+
+    def guard():
+        _require_browser_owner(session_id)
+        if revision != _task_context(session_id)[1]:
+            raise ValueError("只读检查期间页面或资料变化，已丢弃结果")
+
+    async def controls(selectors):
+        guard()
+        result = await browser_demo.observe_form_controls(session_id, selectors,
+            expected_snapshot=observation_snapshot, expected_workflow=observation_workflow)
+        guard()
+        return result
+
+    async def region(selector):
+        guard()
+        result = await browser_demo.observe_page_region(session_id, selector, include_image=True,
+                                                        bring_into_view=True, audit_only=True)
+        guard()
+        return result
+
+    try:
+        result = await audit_extraction(snapshot, payload, observe_controls=controls, observe_region=region)
+        guard()
+        after = await browser_demo.snapshot_for(session_id)
+        if baseline != document_fingerprint(after):
+            raise ValueError("检查期间网页题目、经历归属或填写值变化；未沿用旧结果，请只读同步后重试")
+        return result
+    except (ValueError, LookupError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/browser/{session_id}/observation-consent")
+async def set_observation_consent(session_id: str, payload: ObservationConsentRequest) -> dict:
+    _require_browser_owner(session_id)
+    revision = _task_context(session_id)[1]
+    if payload.enabled:
+        if payload.context_token != revision:
+            raise HTTPException(409, '页面或简历资料已变化，请重新核对截图授权')
+        browser_image_consents[session_id] = revision
+    else:
+        browser_image_consents.pop(session_id, None)
+    return {"enabled": payload.enabled, "context_token": revision}
+
+
+@app.post("/api/browser/{session_id}/observe-region", response_model=PageRegionObservation)
+async def observe_browser_region(session_id: str, payload: PageObservationRequest) -> PageRegionObservation:
+    """Local preview only: this endpoint does not call or send data to a model."""
+    _require_browser_owner(session_id)
+    revision = _task_context(session_id)[1]
+    if payload.context_token != revision:
+        raise HTTPException(409, '页面或简历资料已变化，请重新同步后观察')
+    try:
+        result = await browser_demo.observe_page_region(session_id, payload.selector,
+                                                        include_image=payload.include_image)
+        if revision != _task_context(session_id)[1]:
+            raise HTTPException(409, "观察期间资料已变化，请重新同步")
+        return result
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/browser/{session_id}/field/inspect", response_model=FormReviewResult)
@@ -835,11 +1059,18 @@ async def run_application_agent_step(session_id: str,
         execution = None
         assisted = None
         action_taken = ""
+        navigation_warning = ""
 
         if decision.can_execute and action in {"start_application", "browse_jobs", "search_jobs", "open_job"}:
-            workflow = await browser_demo.advance_workflow(
-                session_id, WorkflowAdvanceRequest(intent=action, candidate_id=decision.candidate_id)
-            )
+            try:
+                workflow = await browser_demo.advance_workflow(
+                    session_id, WorkflowAdvanceRequest(intent=action, candidate_id=decision.candidate_id)
+                )
+            except NavigationNoProgressError as exc:
+                # A no-op entrance is an audited pause, not a lost session or
+                # partially-filled form. Never retry or invent a destination.
+                workflow = exc.workflow
+                navigation_warning = str(exc)
             action_taken = action
         elif decision.can_execute and action == "analyze_and_fill":
             if not payload.resume_id:
@@ -855,9 +1086,13 @@ async def run_application_agent_step(session_id: str,
             check = await browser_demo.pre_submit_check(session_id)
             if not check.ready:
                 raise ValueError("当前页检查结果已经变化，不能继续到下一页")
-            workflow = await browser_demo.advance_workflow(
-                session_id, WorkflowAdvanceRequest(intent="continue_application")
-            )
+            try:
+                workflow = await browser_demo.advance_workflow(
+                    session_id, WorkflowAdvanceRequest(intent="continue_application")
+                )
+            except NavigationNoProgressError as exc:
+                workflow = exc.workflow
+                navigation_warning = str(exc)
             check = None
             action_taken = action
         elif decision.can_execute and action == "refresh":
@@ -868,8 +1103,8 @@ async def run_application_agent_step(session_id: str,
         workflow = await browser_demo.workflow_state(session_id)
         check = (await browser_demo.pre_submit_check(session_id)
                  if workflow.stage in {"profile_form", "application_form", "review"} else None)
-        result_summary = assisted.message if assisted else (f"已执行：{decision.next_label}" if action_taken
-                          else f"等待用户：{decision.next_label}")
+        result_summary = navigation_warning or (assisted.message if assisted else (f"已执行：{decision.next_label}" if action_taken
+                          else f"等待用户：{decision.next_label}"))
         # Return a decision for the new page, not the stale pre-navigation plan.
         decision = await decide_application_step(workflow, snapshot, _task_profile(session_id), check, use_model=False)
         if review is None and workflow.stage in {"profile_form", "application_form", "review"}:
@@ -1067,7 +1302,27 @@ async def check_form_before_submit(session_id: str) -> PreSubmitCheck:
         raise HTTPException(404, str(exc)) from exc
 
 
-async def _run_application_assist(session_id: str, payload: ApplicationAssistRequest) -> ApplicationAssistResult:
+async def _run_application_assist(session_id: str, payload: ApplicationAssistRequest,
+                                  run_id: str | None = None) -> ApplicationAssistResult:
+    _require_browser_owner(session_id)
+    _require_task_resume(session_id, payload.resume_id)
+    run_id = run_id or str(uuid4())
+    progress, replay = assist_runs.begin(run_id, current_user_id(), session_id, payload)
+    if replay:
+        return progress.result
+    try:
+        result = await _prepare_application_assist(session_id, payload,
+            on_progress=lambda event: assist_runs.emit(run_id, event),
+            cancelled=lambda: progress.cancel_requested)
+        assist_runs.finish(run_id, result)
+        return result
+    except BaseException as exc:
+        assist_runs.interrupt(run_id, exc)
+        raise
+
+
+async def _prepare_application_assist(session_id: str, payload: ApplicationAssistRequest,
+                                      *, on_progress=None, cancelled=lambda: False) -> ApplicationAssistResult:
     _require_browser_owner(session_id)
     _require_task_resume(session_id, payload.resume_id)
     if browser_task_resumes.get(session_id) != payload.resume_id:
@@ -1079,6 +1334,8 @@ async def _run_application_assist(session_id: str, payload: ApplicationAssistReq
     profile, revision = _task_context(session_id)
 
     def guard():
+        if cancelled():
+            raise ValueError('你已要求暂停本轮填写；已填内容保留，尚未提交')
         _require_browser_owner(session_id)
         _require_task_resume(session_id, payload.resume_id)
         if _task_context(session_id)[1] != revision:
@@ -1093,13 +1350,14 @@ async def _run_application_assist(session_id: str, payload: ApplicationAssistReq
         model_plan=lambda snapshot: _model_task_plan(session_id, snapshot),
         stamp_plan=lambda plan: _stamp_plan(session_id, plan),
         resume_path=_selected_resume_path(payload.resume_id) if payload.allow_site_parse else None,
-        pending_sections=pending)
+        pending_sections=pending, on_progress=on_progress)
 
 
 @app.post("/api/browser/{session_id}/assist", response_model=ApplicationAssistResult)
-async def assist_application(session_id: str, payload: ApplicationAssistRequest) -> ApplicationAssistResult:
+async def assist_application(session_id: str, payload: ApplicationAssistRequest,
+                             run_id: str | None = Query(default=None, max_length=64, pattern=r'^[A-Za-z0-9_-]+$')) -> ApplicationAssistResult:
     try:
-        return await _run_application_assist(session_id, payload)
+        return await _run_application_assist(session_id, payload, run_id)
     except HTTPException:
         raise
     except LookupError as exc:
@@ -1108,6 +1366,23 @@ async def assist_application(session_id: str, payload: ApplicationAssistRequest)
         raise HTTPException(409, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(502, "自动补齐暂时中断，已完成的填写保留；请重新核对当前网页") from exc
+
+
+@app.get('/api/browser/{session_id}/assist/progress/{run_id}', response_model=ApplicationAssistProgress)
+async def assist_progress(session_id: str, run_id: str) -> ApplicationAssistProgress:
+    _require_browser_owner(session_id)
+    try:
+        return assist_runs.get(run_id, current_user_id(), session_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post('/api/browser/{session_id}/assist/progress/{run_id}/cancel', response_model=ApplicationAssistProgress)
+async def cancel_assist(session_id: str, run_id: str) -> ApplicationAssistProgress:
+    progress = await assist_progress(session_id, run_id)
+    if progress.status == 'running':
+        progress.cancel_requested = True
+    return progress
 
 
 @app.post("/api/browser/{session_id}/journey", response_model=ApplicationJourneyResult)
@@ -1157,4 +1432,5 @@ async def close_browser(session_id: str) -> Response:
     browser_session_owners.pop(session_id, None)
     browser_task_resumes.pop(session_id, None)
     browser_task_epochs.pop(session_id, None)
+    browser_image_consents.pop(session_id, None)
     return Response(status_code=204)

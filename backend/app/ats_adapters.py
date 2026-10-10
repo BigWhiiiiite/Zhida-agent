@@ -184,13 +184,15 @@ async def inspect_application_page(page: Page, session_id: str,
           .map(node => clean(node.innerText)).filter(Boolean).join(' ');
         if (labelledBy) return labelledBy;
         // Custom ATS labels are often sibling divs rather than <label for>.
-        // Only inspect a short, single-control row; a section containing many
+        // Skip inner wrappers without a caption. Only inspect an owned row;
+        // a section containing many
         // questions must not lend one question's title to another input.
         let row = el.parentElement;
-        for (let depth = 0; row && depth < 4; depth++, row = row.parentElement) {
+        for (let depth = 0; row && depth < 12; depth++, row = row.parentElement) {
           if (row.matches('body,main,form,section,fieldset')) break;
           const fields = [...row.querySelectorAll(inputSelector)].filter(visible);
-          if (fields.length !== 1 || fields[0] !== el || clean(row.innerText).length > 160) break;
+          if (fields.length !== 1 || fields[0] !== el) break;
+          if (clean(row.innerText).length > 160) continue;
           const labels = [...row.querySelectorAll('label,[class*="label" i],[class*="question-title" i]')]
             .filter(node => visible(node) && !node.contains(el) && !node.querySelector(inputSelector))
             .map(node => clean(node.innerText)).filter(value => value && value.length <= 60);
@@ -229,7 +231,7 @@ async def inspect_application_page(page: Page, session_id: str,
       const shortLabels = [...new Set(visibleTextNodes.map(node => clean(node.innerText))
         .filter(value => value && value.length <= 40)
         .map(value => value.replace(/[\s*＊:：]/g, '')))];
-      const formSections = shortLabels.filter(value => /^(个人信息|基本信息|联系方式|教育经历|教育背景|工作经历|实习经历|项目经历|投递意向|求职意向|上传简历)$/.test(value));
+      const formSections = shortLabels.filter(value => /^(个人信息|个人基本信息|基本信息|联系方式|教育经历|教育背景|工作经历|实习经历|学生实践经验|项目经历|语言能力|投递意向|求职意向|上传简历)$/.test(value));
       const questionLabels = shortLabels.filter(value => /^(姓名|真实姓名|性别|出生日期|生日|邮箱|电子邮箱|手机号|手机号码|联系电话|学校|学校名称|院校名称|学历|最高学历|专业|专业名称)$/.test(value));
       const authModal = [...document.querySelectorAll(
         '[role="dialog"],[aria-modal="true"],dialog[open],.ant-modal,.el-dialog,.login-dialog,.loginDialog')]
@@ -386,7 +388,7 @@ async def inspect_application_page(page: Page, session_id: str,
     beisen_detail_route = adapter == "beisen-italent" and (bool(re.search(
         r"(?:^|/)detail(?:/|$)", f"{parsed.path}/{parsed.fragment}", re.I)) or _custom_detail_route(url))
     application_route = bool(re.search(
-        r"(?:^|/)(?:form|apply|application)(?:/|$)", f"{parsed.path}/{urlparse(parsed.fragment).path}", re.I))
+        r"(?:^|/)(?:form|apply|application|resumeEdit)(?:/|$)", f"{parsed.path}/{urlparse(parsed.fragment).path}", re.I))
     if parsed.hostname == "talent.autohome.com.cn" and parsed.path == "/recruit-delivery.html":
         application_route = True
     # Moka's /apply/<tenant>/<site>#/jobs is the site root, not an

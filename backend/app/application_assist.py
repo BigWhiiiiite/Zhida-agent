@@ -18,13 +18,13 @@ from pathlib import Path
 from .browser_models import (ApplicationAssistEvent, ApplicationAssistIssue, ApplicationAssistRequest, ApplicationRecordCoverage,
     ApplicationAssistResult, ExecutePlanRequest, FillAction)
 from .field_semantics import semantic_key_for
-from .form_agent import _education_resolutions, build_form_review, create_local_form_plan
+from .form_agent import (_education_resolutions, build_form_review,
+                        comparison_group_key, create_local_form_plan)
 from .repeated_records import resolve_repeated_records
+from .form_field_policy import formal_employment_only, is_declaration
+from .execution_safety import ExecutionTargetChanged, execution_phase_label
 
 
-# Keep this aligned with the executor's legal acknowledgement gate. Merely
-# asking whether someone agrees to relocate is a preference, not a declaration.
-LEGAL = re.compile(r"承诺|声明|真实可信|真实性|我保证|法律责任|协议|条款|隐私|consent|privacy|terms|legal|declaration|attest|certify|acknowledge|undertaking", re.I)
 KINDS = {"education": ("education", "school"), "internships": ("experience", "organization"),
          "projects": ("project", "name")}
 STAGES = {"profile_form", "application_form", "review"}
@@ -46,12 +46,6 @@ def model_budget_seconds() -> float:
                + configured("APP_FORM_FALLBACK_TIMEOUT_SECONDS", 120) + 15)
 
 
-def is_declaration(field) -> bool:
-    return field.field_type in {"checkbox", "radio"} and bool(LEGAL.search(
-        " ".join((field.label, field.question_text, field.group_label, field.option_label, field.name)))
-        or field.name.casefold() in {"agreechk", "agreement", "consent"})
-
-
 def safe_actions(review):
     fields = {field.selector: field for field in review.snapshot.fields}
     return [action for action in review.plan.actions
@@ -60,6 +54,23 @@ def safe_actions(review):
         and not is_declaration(fields[action.selector])
         and fields[action.selector].field_type not in {
             "file", "hidden", "password", "section-button", "button", "submit", "reset"}]
+
+
+def record_text_actions(review, inventory):
+    """Complete grounded text inside vetted records before unrelated widgets.
+
+    Allocation alone is not a complete experience. Keep this separate batch
+    narrowly inside the adapter's record keys; calendars, choices, declarations
+    and ambiguous records continue through the ordinary guarded workflow.
+    """
+    keys = {key for item in inventory if item['kind'] in KINDS
+            for key in item['record_keys']}
+    fields = {field.selector:field for field in review.snapshot.fields}
+    return [action for action in safe_actions(review)
+        if action.action == 'fill'
+        and (field := fields[action.selector]).container_key in keys
+        and field.field_type in {'text', 'textarea'} and not field.readonly
+        and semantic_key_for(field).startswith(('education.', 'experience.', 'project.'))]
 
 
 def observation_key(snapshot):
@@ -73,6 +84,7 @@ def _record_groups(snapshot, prefix):
     result = {}
     for field in snapshot.fields:
         if (field.container_key and field.field_type != 'section-button'
+                and not formal_employment_only(field)
                 and field.section not in {'个人信息', '基本信息'}
                 and field.entity_scope != 'education:highest'
                 and semantic_key_for(field).startswith(prefix + ".")):
@@ -151,7 +163,32 @@ def _coverage(snapshot, profile, inventory):
 def _field_identity(field):
     return tuple(getattr(field, key) for key in ('selector', 'field_type', 'field_signature',
         'question_text', 'label', 'name', 'semantic_key', 'entity_scope', 'container_key',
-        'control_group_key', 'section', 'group_label', 'option_label', 'option_value')) + (tuple(field.options),)
+        'control_group_key', 'section', 'group_label', 'option_label', 'option_value')) + (
+            tuple(field.options),
+            tuple((e.text, e.source) for e in field.question_candidates if e.owned),
+            tuple(sorted(field.constraints.model_dump().items())),
+            tuple(field.required_evidence),
+        )
+
+
+def _retain_execution_failures(review, failed_controls):
+    """A matching display value cannot erase a failed widget commit.
+
+    Bind failures to the observed question, not a reusable DOM selector. A
+    later verified execution clears its failure; a changed question does not
+    inherit it. No raw error or applicant answer is copied into the summary.
+    """
+    failed_groups = {comparison_group_key(field) for field in review.snapshot.fields
+                     if failed_controls.get(field.selector) == _field_identity(field)}
+    for item in review.comparisons:
+        if item.status == "matched" and item.key in failed_groups:
+            item.status = "manual_review"
+            item.recommendation = (
+                "网页显示值相符，但本轮控件提交或选中状态未通过核验；"
+                "不计为填写成功，请重新核对该控件")
+            review.summary.matched -= 1
+            review.summary.manual_review += 1
+    return review
 
 
 def _language_allocation(snapshot, profile):
@@ -196,7 +233,7 @@ def _language_allocation(snapshot, profile):
 
 async def prepare_application(service, session_id, request: ApplicationAssistRequest,
                               profile, *, guard, model_plan, stamp_plan,
-                              resume_path: Path | None = None, pending_sections=()):
+                              resume_path: Path | None = None, pending_sections=(), on_progress=None):
     events = []
     rounds = 0
     review = None
@@ -204,11 +241,16 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
     coverage_blockers = []
     inventory = []
     deferred = {}
+    model_calls = 0
 
     def event(kind, message, completed=0, failed=0, issues=()):
-        events.append(ApplicationAssistEvent(kind=kind, message=message, completed=completed,
-                                             failed=failed, issues=list(issues)))
+        item = ApplicationAssistEvent(kind=kind, message=message, completed=completed,
+                                     failed=failed, issues=list(issues))
+        events.append(item)
+        if on_progress:
+            on_progress(item)
 
+    event('observe', '正在读取当前申请表和真实控件选项；尚未开始填写')
     snapshot = await service.settled_snapshot(session_id)
     initial_url = snapshot.url
 
@@ -234,7 +276,7 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
     def finish(status, message):
         return ApplicationAssistResult(status=status, message=message, snapshot=snapshot,
             review=review, pre_submit=check, events=events, rounds=rounds,
-            record_coverage=_coverage(snapshot, profile, inventory))
+            record_coverage=_coverage(snapshot, profile, inventory), model_calls=model_calls)
 
     async def record_inventory():
         reader = getattr(service, 'record_inventory', None) or service.expandable_sections
@@ -285,6 +327,11 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
             event("review_required", "所选简历仍有待核验资料：" + "、".join(pending_sections))
             return finish("needs_user", "请先到简历资料库确认上述资料；不会把待核验内容当事实填写")
         event("observe", "已确认当前是申请表；不会导航、注册、签署声明或提交")
+        if snapshot.extraction_report:
+            report = snapshot.extraction_report
+            event("extraction", f"当前文档识别{report.question_count}道题，{report.verified_questions}道原题有归属证据，"
+                  f"{report.unclear_questions}道需核实题干，{report.options_pending_questions}道选项或层级待补读；不代表整表完整")
+        event('retrieve', '使用本次简历、主档案和同范围已确认记忆；不同学历、经历及他人资料分别核对')
         if request.allow_site_parse:
             guard()
             if any(f.field_type == "file" and f.current_value for f in snapshot.fields):
@@ -306,6 +353,8 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
             chosen = next(((item,key,fields) for item in inventory if item['kind'] in KINDS
                 for key,fields in _record_groups(snapshot, KINDS[item['kind']][0]).items()
                 if key in item['record_keys'] and _empty_record(fields)
+                and not any(f.selector in deferred and semantic_key_for(f)==
+                    KINDS[item['kind']][0]+'.'+KINDS[item['kind']][1] for f in fields)
                 and _allocation(snapshot,profile,item['kind'],item['record_keys'],key) is not None), None)
             if not chosen:
                 break
@@ -353,6 +402,42 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
                for item in inventory):
             coverage_blockers.append("部分经历尚未展开，已达到安全边界或本轮展开上限")
 
+        # Verify a complete grounded text record as its own batch. An unrelated
+        # picker later in the page must not prevent role/content from being
+        # attempted or erase this batch's already completed readback receipt.
+        record_review = build_form_review(snapshot,
+            apply_deferrals(stamp_plan(create_local_form_plan(snapshot, profile))))
+        text_actions = record_text_actions(record_review, inventory)
+        if text_actions:
+            guard()
+            event('execute', f'先补齐已核实经历记录中的{len(text_actions)}项文本；日期和其他栏目单独处理')
+            started = asyncio.get_running_loop().time()
+            def record_progress(index, phase):
+                elapsed = int(asyncio.get_running_loop().time() - started)
+                event('control', f'经历文本第{index}/{len(text_actions)}项：{execution_phase_label(phase)}'
+                      f'（本批已用{elapsed}秒）；尚未通过整批最终核对')
+            written = await service.execute(session_id, ExecutePlanRequest(actions=text_actions),
+                before_action=guard, on_progress=record_progress)
+            failures = {}
+            issues = []
+            fields = {field.selector:field for field in snapshot.fields}
+            actions = {action.selector:action for action in text_actions}
+            for item in written.results:
+                if item.status == 'failed' or (item.status == 'filled' and not item.verified):
+                    failures[item.selector] = _field_identity(fields[item.selector])
+                    message = item.message or '经历文本未能通过网页回读核验'
+                    value = str(actions[item.selector].value)
+                    if value:
+                        message = message.replace(value, '已确认的目标值')
+                    issues.append(ApplicationAssistIssue(label=item.label, message=message[:240]))
+            event('fill', f'经历文本独立回读：成功{written.verified}项，失败{written.failed}项；不代表整条经历或整表完成',
+                  written.verified, written.failed, issues)
+            snapshot = await observe()
+            if failures:
+                review = _retain_execution_failures(build_form_review(snapshot,
+                    apply_deferrals(stamp_plan(create_local_form_plan(snapshot, profile)))), failures)
+                return finish('partial', '经历文本仍有提交或回读失败；已填内容保留，先核对这些字段，不重复填写其他栏目')
+
         language = _language_allocation(snapshot,profile)
         if language and language.selector not in deferred:
             guard()
@@ -363,10 +448,12 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
             snapshot = await observe()
 
         seen = set()
-        used_model = False
-        last_model_plan = None
+        analysed_questions = set()
+        model_actions = {}
         model_identities = {}
         failed_attempts = set()
+        failed_controls = {}
+        model_deadline = None
 
         def attempt_key(action):
             field = next((f for f in snapshot.fields if f.selector == action.selector), None)
@@ -389,16 +476,32 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
             plan = apply_deferrals(stamp_plan(create_local_form_plan(snapshot, profile)))
             review = build_form_review(snapshot, plan)
             actions = remaining_actions(review)
-            can_analyse = request.use_model and not used_model and plan.routing_summary.model_pending
+            pending = {a.selector for a in plan.actions if a.needs_model and a.selector not in deferred}
+            new_questions = {f.selector for f in snapshot.fields if f.selector in pending
+                             and _field_identity(f) not in analysed_questions}
+            can_analyse = request.use_model and model_calls < 2 and bool(new_questions)
+            event('decide', f'第{rounds+1}轮核对：{len(actions)}项有确定依据，{len(new_questions)}项新的疑难题目')
             if repeated and not can_analyse:
                 event("stopped", "页面没有变化，停止重复尝试；请查看未完成项")
                 break
             if not actions and can_analyse:
-                used_model = True
+                model_calls += 1
+                if model_deadline is None:
+                    model_deadline = asyncio.get_running_loop().time() + model_budget_seconds()
+                remaining_budget = model_deadline - asyncio.get_running_loop().time()
+                if remaining_budget <= 0:
+                    event('model_unavailable', '本轮模型分析时间预算已用完；已填内容保留')
+                    break
+                analysed_questions.update(_field_identity(f) for f in snapshot.fields if f.selector in new_questions)
                 model_snapshot = observation_key(snapshot)
+                event('model', f'正在调用配置模型分析第{model_calls}批疑难题目；不会猜测缺失的个人事实')
                 try:
-                    model_view = snapshot.model_copy(update={'fields':[f for f in snapshot.fields if f.selector not in deferred]})
-                    plan = await asyncio.wait_for(model_plan(model_view), timeout=model_budget_seconds())
+                    # Keep record anchors as context, but do not ask the model
+                    # the same unresolved question again unless its identity or
+                    # actual options changed after a dependency was filled.
+                    model_view = snapshot.model_copy(update={'fields':[f for f in snapshot.fields
+                        if f.selector not in deferred and (f.selector not in pending or f.selector in new_questions)]})
+                    plan = await asyncio.wait_for(model_plan(model_view), timeout=remaining_budget)
                 except asyncio.TimeoutError:
                     event("model_unavailable", "模型分析超时；已填内容保留，未用猜测值补齐")
                     break
@@ -410,16 +513,25 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
                     event("stopped", "模型分析期间网页发生变化，旧建议已丢弃，请重新核对")
                     break
                 plan = apply_deferrals(plan)
-                last_model_plan = plan
-                model_identities = {f.selector: (f.question_text, f.container_key, semantic_key_for(f), f.options)
-                                    for f in snapshot.fields}
+                model_actions.update({a.selector:a for a in plan.actions
+                                      if a.resolution_source == 'model'})
+                model_identities.update({f.selector:_field_identity(f) for f in model_view.fields})
                 review = build_form_review(snapshot, plan)
                 actions = remaining_actions(review)
                 event("model", "已让模型分析疑难项；填写值仍由档案证据和安全规则决定")
             if not actions:
                 break
             guard()
-            result = await service.execute(session_id, ExecutePlanRequest(actions=actions), before_action=guard)
+            event('execute', f'正在执行{len(actions)}项有依据的填写；每项都要回读核验')
+            started = asyncio.get_running_loop().time()
+            def control_progress(index, phase):
+                # No answer, selector, exception body or DOM is copied into the
+                # progress stream. This is a stage, not a success count.
+                elapsed = int(asyncio.get_running_loop().time() - started)
+                event('control', f'第{index}/{len(actions)}项：{execution_phase_label(phase)}'
+                      f'（本批已用{elapsed}秒）；尚未通过整批最终核对')
+            result = await service.execute(session_id, ExecutePlanRequest(actions=actions), before_action=guard,
+                                           on_progress=control_progress)
             rounds += 1
             issues = []
             by_selector = {a.selector: a for a in actions}
@@ -428,31 +540,40 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
                     action = by_selector.get(item.selector)
                     if action:
                         failed_attempts.add(attempt_key(action))
+                        field = next((f for f in snapshot.fields if f.selector == item.selector), None)
+                        if field:
+                            failed_controls[item.selector] = _field_identity(field)
                     message = item.message or "未能通过网页回读核验"
                     # Progress history needs causes, not attempted personal values.
                     if action and isinstance(action.value, str) and action.value:
                         message = message.replace(action.value, "已确认的目标值")
                     issues.append(ApplicationAssistIssue(label=item.label, message=message[:240]))
+                elif item.verified:
+                    failed_controls.pop(item.selector, None)
             event("fill", f"第{rounds}轮：回读成功{result.verified}项，失败{result.failed}项",
                   result.verified, result.failed, issues[:50])
             # Never resend old selectors blindly. The next bounded iteration
             # snapshots again, obtains new options and skips all matching values.
-            snapshot = await observe()
+            event('verify', '重新读取网页，检查实际保存值及新增的联动题目；不盲目重发旧计划')
+            # The next loop iteration (or the mandatory final observation)
+            # performs this fresh read. Avoid scanning/probing the same long
+            # form twice consecutively; no identity or execution guard is lost.
 
         snapshot = await observe()
         final_plan = apply_deferrals(stamp_plan(create_local_form_plan(snapshot, profile)))
-        if last_model_plan:
+        if model_actions:
             # Preserve already grounded model mappings only while the same
             # field identity exists; no new model-generated values are added.
-            by_selector = {a.selector: a for a in last_model_plan.actions
+            by_selector = {a.selector: a for a in model_actions.values()
                            if a.resolution_source == "model" and a.action in {"fill", "select", "check"}}
-            identities = {f.selector: (f.question_text, f.container_key, semantic_key_for(f), f.options)
+            identities = {f.selector: _field_identity(f)
                           for f in snapshot.fields}
             for i, action in enumerate(final_plan.actions):
                 if (action.needs_model and action.selector in by_selector
                         and identities.get(action.selector) == model_identities.get(action.selector)):
                     final_plan.actions[i] = by_selector[action.selector]
-        review = build_form_review(snapshot, final_plan)
+        review = _retain_execution_failures(build_form_review(snapshot, final_plan), failed_controls)
+        event('verify', '正在进行最终回读、必填检查及各段经历覆盖核对；尚未提交')
         check = await service.pre_submit_check(session_id)
         latest = await observe()
         if observation_key(latest) != observation_key(snapshot):
@@ -474,16 +595,26 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
             event("coverage", "；".join(dict.fromkeys(coverage_blockers)))
         if check.human_challenges or check.validation_errors:
             return finish("needs_user", "官网仍有验证或校验提示，请先在网页处理，已填内容保留")
+        if snapshot.extraction_report and snapshot.extraction_report.capture_status == "partial":
+            event("extraction", "当前文档仍有未读取区域、未展开栏目或未映射控件，不能将已见字段完成视为整表完成")
+            return finish("partial", "本轮已核对当前读取到的字段，但页面覆盖仍有缺口，不等于已全部填写；请先查看信息提取报告，尚未提交")
         if not unresolved and not missing and not coverage_blockers:
             return finish("ready_for_review", "已完成当前已识别资料的填写与核对；请本人检查附件和声明，尚未提交申请")
         if (not unresolved and not coverage_blockers and missing
                 and all(item.selector in deferred for item in missing)):
             return finish('needs_user', '其余资料已完成本轮填写与核对；仅本人明确留空的必填项仍缺失，不能提交')
+        if any(failed_controls.get(field.selector) == _field_identity(field) for field in snapshot.fields):
+            return finish("partial", "仍有控件提交或选中状态未通过核验；已填内容保留，不将显示值相符计为填写成功")
         if safe_actions(review):
             return finish("partial", "仍有未验证字段，已停止本轮有限尝试；已填正确内容保留，可重新核对后继续")
         if any(action.needs_model for action in review.plan.actions):
             return finish("partial", "还有疑难字段尚未解析完成；已填内容保留，可再次分析或按网页原题补充")
         return finish("needs_user", "剩余问题需要你补充、确认或核对；不会让模型猜测个人事实")
     except (ValueError, LookupError) as exc:
+        if isinstance(exc, ExecutionTargetChanged) and exc.attempted_issues:
+            event("write_interrupted",
+                  f"中断前已处理{exc.attempted_count}项，其中{exc.provisional_matches}项曾回读匹配；"
+                  "整批最终核对未完成，不计为本轮完成，请先重新核对已填内容",
+                  issues=exc.attempted_issues)
         event("stopped", str(exc)[:240])
         return finish("blocked", str(exc)[:240])

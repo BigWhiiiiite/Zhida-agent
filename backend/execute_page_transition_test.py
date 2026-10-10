@@ -12,6 +12,7 @@ from playwright.async_api import async_playwright
 
 from app.browser_models import ExecutePlanRequest, FillAction
 from app.browser_service import BrowserDemoService
+from app.execution_safety import ExecutionTargetChanged, EXECUTION_PHASES
 
 
 URL = "https://execution.example.test/application?jobId=offline-one"
@@ -37,6 +38,11 @@ TRANSITIONS = {
     "native_name_reused": "document.querySelector('#email').name='emergency_email'",
     "native_type_reused": "document.querySelector('#email').type='tel'",
     "native_record_reused": "const section=document.createElement('section');section.innerHTML='<h2>紧急联系人</h2>';section.append(document.querySelector('#email'));document.querySelector('main').append(section)",
+}
+EXPECTED_REASON = {
+    "url_change": "网页地址", "login_expired": "申请阶段",
+    "job_changed_same_url": "岗位标题", "step_changed_same_url": "表单步骤",
+    "same_url_reload": "文档已重新加载",
 }
 
 
@@ -93,18 +99,33 @@ async def run() -> None:
                     if mode == "reactive_options":
                         actions.append(FillAction(selector=city.selector, label="城市", action="select", value="北京", confidence=1))
                     error = ""
+                    interruption = None
                     result = None
+                    progress = []
                     try:
-                        result = await service.execute(service.session_id, ExecutePlanRequest(actions=actions))
+                        result = await service.execute(service.session_id, ExecutePlanRequest(actions=actions),
+                            on_progress=lambda index, phase: progress.append((index, phase)))
                     except (ValueError, LookupError) as exc:
                         error = str(exc)
+                        interruption = exc
                     email = await page.locator("#email").input_value()
                     writes = await page.evaluate("window.emailWrites")
+                    assert progress and all(1 <= index <= len(actions) and phase in EXECUTION_PHASES
+                                            for index, phase in progress), progress
+                    assert 'candidate@example.test' not in repr(progress) and '合成候选人' not in repr(progress)
                     if mode == "reactive_options":
                         assert result and result.completed == result.verified == 3, (error, result)
                         assert await page.locator("#city").input_value() == "bj"
                         assert writes == ["candidate@example.test"]
+                        assert progress[-1][1] == 'final_verify'
                     else:
+                        assert isinstance(interruption, ExecutionTargetChanged), (mode, error)
+                        assert EXPECTED_REASON.get(mode, "字段题干、类型或所属记录") in error, (mode, error)
+                        assert interruption.attempted_count == interruption.provisional_matches == 1
+                        assert interruption.attempted_issues[0].label == "姓名"
+                        assert "最终核对未完成" in interruption.attempted_issues[0].message
+                        assert "合成候选人" not in repr(interruption.__dict__)
+                        assert '停点：' in interruption.attempted_issues[-1].message
                         print(f"{mode}: email={email!r}, writes={writes}, stopped={bool(error) or bool(result and result.failed)}")
                         if email or writes:
                             problems.append(f"{mode}: old batch wrote email after page transition")

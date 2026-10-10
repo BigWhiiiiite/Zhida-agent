@@ -2,10 +2,23 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowRight, BriefcaseBusiness, Building2, Check, ChevronRight, CircleUserRound, Download, ExternalLink, FileJson, FileText, Files, Globe2, LayoutDashboard, ListChecks, LoaderCircle, LockKeyhole, LogOut, MapPin, MessageSquare, Play, Plus, RefreshCw, Save, ShieldCheck, Sparkles, Target, Trash2, UploadCloud, UserPlus, WandSparkles, X } from 'lucide-react'
 import { API, ApiError, api } from './api'
 import ApplicationKnowledge from './ApplicationKnowledge'
+import ApplicationWorkspace from './ApplicationWorkspace'
+import type {ApplicationWorkspaceSection} from './ApplicationWorkspace'
+import {isUserAnswerQuestion,userQuestionBlockReason} from './manualQuestionPolicy'
+import {checkboxQuestionGroups,checkboxGroupAnswers,checkboxGroupAnswered,checkboxGroupChecked} from './checkboxGroups'
+import type {CheckboxQuestionGroup} from './checkboxGroups'
+import AssistProgress from './AssistProgress'
+import ControlDiagnostics from './ControlDiagnostics'
+import FormExtractionQuality from './FormExtractionQuality'
+import ExtractionAudit from './ExtractionAudit'
+import PageObservation from './PageObservation'
 import AutofillRoutingSummary from './AutofillRoutingSummary'
 import ChatWorkspace from './ChatWorkspace'
 import ResumeFactEditor from './ResumeFactEditor'
+import {ExternalWebsiteOpening} from './ExternalWebsiteOpening'
+import {ExistingSafariConnection} from './ExistingSafariConnection'
 import {resumeChoiceLabel} from './resumeFacts'
+import {isSelectionField,manualFillAction} from './formInputKind'
 import {resumeAttachmentBlocker} from './resumeAttachment'
 import {journeyBackendReady,journeyButtonLabel,journeyGuard,journeyStatus} from './applicationJourney'
 import {formStageReady,inspectTaskUrl,shouldKeepChatMounted} from './chatTask'
@@ -14,8 +27,8 @@ import {canContinueWorkflow,workbenchView} from './workbenchView'
 import {observedJobTitle,shouldObserveWorkbench,workflowPageChanged} from './workbenchObservation'
 import './workbench-view.css'
 import { actionReviewTitle, modelPending, pendingActionSelectors, routeLabel, runAutofillPhases } from './autofillRouting'
-import {assistanceBackendReady,assistGuard,assistRequest,assistStatus,draftFieldsCompatible,learnVerifiedDrafts,monthPrecisionMemory,needsMonthPrecisionConsent,verifiedDraftEntries} from './applicationAssist'
-import type {ApplicationAssistResult,ApplicationJourneyResult} from './types'
+import {assistanceBackendReady,assistFailure,assistGuard,assistRequest,assistStatus,draftFieldsCompatible,forgetAssistRun,learnVerifiedDrafts,monthPrecisionMemory,needsMonthPrecisionConsent,rememberAssistRun,rememberedAssistRun,verifiedDraftEntries,watchAssist} from './applicationAssist'
+import type {ApplicationAssistResult,ApplicationAssistProgress,ApplicationJourneyResult} from './types'
 import type { ApplicationTarget, NavigationCandidate, ApplicationAgentTurn, ApplicationAnswerMemory, ApplicationQueueItem, ApplicationReadiness, ApplicationWorkflowState, BrowserSnapshot, CandidateProfile, CompanySize, Conflict, DiscoveryAdapter, Education, Evidence, ExecutionResult, Experience, FieldComparison, FillAction, FormPlan, JobEvidenceExplanation, JobRecommendation, JobVerification, LiveJobStatus, ModelHealth, NativeResumeImportResult, OfficialJobSource, PageField, PreSubmitCheck, Project, QueueStatus, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
 
 type Page='overview'|'chat'|'jobs'|'profile'|'resumes'|'review'|'demo'
@@ -53,12 +66,12 @@ export default function App(){
     <div className="privacy"><ShieldCheck size={17}/><div><strong>受控模型传输</strong><small>解析、匹配与授权聊天时发送</small></div></div><div className={`account-chip ${user.is_local?'local':''}`}><span>{user.is_local?'本':(user.display_name||user.email)[0].toUpperCase()}</span><div><strong>{user.is_local?'本机免登录':user.display_name||'职达用户'}</strong><small>{user.is_local?'数据保存在当前电脑':user.email}</small></div>{!user.is_local&&<button title="退出登录" onClick={logout}><LogOut size={15}/></button>}</div></aside>
     <main><Top page={page}/>{notice&&<div className="notice">{notice}<button onClick={()=>setNotice('')}>×</button></div>}
       {page==='overview'&&profile&&<Overview profile={profile} resumes={resumes} conflicts={conflicts} go={setPage}/>}
-      {shouldKeepChatMounted(page,chatVisitedUser,user.id)&&<div hidden={page!=='chat'}><ChatWorkspace key={user.id} activeBrowser={activeBrowser} onGo={setPage} onLaunch={target=>{if(activeBrowser){setNotice('请先进入投递工作台结束原会话，再开始新目标。');setPage('demo');return}setLaunchJob(null);setChatTarget(target);setPage('demo');setNotice('已确认目标并带入工作台。点击“打开浏览器”才访问该网站，系统不会自动投递。')}}/></div>}
+      {shouldKeepChatMounted(page,chatVisitedUser,user.id)&&<div hidden={page!=='chat'}><ChatWorkspace key={user.id} activeBrowser={activeBrowser} onGo={setPage} onLaunch={target=>{if(activeBrowser){setNotice('请先进入投递工作台结束原会话，再开始新目标。');setPage('demo');return}setLaunchJob(null);setChatTarget(target);setPage('demo');setNotice('目标已带入工作台。请先在官网完成登录和选岗，再提供信息填写页网址；确认设置不会自动投递。')}}/></div>}
       {page==='jobs'&&profile&&<JobRecommendations profile={profile} resumes={resumes} notify={setNotice} onApply={(job,resumeId,queueId)=>{if(activeBrowser){setPage('demo');setNotice('已有浏览器任务正在进行，请先结束原会话。当前网页及人工修改没有被覆盖。');return}setChatTarget(null);setLaunchJob({recommendation:job,resumeId,queueId});setPage('demo');setNotice(`已选择 ${job.job.company} · ${job.job.title}，岗位链接已自动带入投递工作台。`)}}/>}
       {page==='profile'&&profile&&<ProfileEditor profile={profile} onSave={async p=>{setBusy(true);try{setProfile(await api.saveProfile(p));setNotice('主档案已保存。')}catch(e){setNotice(message(e))}finally{setBusy(false)}}}/>}
       {page==='resumes'&&<ResumeLibrary resumes={resumes} busy={busy} upload={()=>fileInput.current?.click()} onReview={openReview} onRefresh={async r=>{setBusy(true);try{updateResumeLocal(await api.reparse(r.id));await reload();setNotice('重新解析完成。')}catch(e){await reload();setNotice(message(e))}finally{setBusy(false)}}} onDefault={async r=>{updateResumeLocal(await api.saveResume(r.id,{is_default:true}));await reload()}} onDelete={async r=>{if(!confirm(`确定删除“${r.label}”及其原始文件吗？`))return;await api.deleteResume(r.id);await reload();setNotice('简历及原始文件已删除。')}}/>}
       {page==='review'&&<ReviewWorkspace resumes={resumes} active={active} conflicts={conflicts} rawText={rawText} select={openReview} notify={setNotice} onReviewed={async item=>{updateResumeLocal(item);setProfile(await api.profile())}} onResolved={async(id,choice,custom)=>{await api.resolve(id,choice,custom);await reload();setNotice('冲突已处理，主档案已更新。')}}/>}
-      <div hidden={page!=='demo'}><BrowserDemo key={user.id} active={page==='demo'} profile={profile} resumes={resumes} notify={setNotice} onProfileUpdate={setProfile} onResumeUpdate={updateResumeLocal} initialJob={launchJob?.recommendation??null} initialResumeId={launchJob?.resumeId??''} initialQueueId={launchJob?.queueId??''} initialTarget={chatTarget} onSessionChange={setActiveBrowser}/></div>
+      <div hidden={page!=='demo'}><BrowserDemo key={user.id} ownerId={user.id} active={page==='demo'} profile={profile} resumes={resumes} notify={setNotice} onProfileUpdate={setProfile} onResumeUpdate={updateResumeLocal} initialJob={launchJob?.recommendation??null} initialResumeId={launchJob?.resumeId??''} initialQueueId={launchJob?.queueId??''} initialTarget={chatTarget} onSessionChange={setActiveBrowser}/></div>
     </main></div>
 }
 
@@ -69,7 +82,7 @@ function AuthPage({onAuthenticated}:{onAuthenticated:(user:UserAccount)=>void}){
   return <main className="auth-shell"><section className="auth-brand"><span><BriefcaseBusiness size={27}/></span><strong>职达 Zhida</strong><small>让每一份求职资料都有清晰归属</small><div><ShieldCheck size={18}/><p><b>账号级资料隔离</b><br/>密码只保存安全哈希，简历和投递清单按用户分开。</p></div></section><section className="auth-card"><div className="auth-tabs"><button className={mode==='login'?'active':''} onClick={()=>switchMode('login')}>登录</button><button className={mode==='register'?'active':''} onClick={()=>switchMode('register')}>创建账号</button></div><div className="auth-heading"><span>{mode==='login'?<LockKeyhole size={19}/>:<UserPlus size={19}/>}</span><div><h1>{mode==='login'?'欢迎回来':'创建你的职达账号'}</h1><p>{mode==='login'?'继续管理简历和投递任务':'第一位注册用户会自动接管当前本地资料'}</p></div></div><form onSubmit={submit}>{mode==='register'&&<label><span>显示名称</span><input autoComplete="name" value={displayName} onChange={e=>setDisplayName(e.target.value)} placeholder="例如：李春博"/></label>}<label><span>邮箱账号</span><input type="email" autoComplete="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@example.com"/></label><label><span>密码</span><input type="password" autoComplete={mode==='login'?'current-password':'new-password'} required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} placeholder="至少 8 位，包含两类字符"/></label>{mode==='register'&&<label><span>确认密码</span><input type="password" autoComplete="new-password" required minLength={8} value={confirmPassword} onChange={e=>setConfirmPassword(e.target.value)} placeholder="再次输入密码"/></label>}{error&&<div className="auth-error"><AlertTriangle size={15}/>{error}</div>}<button className="primary auth-submit" disabled={busy}>{busy?<LoaderCircle className="spin" size={17}/>:mode==='login'?<LockKeyhole size={17}/>:<UserPlus size={17}/>} {busy?'请稍候':mode==='login'?'登录':'创建账号并进入'}</button></form><footer>本地开发版使用 HttpOnly 会话 Cookie；部署时请开启 HTTPS。</footer></section></main>
 }
 
-function Top({page}:{page:Page}){const copy={chat:['求职助手','通过文字与招聘截图明确目标，再进入可控的投递流程。'],overview:['候选人资料总览','一次维护，反复用于之后的每次申请。'],jobs:['推荐投递清单','根据已确认简历生成可解释推荐，选中后直接进入投递流程。'],profile:['候选人主档案','这里是你的事实来源，Agent 不会擅自覆盖已确认信息。'],resumes:['简历资料库','管理不同语言、岗位方向和版本的简历。'],review:['识别结果检查','对照原文确认 Agent 拆分的字段，并处理资料冲突。'],demo:['招聘网站投递工作台','让 Agent 理解表单，由 Playwright 安全执行，永不自动提交。']}[page];return <header><div><p className="eyebrow">ZHIDA / PROFILE WORKSPACE</p><h1>{copy[0]}</h1><p>{copy[1]}</p></div><a className="export" href={`${API}/export`} target="_blank" rel="noreferrer"><FileJson size={17}/>导出 JSON</a></header>}
+function Top({page}:{page:Page}){const copy={chat:['求职助手','通过文字与招聘截图明确目标，再进入可控的投递流程。'],overview:['候选人资料总览','一次维护，反复用于之后的每次申请。'],jobs:['推荐投递清单','根据已确认简历生成可解释推荐，选中后直接进入投递流程。'],profile:['候选人主档案','这里是你的事实来源，Agent 不会擅自覆盖已确认信息。'],resumes:['简历资料库','管理不同语言、岗位方向和版本的简历。'],review:['识别结果检查','对照原文确认 Agent 拆分的字段，并处理资料冲突。'],demo:['投递工作台','选择简历和信息填写页，剩下的交给职达辅助。']}[page];return <header><div><p className="eyebrow">ZHIDA / PROFILE WORKSPACE</p><h1>{copy[0]}</h1><p>{copy[1]}</p></div>{page!=='demo'&&<a className="export" href={`${API}/export`} target="_blank" rel="noreferrer"><FileJson size={17}/>导出 JSON</a>}</header>}
 
 function Overview({profile,resumes,conflicts,go}:{profile:CandidateProfile;resumes:ResumeRecord[];conflicts:Conflict[];go:(p:Page)=>void}){
   const pending=resumes.flatMap(r=>r.evidence).filter(e=>e.status==='pending_review').length
@@ -149,6 +162,14 @@ function ProfileEditor({profile,onSave}:{profile:CandidateProfile;onSave:(p:Resu
   const set=(key:keyof ResumeProfile,value:unknown)=>setDraft(d=>({...d,[key]:value}))
   return <div className="stack"><section className="card"><SectionTitle n="01" title="基本信息" sub="敏感信息只由你填写或确认"/><div className="form-grid three">
     <Input label="姓名" value={draft.name} set={v=>set('name',v)}/><Input label="英文姓名" value={draft.english_name} set={v=>set('english_name',v)}/><Select label="性别" value={draft.gender} values={['未识别','男','女','其他']} set={v=>set('gender',v)}/><Input label="出生日期" type="date" value={draft.birth_date} set={v=>set('birth_date',v)}/><Input label="年龄" type="number" value={draft.age} set={v=>set('age',v?Number(v):null)}/><Input label="手机号" value={draft.phone} set={v=>set('phone',v)}/><Input label="邮箱" type="email" value={draft.email} set={v=>set('email',v)}/><Input label="国家/地区" value={draft.country_region} set={v=>set('country_region',v)}/><Input label="国籍" value={draft.nationality} set={v=>set('nationality',v)}/><Input label="民族" value={draft.ethnicity} set={v=>set('ethnicity',v)}/><Input label="政治面貌" value={draft.political_status} set={v=>set('political_status',v)}/><Input label="婚姻状况" value={draft.marital_status} set={v=>set('marital_status',v)}/><Input label="QQ" value={draft.qq} set={v=>set('qq',v)}/><Input label="微信" value={draft.wechat} set={v=>set('wechat',v)}/><Input label="当前城市" value={draft.location} set={v=>set('location',v)}/><Input label="籍贯" value={draft.hometown} set={v=>set('hometown',v)}/><Input label="户籍所在地" value={draft.hukou_location} set={v=>set('hukou_location',v)}/><Input label="通讯地址" value={draft.address} set={v=>set('address',v)}/><Input label="GitHub" value={draft.github} set={v=>set('github',v)}/><Input label="LinkedIn" value={draft.linkedin} set={v=>set('linkedin',v)}/><Input label="个人网站" value={draft.website} set={v=>set('website',v)}/></div><Text label="个人简介" value={draft.summary} set={v=>set('summary',v)}/></section>
+    <section className="card"><SectionTitle n="补充" title="常用网申资料" sub="只保存本人确认的事实；籍贯、户口、生源地、现居住地分别使用。退役状态仍需在当次表单确认；无正式工作不代表无实习。"/><div className="form-grid three">
+      <Input label="身高（cm）" type="number" value={draft.height_cm??''} set={v=>set('height_cm',v?Number(v):null)}/>
+      <Input label="体重（kg）" type="number" value={draft.weight_kg??''} set={v=>set('weight_kg',v?Number(v):null)}/>
+      <Input label="生源地（高考所在地，省/市/区）" value={draft.student_origin||''} set={v=>set('student_origin',v)}/>
+      <Select label="是否为退役军人" value={draft.veteran_status||''} values={['','是','否']} set={v=>set('veteran_status',v)}/>
+      <Select label="高中到最高学历学习时间是否连续" value={draft.study_continuity||''} values={['','是','否']} set={v=>set('study_continuity',v)}/>
+      <Select label="正式劳动合同及社保工作经历（不含实习）" value={draft.formal_employment_status||''} values={['','有','无']} set={v=>set('formal_employment_status',v)}/>
+    </div></section>
     <section className="card"><SectionTitle n="02" title="求职偏好" sub="后续用于职位筛选和申请表单"/><div className="form-grid three"><Input label="目标岗位" value={draft.target_role} set={v=>set('target_role',v)}/><Input label="目标城市（逗号分隔）" value={draft.target_cities.join('，')} set={v=>set('target_cities',split(v))}/><Input label="目标行业（逗号分隔）" value={draft.target_industries.join('，')} set={v=>set('target_industries',split(v))}/><Input label="意向事业群（逗号分隔）" value={draft.preferred_business_groups.join('，')} set={v=>set('preferred_business_groups',split(v))}/><Input label="面试方式/城市偏好（逗号分隔）" value={draft.interview_preferences.join('，')} set={v=>set('interview_preferences',split(v))}/><Input label="是否接受调剂/异地分配" value={draft.willing_to_relocate} set={v=>set('willing_to_relocate',v)}/><Input label="校招候选人类型" value={draft.campus_candidate_type} set={v=>set('campus_candidate_type',v)}/><Input label="可入职时间" value={draft.available_date} set={v=>set('available_date',v)}/><Input label="实习时长" value={draft.internship_duration} set={v=>set('internship_duration',v)}/><Input label="每周可实习天数" value={draft.days_per_week} set={v=>set('days_per_week',v)}/><Input label="期望薪资" value={draft.expected_salary} set={v=>set('expected_salary',v)}/><Input label="远程偏好" value={draft.remote_preference} set={v=>set('remote_preference',v)}/></div></section>
     <EditableList title="教育经历" n="03" items={draft.education} empty={emptyEducation} set={v=>set('education',v)} render={(x,i,edit)=><div className="form-grid three"><Input label="学校" value={x.school} set={v=>edit(i,{school:v})}/><Input label="学院" value={x.college} set={v=>edit(i,{college:v})}/><Input label="专业" value={x.major} set={v=>edit(i,{major:v})}/><Input label="学历" value={x.degree} set={v=>edit(i,{degree:v})}/><Input label="培养/学习方式" value={x.study_mode} set={v=>edit(i,{study_mode:v})}/><Input label="学制" value={x.academic_system} set={v=>edit(i,{academic_system:v})}/><Input label="学号" value={x.student_id} set={v=>edit(i,{student_id:v})}/><Input label="导师" value={x.advisor} set={v=>edit(i,{advisor:v})}/><Input label="实验室" value={x.laboratory} set={v=>edit(i,{laboratory:v})}/><Input label="研究方向" value={x.research_direction} set={v=>edit(i,{research_direction:v})}/><Input label="就读地点" value={x.location} set={v=>edit(i,{location:v})}/><Input label="开始时间" value={x.start_date} set={v=>edit(i,{start_date:v})}/><Input label="毕业时间" value={x.end_date} set={v=>edit(i,{end_date:v})}/><Input label="GPA" value={x.gpa} set={v=>edit(i,{gpa:v})}/><Input label="排名" value={x.ranking} set={v=>edit(i,{ranking:v})}/></div>}/>
     <EditableList title="实习经历" n="04" items={draft.internships} empty={emptyExperience} set={v=>set('internships',v)} render={(x,i,edit)=><><div className="form-grid three"><Input label="公司/组织" value={x.organization} set={v=>edit(i,{organization:v})}/><Input label="部门" value={x.department} set={v=>edit(i,{department:v})}/><Input label="职位" value={x.role} set={v=>edit(i,{role:v})}/><Input label="地点" value={x.location} set={v=>edit(i,{location:v})}/><Input label="开始时间" value={x.start_date} set={v=>edit(i,{start_date:v})}/><Input label="结束时间" value={x.end_date} set={v=>edit(i,{end_date:v})}/></div><Text label="工作内容" value={x.description} set={v=>edit(i,{description:v})}/><Text label="实习成果（每行一条）" value={x.achievements.join('\n')} set={v=>edit(i,{achievements:v.split(/\r?\n/).map(s=>s.trim()).filter(Boolean)})}/><Input label="使用技术（逗号分隔）" value={x.technologies.join('，')} set={v=>edit(i,{technologies:split(v)})}/></>}/>
@@ -171,12 +192,14 @@ function ReviewWorkspace({resumes,active,conflicts,rawText,select,notify,onRevie
 function EvidenceItem({item,act,notify}:{item:Evidence;act:(s:string,v?:unknown)=>Promise<void>;notify:(v:string)=>void}){const [editing,setEditing]=useState(false);const [value,setValue]=useState(typeof item.value==='string'?item.value:JSON.stringify(item.value,undefined,2));const tone=item.confidence>=.9?'high':item.confidence>=.75?'medium':'low';const submit=async(status:string,next?:unknown)=>{try{await act(status,next);if(status==='edited')notify(`${labels[item.field_path]??item.field_path}已同步到简历版本和主档案。`);return true}catch(e){notify(message(e));return false}};const save=async()=>{let parsed:unknown=value;if(typeof item.value!=='string'){try{parsed=JSON.parse(value)}catch{notify('列表或经历字段必须是有效的 JSON，请检查括号和引号。');return}}if(await submit('edited',parsed))setEditing(false)};return <article className={`evidence-item ${item.status}`}><div className="evidence-top"><strong>{labels[item.field_path]??item.field_path}</strong><span className={tone}>{Math.round(item.confidence*100)}% 置信度</span></div>{editing?<textarea value={value} onChange={e=>setValue(e.target.value)}/>:<div className="evidence-value">{value}</div>}<blockquote>{item.source_text||'未找到直接原文'}</blockquote><div className="evidence-actions"><span>等待确认</span>{editing?<><button onClick={save}>保存修改</button><button onClick={()=>setEditing(false)}>取消</button></>:<><button onClick={()=>submit('confirmed')}><Check size={14}/>确认</button><button onClick={()=>setEditing(true)}>修改</button><button className="reject" onClick={()=>submit('rejected')}>拒绝</button></>}</div></article>}
 function ConflictList({conflicts,resolve}:{conflicts:Conflict[];resolve:(id:string,c:'current'|'incoming'|'custom',v?:unknown)=>void}){return <section className="card"><SectionTitle n={String(conflicts.length).padStart(2,'0')} title="资料冲突" sub="新简历不会静默覆盖主档案，请选择真实信息"/>{!conflicts.length?<div className="success-empty"><ShieldCheck size={30}/><h3>没有待处理冲突</h3><p>主档案中的信息目前一致。</p></div>:<div className="conflict-list">{conflicts.map(c=><article key={c.id}><div><span>{labels[c.field_path]??c.field_path}</span><small>来自：{c.resume_label}</small></div><button onClick={()=>resolve(c.id,'current')}><small>保留主档案</small><strong>{display(c.current_value)}</strong></button><button onClick={()=>resolve(c.id,'incoming')}><small>采用新简历</small><strong>{display(c.incoming_value)}</strong></button></article>)}</div>}</section>}
 
-function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpdate,initialJob,initialResumeId,initialQueueId,initialTarget,onSessionChange}:{active:boolean;initialTarget:ApplicationTarget|null;onSessionChange:(active:boolean)=>void;profile:CandidateProfile|null;resumes:ResumeRecord[];notify:(v:string)=>void;onProfileUpdate:(profile:CandidateProfile)=>void;onResumeUpdate:(resume:ResumeRecord)=>void;initialJob:JobRecommendation|null;initialResumeId:string;initialQueueId:string}){
+function BrowserDemo({ownerId,active,profile,resumes,notify,onProfileUpdate,onResumeUpdate,initialJob,initialResumeId,initialQueueId,initialTarget,onSessionChange}:{ownerId:string;active:boolean;initialTarget:ApplicationTarget|null;onSessionChange:(active:boolean)=>void;profile:CandidateProfile|null;resumes:ResumeRecord[];notify:(v:string)=>void;onProfileUpdate:(profile:CandidateProfile)=>void;onResumeUpdate:(resume:ResumeRecord)=>void;initialJob:JobRecommendation|null;initialResumeId:string;initialQueueId:string}){
   const defaultResumeId=initialResumeId||(resumes.find(item=>item.is_default)??resumes[0])?.id||''
   const initialResume=resumes.find(item=>item.id===defaultResumeId)
-  const [url,setUrl]=useState(initialTarget?.source_url||initialJob?.job.url||'https://join.qq.com/post_detail.html?postid=1282707395466077184');const [snapshot,setSnapshot]=useState<BrowserSnapshot|null>(null);const [workflow,setWorkflow]=useState<ApplicationWorkflowState|null>(null);const [agentTurn,setAgentTurn]=useState<ApplicationAgentTurn|null>(null);const [verificationCode,setVerificationCode]=useState('');const [registrationEmail,setRegistrationEmail]=useState(profile?.email||'');const [registrationPhone,setRegistrationPhone]=useState(profile?.phone||'');const [registrationPassword,setRegistrationPassword]=useState('');const [plan,setPlan]=useState<FormPlan|null>(null);const [comparisons,setComparisons]=useState<FieldComparison[]>([]);const [nativeImport,setNativeImport]=useState<NativeResumeImportResult|null>(null);const [showMatched,setShowMatched]=useState(false);const [execution,setExecution]=useState<ExecutionResult|null>(null);const [check,setCheck]=useState<PreSubmitCheck|null>(null);const [answers,setAnswers]=useState<Record<string,string>>({});const [skippedSelectors,setSkippedSelectors]=useState<Set<string>>(new Set());const [editingSelectors,setEditingSelectors]=useState<Set<string>>(new Set());const [selectedResume,setSelectedResume]=useState(defaultResumeId);const [busy,setBusyState]=useState('')
+  const [url,setUrl]=useState(initialTarget?.source_url||initialJob?.job.url||'');const [snapshot,setSnapshot]=useState<BrowserSnapshot|null>(null);const [workflow,setWorkflow]=useState<ApplicationWorkflowState|null>(null);const [agentTurn,setAgentTurn]=useState<ApplicationAgentTurn|null>(null);const [verificationCode,setVerificationCode]=useState('');const [registrationEmail,setRegistrationEmail]=useState(profile?.email||'');const [registrationPhone,setRegistrationPhone]=useState(profile?.phone||'');const [registrationPassword,setRegistrationPassword]=useState('');const [plan,setPlan]=useState<FormPlan|null>(null);const [comparisons,setComparisons]=useState<FieldComparison[]>([]);const [nativeImport,setNativeImport]=useState<NativeResumeImportResult|null>(null);const [showMatched,setShowMatched]=useState(false);const [execution,setExecution]=useState<ExecutionResult|null>(null);const [check,setCheck]=useState<PreSubmitCheck|null>(null);const [answers,setAnswers]=useState<Record<string,string>>({});const [skippedSelectors,setSkippedSelectors]=useState<Set<string>>(new Set());const [editingSelectors,setEditingSelectors]=useState<Set<string>>(new Set());const [selectedResume,setSelectedResume]=useState(defaultResumeId);const [busy,setBusyState]=useState('')
   const agentRevision=useRef(0)
   const restoreRequest=useRef(0)
+  const [openedSafari,setOpenedSafari]=useState<{url:string;token:string}|null>(null)
+  const hasMatchingSafari=Boolean(openedSafari&&openedSafari.url===inspectTaskUrl(url).url)
   const [browserOccupied,setBrowserOccupied]=useState(false)
   const [backendReady,setBackendReady]=useState(false)
   const [recordCompletionReady,setRecordCompletionReady]=useState(false)
@@ -185,16 +208,21 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
   const [memoryFailures,setMemoryFailures]=useState<string[]>([])
   const [checkedSkips,setCheckedSkips]=useState<{selectors:string[];snapshot:BrowserSnapshot;resumeId:string}|null>(null)
   const [assistResult,setAssistResult]=useState<ApplicationAssistResult|null>(null)
+  const [assistProgress,setAssistProgress]=useState<ApplicationAssistProgress|null>(null)
+  const [controlDiagnostics,setControlDiagnostics]=useState<Record<string,unknown>|null>(null)
+  const assistRun=useRef<{session:string;id:string;active:boolean}|null>(null)
+  useEffect(()=>()=>{if(assistRun.current)assistRun.current.active=false},[])
   const [allowSiteParse,setAllowSiteParse]=useState(false)
-  const [deferGovernmentId,setDeferGovernmentId]=useState(false)
-  useEffect(()=>{setDeferGovernmentId(false)},[snapshot?.session_id,selectedResume])
+  const [workspaceStage,setWorkspaceStage]=useState<'setup'|'workspace'>('setup')
+  const [workspaceSection,setWorkspaceSection]=useState<ApplicationWorkspaceSection>('operation')
   const changeTaskResume=async(id:string)=>{
     if(busy||id===selectedResume)return
+    if(!snapshot){setSelectedResume(id);resetReview();return}
     if(!backendReady){notify('本轮自动补齐升级尚未加载，请先保留招聘草稿，再重启后端。');return}
     if(snapshot&&(Object.values(answers).some(v=>v.trim())||skippedSelectors.size)){notify('请先填写并验证或清除本页临时答案，再切换简历。');return}
     if(snapshot&&!window.confirm('切换后会清空旧分析计划并重新核对。招聘网页上已填写的内容和已上传的附件不会自动撤销，请重新检查。'))return
     setBusy('resume-switching')
-    try{if(snapshot)await api.selectTaskResume(snapshot.session_id,id);setSelectedResume(id);setDeferGovernmentId(false);resetReview();setAgentTurn(null);setNativeImport(null);notify('已切换本次填写依据；请重新分析当前网页。')}
+    try{if(snapshot)await api.selectTaskResume(snapshot.session_id,id);setSelectedResume(id);resetReview();setAgentTurn(null);setNativeImport(null);notify('已切换本次填写依据。')}
     catch(e){notify(message(e))}finally{setBusy('')}
   }
   const [recoveryWarning,setRecoveryWarning]=useState('')
@@ -233,6 +261,33 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
   const restoreExistingSession=async()=>{
     const revision=++restoreRequest.current;setBusy('restoring');setRecoveryWarning('')
     try{
+      const remembered=rememberedAssistRun(window.sessionStorage,ownerId,window.location.hash)
+      if(remembered){
+        const run={...remembered,active:true};assistRun.current=run;setBusy('assisting')
+        rememberAssistRun(window.sessionStorage,ownerId,remembered)
+        // Restoring progress is not restoring a write task. Only receipt GETs
+        // run while the original task may still hold the browser operation lock.
+        const result=await watchAssist(()=>api.assistProgress(run.session,run.id),p=>{
+          if(run.active&&revision===restoreRequest.current)setAssistProgress(p)
+        },()=>run.active&&revision===restoreRequest.current)
+        run.active=false
+        if(revision!==restoreRequest.current)return
+        forgetAssistRun(window.sessionStorage,ownerId)
+        const params=new URLSearchParams(window.location.hash.replace(/^#/,''))
+        if(params.has('assist-session')||params.has('assist-run'))window.history.replaceState(null,'',window.location.pathname+window.location.search)
+        if(result){
+          setAssistResult(result);setSnapshot(result.snapshot);setUrl(result.snapshot.url)
+          setPlan(result.review?.plan??null);setComparisons(result.review?.comparisons??[]);setCheck(result.pre_submit)
+          const current=await api.currentBrowser()
+          if(revision!==restoreRequest.current)return
+          setBackendReady(assistanceBackendReady(current));setRecordCompletionReady((current.record_completion_version??0)>=1);setJourneyReady(journeyBackendReady(current));setBrowserOccupied(current.occupied);setSelectedResume(current.resume_id||'')
+          const state=await api.workflowState(run.session)
+          if(revision!==restoreRequest.current)return
+          setWorkflow(state);setTaskTarget(state.target||null);setObservedChange(state)
+          setRecoveryWarning('已只读恢复上轮进度和结果，没有重发填写。结果来自上轮核验；继续操作前请同步当前页。')
+          return
+        }
+      }
       const current=await api.currentBrowser()
       if(revision!==restoreRequest.current)return
       setBackendReady(assistanceBackendReady(current));setRecordCompletionReady((current.record_completion_version??0)>=1);setJourneyReady(journeyBackendReady(current));setBrowserOccupied(current.occupied)
@@ -260,7 +315,7 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
         setCheck(null);setExecution(null);setAssistResult(null);setJourneyResult(null);setAgentTurn(null)
         setRecoveryWarning('原招聘浏览器会话已结束（可能是后端重启）。目标岗位、简历选择和未执行答案仍保留；请重新打开招聘页面，不会执行旧填写计划。')
       }
-    }catch(error){if(revision!==restoreRequest.current)return;setBackendReady(false);setJourneyReady(false);setBrowserOccupied(true);setRecoveryWarning(`暂时无法确认现有浏览器任务状态，已暂停创建新任务以免覆盖。${message(error)}`)}finally{if(revision===restoreRequest.current)setBusy('')}
+    }catch(error){if(revision!==restoreRequest.current)return;if(assistRun.current)assistRun.current.active=false;if(error instanceof ApiError&&[401,403,404].includes(error.status))forgetAssistRun(window.sessionStorage,ownerId);setBackendReady(false);setJourneyReady(false);setBrowserOccupied(true);setRecoveryWarning(`暂时无法确认现有浏览器任务状态，已暂停创建新任务以免覆盖。${message(error)}`)}finally{if(revision===restoreRequest.current)setBusy('')}
   }
   useEffect(()=>{void restoreExistingSession();return()=>{restoreRequest.current+=1}},[])
   useEffect(()=>{if(initialTarget&&!snapshot){setTaskTarget(initialTarget);setUrl(initialTarget.source_url)}},[initialTarget])
@@ -273,7 +328,23 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
   useEffect(()=>{setRegistrationEmail(profile?.email||'');setRegistrationPhone(profile?.phone||'')},[profile?.email,profile?.phone])
   const resetReview=()=>{setPlan(null);setComparisons([]);setExecution(null);setCheck(null);setAnswers({});setSkippedSelectors(new Set());setCheckedSkips(null);setEditingSelectors(new Set());setPhaseProgress({rules:null,model:null});setAssistResult(null);setJourneyResult(null);setMemoryFailures([]);setAllowSiteParse(false)}
   const applyAgentTurn=(turn:ApplicationAgentTurn)=>{if(turn.action_taken&&turn.action_taken!=='analyze_and_fill')resetReview();setAgentTurn(turn);setWorkflow(turn.workflow);setSnapshot(turn.snapshot);if(turn.review){setPlan(turn.review.plan);setComparisons(turn.review.comparisons)}if(turn.assistance){setAssistResult(turn.assistance);setExecution(null);setAllowSiteParse(false);setPlan(turn.assistance.review?.plan??null);setComparisons(turn.assistance.review?.comparisons??[])}if(turn.execution)setExecution(turn.execution);setCheck(turn.assistance?.pre_submit??turn.pre_submit??turn.execution?.pre_submit??null)}
-  const start=async()=>{if(busy||snapshot||browserOccupied||!ensureDraftSettled())return;if(!backendReady){notify('后端尚未加载新版，请重启后再开始投递。');return}const destination=inspectTaskUrl(url);if(destination.error){notify(destination.error);return}if(!window.confirm(`将访问 ${destination.hostname}，请确认这是你要使用的招聘网站。系统仅进入浏览，不代表已验证官网，也不会最终提交。`))return;setBusy('opening');resetReview();setNativeImport(null);setWorkflow(null);setAgentTurn(null);setVerificationCode('');try{const data=await api.startBrowser(destination.url,taskTarget?{...taskTarget,source_url:destination.url}:undefined,selectedResume);setSnapshot(data);setRecoveryWarning('');const state=await api.workflowState(data.session_id);setWorkflow(state);notify(`已打开 ${data.title||data.url}，当前阶段：${workflowStageLabel(state.stage)}。`);assessInBackground(data.session_id)}catch(e){notify(message(e))}finally{setBusy('')}}
+  const start=async()=>{
+    if(busy||snapshot||browserOccupied||!ensureDraftSettled())return
+    if(!backendReady){notify('暂时无法连接职达后端，请检查后重试。');return}
+    const destination=inspectTaskUrl(url)
+    if(destination.error){notify(destination.error);return}
+    if(!openedSafari||openedSafari.url!==destination.url){notify('请先连接你指定的已登录填写窗口，职达不会另开窗口。');return}
+    setBusy('opening');resetReview();setNativeImport(null);setWorkflow(null);setAgentTurn(null)
+    try{
+      // This form-only workbench never launches a new window or job navigation.
+      const data=await api.startBrowser(destination.url,undefined,selectedResume,openedSafari?.url===destination.url?openedSafari.token:'')
+      setSnapshot(data);setRecoveryWarning('')
+      const state=await api.workflowState(data.session_id)
+      setWorkflow(state)
+      return {snapshot:data,workflow:state}
+    }catch(error){if(error instanceof ApiError&&error.status===404)setOpenedSafari(null);notify(message(error))}
+    finally{setBusy('')}
+  }
   const refreshWorkflow=async()=>{if(!snapshot||busy||!ensureDraftSettled())return;setBusy('refreshing');try{const [state,fresh]=await Promise.all([api.advanceWorkflow(snapshot.session_id,'refresh'),api.browserSnapshot(snapshot.session_id)]);setWorkflow(state);setSnapshot(fresh);setObservedChange(null);setNativeImport(null);resetReview();notify(`已重新识别，当前阶段：${workflowStageLabel(state.stage)}。`);assessInBackground(snapshot.session_id)}catch(e){notify(message(e))}finally{setBusy('')}}
   const assessAgent=async()=>{if(!snapshot||busy||!ensureCurrentPage()||!ensureDraftSettled())return;setBusy('agent-assessing');try{applyAgentTurn(await api.assessApplicationAgent(snapshot.session_id));notify('流程 Agent 已结合当前网页、资料准备度和安全边界给出下一步。')}catch(e){notify(message(e))}finally{setBusy('')}}
   const runAgentStep=async()=>{if(!snapshot||busy||!ensureCurrentPage()||!ensureDraftSettled())return;setBusy('agent-running');try{const turn=await api.runApplicationAgentStep(snapshot.session_id,selectedResume);applyAgentTurn(turn);if(turn.assistance){await syncTrackedStatus('needs_review');notify(`${assistStatus(turn.assistance.status).title}：${turn.assistance.message}`)}else if(turn.execution){const synced=await syncTrackedStatus(trackedStatus(turn.execution.pre_submit,turn.execution.failed));notify(`Agent 已填写并回读验证 ${turn.execution.verified} 项，${turn.execution.failed} 项失败。${synced?'流水账已同步。':''}`)}else notify(turn.action_taken?`Agent 已执行：${agentActionLabel(turn.action_taken)}`:turn.decision.next_label)}catch(e){notify(message(e))}finally{setBusy('')}}
@@ -289,7 +360,7 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
       applyAgentTurn(result.turn);setJourneyResult(result);setObservedChange(null);setRecoveryWarning('')
       if(result.turn.assistance||result.turn.execution)await syncTrackedStatus('needs_review')
       notify(`${journeyStatus(result.status)}：${result.message}`)
-    }catch(error){setPlan(null);setComparisons([]);setCheck(null);setWorkflow(null);setRecoveryWarning('职达未取得完整推进结果，网页可能已有部分填写。请先只读同步当前页再核对，不要重复上传附件。');notify(`本轮未完成：${message(error)}`)}
+    }catch(error){setPlan(null);setComparisons([]);setCheck(null);setWorkflow(null);setRecoveryWarning('本轮未完成，当前招聘页面状态需要重新确认。请先只读同步并核对官网实际内容；不会自动重试或重复上传附件。');notify(`本轮未完成：${message(error)}`)}
     finally{setBusy('')}
   }
   const onFactSaved=async(updated:ResumeRecord):Promise<string>=>{
@@ -322,10 +393,19 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
   const radioKey=(field:PageField)=>field.control_group_key||field.group_label||field.name||field.label
   const answerRadio=(field:PageField,selector:string)=>{setCheckedSkips(null);const group=snapshot?.fields.filter(item=>item.field_type==='radio'&&radioKey(item)===radioKey(field))??[];setMemoryFailures(current=>current.filter(item=>!group.some(field=>field.selector===item)));setAnswers(current=>{const next={...current};group.forEach(item=>delete next[item.selector]);if(selector)next[selector]='true';return next})}
   const answerMulti=(action:FillAction,option:string,checked:boolean)=>{setCheckedSkips(null);setMemoryFailures(current=>current.filter(selector=>selector!==action.selector));setAnswers(current=>{const values=new Set(split(current[action.selector]||''));checked?values.add(option):values.delete(option);const next={...current};const value=[...values].join('，');if(value)next[action.selector]=value;else delete next[action.selector];return next})}
+  const answerCheckboxGroup=(group:CheckboxQuestionGroup,selector:string,checked:boolean)=>{if(group.blockReason)return;setCheckedSkips(null);const members=new Set(group.fields.map(field=>field.selector));setMemoryFailures(current=>current.filter(item=>!members.has(item)));setAnswers(current=>checkboxGroupAnswers(group,current,selector,checked))}
   const toggleSkip=(selector:string)=>{setCheckedSkips(null);setMemoryFailures(current=>current.filter(item=>item!==selector));setSkippedSelectors(current=>{const next=new Set(current);next.has(selector)?next.delete(selector):next.add(selector);return next})}
   const toggleEdit=(selector:string)=>setEditingSelectors(current=>{const next=new Set(current);next.has(selector)?next.delete(selector):next.add(selector);return next})
   const reusableValue=(field:PageField,raw:string)=>field.field_type==='radio'?(field.option_label||field.option_value||field.label):field.field_type==='checkbox'?(raw==='true'?'是':'否'):raw.trim()
-  const persistAnswer=async(action:FillAction,raw:string)=>{const field=snapshot?.fields.find(f=>f.selector===action.selector);if(!field||action.sensitive||skippedSelectors.has(action.selector))return null;const value=reusableValue(field,raw);if(!value)return null;const question=fieldDisplayLabel(field,action.label);return api.saveApplicationAnswer(question,field.name,value,{semantic_key:field.semantic_key,entity_scope:field.entity_scope,field_signature:field.field_signature,field_type:field.field_type,options:field.options,source_url:snapshot?.url||'',resume_id:selectedResume})}
+  const persistAnswer=async(action:FillAction,raw:string)=>{
+    const field=snapshot?.fields.find(f=>f.selector===action.selector)
+    if(!field||action.sensitive||skippedSelectors.has(action.selector))return null
+    const groupedCheckbox=field.field_type==='checkbox'&&checkboxQuestionGroups(snapshot?.fields??[]).some(group=>group.fields.some(member=>member.selector===field.selector))
+    if(groupedCheckbox&&(!field.field_signature?.startsWith('checkbox-option-v1:')||field.knowledge_block_reason?.startsWith('复选题记忆归属不明确：')))return null
+    const value=reusableValue(field,raw);if(!value)return null
+    const question=fieldDisplayLabel(field,action.label)
+    return api.saveApplicationAnswer(question,field.name,value,{semantic_key:field.semantic_key,entity_scope:field.entity_scope,field_signature:field.field_signature,field_type:field.field_type,options:field.options,source_url:snapshot?.url||'',resume_id:selectedResume})
+  }
   const remember=async(action:FillAction)=>{
     if(busy||!snapshot||!ensureCurrentPage())return
     const value=answers[action.selector]?.trim()
@@ -341,6 +421,11 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
         setPlan(null);setComparisons([]);setCheck(null);setExecution(null);setObservedChange(workflow);setWorkflow(null)
         setRecoveryWarning('网页题目、选项或本次简历已变化，尚未保存答案记忆。临时答案仍保留，旧计划已暂停；请核对后只读同步当前页。')
         notify('当前页面或简历与原答案不一致，未写入记忆；请先核对保留的答案。')
+        return
+      }
+      const currentField=currentSnapshot.fields.find(field=>field.selector===action.selector)
+      if(currentField?.field_type==='checkbox'&&currentField.current_value!==value){
+        notify('官网勾选状态与保留答案不一致，未写入记忆。请先核对并重新填写验证。')
         return
       }
       const updated=await persistAnswer(action,value)
@@ -373,6 +458,9 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
     const learned=await learnVerifiedDrafts(answers,result,async(selector,value)=>{
       const action=plan.actions.find(item=>item.selector===selector)
       if(!action||action.sensitive||skippedSelectors.has(selector))return false
+      const field=snapshot?.fields.find(item=>item.selector===selector)
+      const receipt=result.results.find(item=>item.selector===selector)
+      if(field?.field_type==='checkbox'&&receipt?.actual_value!==value)throw new Error('复选项回读状态与确认答案不一致，未记住该答案')
       const saved=await persistAnswer(action,value)
       if(saved)updated=saved
       return Boolean(saved)
@@ -381,14 +469,32 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
     setMemoryFailures(learned.failed)
     return learned
   }
-  const preparedActions=useMemo(()=>plan?.actions.map(action=>{if(skippedSelectors.has(action.selector))return {...action,action:'skip' as const,value:'',reason:'用户选择本次不填写'};const manual=answers[action.selector];if(!manual)return action;const field=snapshot?.fields.find(f=>f.selector===action.selector);const kind=field?.field_type;return {...action,action:(kind==='select-one'||kind==='select-multiple'||kind==='combobox'?'select':kind==='checkbox'||kind==='radio'?'check':'fill') as FillAction['action'],value:kind==='checkbox'||kind==='radio'?manual==='true':manual,confidence:1,sensitive:action.sensitive,user_confirmed:true,resolution_source:'user' as const,needs_model:false,value_source:'用户在提交前补充'}})??[],[plan,answers,snapshot,skippedSelectors])
+  const preparedActions=useMemo(()=>plan?.actions.map(action=>{if(skippedSelectors.has(action.selector))return {...action,action:'skip' as const,value:'',reason:'用户选择本次不填写'};const manual=answers[action.selector];if(!manual)return action;const field=snapshot?.fields.find(f=>f.selector===action.selector);const kind=field?.field_type;return {...action,action:manualFillAction(field),value:kind==='checkbox'||kind==='radio'?manual==='true':manual,confidence:1,sensitive:action.sensitive,user_confirmed:true,resolution_source:'user' as const,needs_model:false,value_source:'用户在提交前补充'}})??[],[plan,answers,snapshot,skippedSelectors])
   const readyCount=preparedActions.filter(a=>['fill','select','check'].includes(a.action)&&(a.action==='check'||String(a.value).trim())&&(!a.sensitive||a.user_confirmed)&&a.confidence>=.85).length
   const needsInput=plan?.actions.filter(action=>{const field=snapshot?.fields.find(f=>f.selector===action.selector);if(!field||field.field_type==='file'||action.needs_model&&!answers[action.selector])return false;const emptyAction=!['fill','select','check'].includes(action.action)||(action.action!=='check'&&!String(action.value).trim());const websiteFilled=field.field_type==='radio'?Boolean(snapshot?.fields.some(item=>item.field_type==='radio'&&radioKey(item)===radioKey(field)&&item.current_value==='true')):field.field_type==='checkbox'?field.current_value==='true':Boolean(field.current_value&&!/^(select|choose|请选择|未选择|暂未选择)/i.test(field.current_value));return Boolean(answers[action.selector])||action.action==='ask_user'||action.sensitive||Boolean(field.required&&emptyAction&&!websiteFilled)})??[]
-  const manualGroups=useMemo(()=>{const groups:{key:string;label:string;kind:'radio'|'field';actions:FillAction[];fields:PageField[]}[]=[];const seen=new Set<string>();for(const action of needsInput){const field=snapshot?.fields.find(item=>item.selector===action.selector);if(!field)continue;if(field.field_type==='radio'){const key=`radio:${radioKey(field)}`;if(seen.has(key))continue;seen.add(key);const fields=snapshot?.fields.filter(item=>item.field_type==='radio'&&radioKey(item)===radioKey(field))??[];const selectors=new Set(fields.map(item=>item.selector));groups.push({key,label:actionReviewTitle(action,field),kind:'radio',fields,actions:needsInput.filter(item=>selectors.has(item.selector))})}else{groups.push({key:action.selector,label:actionReviewTitle(action,field),kind:'field',fields:[field],actions:[action]})}}return groups},[needsInput,snapshot])
+  const manualGroups=useMemo(()=>{
+    const groups:{key:string;label:string;kind:'radio'|'checkbox'|'field';actions:FillAction[];fields:PageField[];checkboxGroup?:CheckboxQuestionGroup}[]=[]
+    const seen=new Set<string>(),checkboxBySelector=new Map(checkboxQuestionGroups(snapshot?.fields??[]).flatMap(group=>group.fields.map(field=>[field.selector,group] as const)))
+    for(const action of needsInput){
+      const field=snapshot?.fields.find(item=>item.selector===action.selector);if(!field)continue
+      const checkboxGroup=checkboxBySelector.get(field.selector)
+      if(checkboxGroup){
+        if(seen.has(checkboxGroup.key))continue;seen.add(checkboxGroup.key)
+        const selectors=new Set(checkboxGroup.fields.map(item=>item.selector))
+        groups.push({key:checkboxGroup.key,label:checkboxGroup.question,kind:'checkbox',fields:checkboxGroup.fields,actions:needsInput.filter(item=>selectors.has(item.selector)),checkboxGroup})
+      }else if(field.field_type==='radio'){
+        const key=`radio:${radioKey(field)}`;if(seen.has(key))continue;seen.add(key)
+        const fields=snapshot?.fields.filter(item=>item.field_type==='radio'&&radioKey(item)===radioKey(field))??[],selectors=new Set(fields.map(item=>item.selector))
+        groups.push({key,label:actionReviewTitle(action,field),kind:'radio',fields,actions:needsInput.filter(item=>selectors.has(item.selector))})
+      }else groups.push({key:action.selector,label:actionReviewTitle(action,field),kind:'field',fields:[field],actions:[action]})
+    }
+    return groups
+  },[needsInput,snapshot])
   const visibleActions=useMemo(()=>{const actions=plan?.actions??[];const result:FillAction[]=[];const seen=new Set<string>();for(const action of actions){const field=snapshot?.fields.find(item=>item.selector===action.selector);if(field?.field_type!=='radio'){result.push(action);continue}const key=radioKey(field);if(seen.has(key))continue;seen.add(key);const selectors=new Set(snapshot?.fields.filter(item=>item.field_type==='radio'&&radioKey(item)===key).map(item=>item.selector)??[]);const groupActions=actions.filter(item=>selectors.has(item.selector));result.push(groupActions.find(item=>item.action==='check')??groupActions.find(item=>item.action==='ask_user')??groupActions.find(item=>item.action!=='skip')??action)}return result},[plan,snapshot])
   const pendingModelSelectors=pendingActionSelectors(preparedActions)
   const visibleComparisons=comparisons.filter(item=>!pendingModelSelectors.has(item.selector)&&(showMatched||item.status!=='matched'))
-  const unresolvedGroups=manualGroups.filter(group=>group.kind==='radio'?!group.fields.some(field=>answers[field.selector]==='true'):!answers[group.actions[0]?.selector]&&!skippedSelectors.has(group.actions[0]?.selector))
+  const groupUnanswered=(group:typeof manualGroups[number])=>group.kind==='checkbox'? !checkboxGroupAnswered(group.checkboxGroup!,answers):group.kind==='radio'?!group.fields.some(field=>answers[field.selector]==='true'):!answers[group.actions[0]?.selector]&&!skippedSelectors.has(group.actions[0]?.selector)
+  const unresolvedGroups=manualGroups.filter(groupUnanswered)
   const pendingModelCount=pendingModelSelectors.size
   const hasDraftEdits=Object.values(answers).some(value=>value.trim())||skippedSelectors.size>0
   const ensureDraftSettled=()=>{if(!hasDraftEdits)return true;notify(stalePage?'招聘网页已变化，你的临时答案仍完整保留。可以先查看或复制保留的答案；若确认不再需要，请明确“清除之前的临时修改”后再同步。不会拿旧答案填入新页面。':'请先完成下方“填写并验证”，或明确“清除本页临时修改”。当前答案和“不填写”选择会保留，不会被重新分析或自动步骤覆盖。');return false}
@@ -416,19 +522,39 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
     }catch(e){setCheckedSkips(null);notify(message(e))}finally{setBusy('')}
   }
   const trackedStatus=(next:PreSubmitCheck,failed=0):QueueStatus=>next.ready&&!failed&&workflow?.stage==='review'?'ready_to_submit':next.ready&&!failed?'in_progress':'needs_review'
-  const syncTrackedStatus=async(status:QueueStatus)=>{if(!initialQueueId)return true;try{await api.updateQueuedJob(initialQueueId,{status});return true}catch{return false}}
+  const syncTrackedStatus=async(status:QueueStatus)=>{if(!initialQueueId||!initialJob||initialJob.job.url!==snapshot?.url)return true;try{await api.updateQueuedJob(initialQueueId,{status});return true}catch{return false}}
   const discardDraft=()=>{if(!hasDraftEdits||!window.confirm('清除本页尚未执行的临时答案和“不填写”选择？已保存的主档案、记忆和招聘网页内容不会被修改。'))return;setAnswers({});setSkippedSelectors(new Set());setCheckedSkips(null);setEditingSelectors(new Set());setMemoryFailures([]);notify('本页临时修改已清除。现在可以重新智能分层填写。')}
   // Only the bounded assist endpoint can carry explicit leave-blank choices.
   // Journey, analysis and next-page guards continue to block ALL draft edits.
   const assistBlocker=assistGuard({busy:Boolean(busy),backendReady:backendReady&&recordCompletionReady,hasSnapshot:Boolean(snapshot),formReady:formStageReady(workflow,snapshot),stalePage,hasDraftEdits:Object.values(answers).some(value=>value.trim()),resumeId:selectedResume,planResumeId:plan?.resume_id})
-  const assistApplication=async()=>{
-    if(assistBlocker||!snapshot){if(assistBlocker)notify(assistBlocker);return}
-    if(allowSiteParse&&!window.confirm(`将“${resumes.find(item=>item.id===selectedResume)?.label||'本次所选简历'}”上传给当前招聘网站解析，可能覆盖网页已有填写。随后会补齐并回读核对；不会勾选协议或最终提交。确认继续？`))return
+  const assistApplication=async(connection?:{snapshot:BrowserSnapshot;workflow:ApplicationWorkflowState})=>{
+    // A freshly connected page is explicit context, not an old React closure.
+    // Restoring the screen never sets this argument and never starts filling.
+    const currentSnapshot:BrowserSnapshot|null=connection?.snapshot??observationState.current.snapshot
+    const blocker=connection?assistGuard({busy:Boolean(busy),backendReady:backendReady&&recordCompletionReady,hasSnapshot:true,formReady:formStageReady(connection.workflow,currentSnapshot),stalePage:false,hasDraftEdits:Object.values(answers).some(value=>value.trim()),resumeId:selectedResume}):assistBlocker
+    if(blocker||!currentSnapshot){if(blocker)notify(connection?'请确认已经进入信息填写页，再重新同步。':blocker);return}
+    const snapshot=currentSnapshot
+    if(allowSiteParse&&snapshot.browser_engine!=='safari'&&!window.confirm(`将“${resumes.find(item=>item.id===selectedResume)?.label||'本次所选简历'}”上传给当前招聘网站解析，可能覆盖网页已有填写。随后会补齐并回读核对；不会勾选协议或最终提交。确认继续？`))return
     setBusy('assisting');setAssistResult(null);setExecution(null);setCheck(null);setPhaseProgress({rules:null,model:null})
+    const run={session:snapshot.session_id,id:crypto.randomUUID(),active:true}
+    assistRun.current=run
+    rememberAssistRun(window.sessionStorage,ownerId,{session:run.session,id:run.id,started:Date.now()})
+    setAssistProgress({run_id:run.id,status:'running',phase:'observe',message:'正在等待填写任务启动；若当前网页检查尚未结束，会先等待，尚未开始填写',events:[],result:null,cancel_requested:false})
+    // Start one write request. A parallel metadata poll stays responsive even
+    // while the browser is locked by model analysis or option verification.
+    const watching=watchAssist(()=>api.assistProgress(run.session,run.id),p=>{if(run.active)setAssistProgress(p)},()=>run.active)
+      .then(result=>({result,error:null}),error=>({result:null,error}))
     try{
       const deferredFields=[...skippedSelectors].map(selector=>snapshot.fields.find(field=>field.selector===selector))
       if(deferredFields.some(field=>!field))throw new Error('本次留空的字段已变化，请先同步核对，未启动填写。')
-      const result=await api.assistApplication(snapshot.session_id,assistRequest(selectedResume,allowSiteParse,deferredFields as PageField[],deferGovernmentId))
+      const result=await api.assistApplication(snapshot.session_id,assistRequest(selectedResume,allowSiteParse&&snapshot.browser_engine!=='safari',deferredFields as PageField[]),run.id).catch(async error=>{
+        const receipt=await watching
+        if(receipt.result)return receipt.result
+        throw assistFailure(error,receipt.error)
+      })
+      run.active=false
+      forgetAssistRun(window.sessionStorage,ownerId)
+      setAssistProgress({run_id:run.id,status:'finished',phase:result.status,message:result.message,events:result.events,result,cancel_requested:false})
       setAssistResult(result);setSnapshot(result.snapshot);setPlan(result.review?.plan??null);setComparisons(result.review?.comparisons??[]);setCheck(result.pre_submit);setAgentTurn(null)
       // An upload is one-shot consent, not permission to overwrite on future runs.
       setAllowSiteParse(false)
@@ -437,9 +563,15 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
       setSkippedSelectors(new Set());setCheckedSkips(null)
       try{setWorkflow(await api.workflowState(snapshot.session_id));setObservedChange(null)}catch{setWorkflow(null);setRecoveryWarning('补齐结果已保留，但流程状态读取失败。请重新读取浏览器状态后再继续。')}
       await syncTrackedStatus('needs_review')
-      notify(`${assistStatus(result.status).title}：${result.message} 未点击最终提交。`)
+      notify(result.status==='ready_for_review'?'请到招聘官网核对，确认后自行提交。':'本轮已暂停；请补充所需资料或核对官网，尚未最终提交。')
     }catch(error){setAllowSiteParse(false);setPlan(null);setComparisons([]);setWorkflow(null);setRecoveryWarning('本轮自动补齐未取得完整结果，招聘网页可能已有部分填写。请先重新读取浏览器状态，再核对；不要直接重复上传。');notify(`自动补齐未完成：${message(error)}`)}
-    finally{setBusy('')}
+    finally{run.active=false;setBusy('')}
+  }
+  const pauseAssist=async()=>{
+    const run=assistRun.current
+    if(!run?.active)return
+    try{setAssistProgress(await api.cancelAssist(run.session,run.id));notify('已请求暂停；当前读取或模型调用结束后停止后续填写，已填内容保留。')}
+    catch(error){notify(`暂停请求未确认：${message(error)}；请先不要改动网页。`)}
   }
   const confirmMonthPrecision=async()=>{
     if(assistBlocker||!snapshot||!needsMonthPrecisionConsent(snapshot.url,plan)){if(assistBlocker)notify(assistBlocker);return}
@@ -522,7 +654,8 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
         }
       }catch{setWorkflow(null);setRecoveryWarning('已完成的填写保留，但重新核对失败。临时答案未清除，请先重新读取浏览器状态，再检查剩余项。')}
       const synced=await syncTrackedStatus(result.failed||Object.keys(remaining).length?'needs_review':trackedStatus(result.pre_submit))
-      notify(`填写完成：${result.verified} 项已回读验证，${result.failed} 项失败，仍有 ${result.pre_submit.required_missing.length} 个必填项缺失。${learned.count?`已安全记住 ${learned.count} 个验证成功的答案。`:''}${learned.failed.length?`${learned.failed.length} 项填写成功但未记住，请点击下方“记住本网站答案”重试，不必重新填写网页。`:''}${Object.keys(remaining).length>learned.failed.length?`另有 ${Object.keys(remaining).length-learned.failed.length} 个未验证答案仍保留，未自动记忆。`:''}${synced?'流水账已同步。':'但流水账同步失败，请手动核对记录。'}`)
+      if(!Object.keys(remaining).length&&!learned.failed.length)setWorkspaceSection('operation')
+      notify(result.failed||Object.keys(remaining).length?'部分答案尚未完成，未保存的输入已保留，请核对后继续。':learned.failed.length?'答案尚未记住，输入仍保留；请核对官网后单独重试。':'答案已填写并核对。可回到投递操作继续；最终提交仍由你完成。')
     }catch(e){notify(message(e))}finally{setBusy('')}
   }
   const recheck=async()=>{
@@ -544,141 +677,119 @@ function BrowserDemo({active,profile,resumes,notify,onProfileUpdate,onResumeUpda
       const synced=await syncTrackedStatus(trackedStatus(next));notify(synced?'已重新检查当前网页，流水账状态已同步。':'网页检查完成，但流水账同步失败，请返回岗位推荐页手动更新状态。')
     }catch(e){notify(message(e))}finally{setBusy('')}
   }
-  const close=async()=>{if(busy)return;setBusy('closing');agentRevision.current+=1;try{if(snapshot)await api.closeBrowser(snapshot.session_id);setSnapshot(null);setObservedChange(null);setBrowserOccupied(false);setRecoveryWarning('');setWorkflow(null);setAgentTurn(null);setVerificationCode('');setRegistrationPassword('');setNativeImport(null);resetReview();notify('浏览器会话已结束，可以开始新的任务。')}catch(error){if(error instanceof ApiError&&error.status===404){setSnapshot(null);setObservedChange(null);setBrowserOccupied(false);setWorkflow(null);resetReview();notify('原会话已经结束。')}else notify(`结束会话失败，已保留当前任务，不会创建新任务覆盖它。${message(error)}`)}finally{setBusy('')}}
+  const close=async()=>{if(busy)return;setBusy('closing');agentRevision.current+=1;try{if(snapshot)await api.closeBrowser(snapshot.session_id);setSnapshot(null);setOpenedSafari(null);setObservedChange(null);setBrowserOccupied(false);setRecoveryWarning('');setWorkflow(null);setAgentTurn(null);setVerificationCode('');setRegistrationPassword('');setNativeImport(null);resetReview();notify('浏览器会话已结束，可以开始新的任务。')}catch(error){if(error instanceof ApiError&&error.status===404){setSnapshot(null);setOpenedSafari(null);setObservedChange(null);setBrowserOccupied(false);setWorkflow(null);resetReview();notify('原会话已经结束。')}else notify(`结束会话失败，已保留当前任务，不会创建新任务覆盖它。${message(error)}`)}finally{setBusy('')}}
   const canAnalyze=!stalePage&&formStageReady(workflow,snapshot)
   const workbenchState=workbenchView({workflow,snapshot,hasPlan:Boolean(plan),hasDraftEdits,unresolvedQuestions:unresolvedGroups.length,ready:overallReady,hasExecution:Boolean(execution||assistResult)})
   const workspaceView={...workbenchState,label:workbenchState.action==='fill'?'自动补齐并核对':workbenchState.label}
   const focusSection=(id:string)=>document.getElementById(id)?.scrollIntoView({behavior:'smooth',block:'start'})
-  const nextWorkspaceStep=()=>{if(hasDraftEdits){focusSection('workbench-results');notify('临时答案还没有处理，请先填写并验证；若只差记忆，点击“记住本网站答案”即可。');return}if(workspaceView.action==='review'){focusSection(plan?'workbench-results':'workbench-assist-result');return}void runJourney()}
-  return <div className="stack demo-workspace">
-    {!backendReady&&<div className="chat-url-warning" role="alert">本轮自动补齐升级尚未加载，请先保留招聘草稿，再重启后端。已暂停新任务及填写，避免旧流程误上传或混用资料；现在仍可只读查看当前页面。不要为了升级而关闭或刷新未保存的招聘网页。<button disabled={!!busy} onClick={restoreExistingSession}>只读检查连接与升级状态</button></div>}
-    <section className="card"><label className="field"><span>本次投递使用哪份简历？</span><select disabled={!!busy} value={selectedResume} onChange={e=>void changeTaskResume(e.target.value)}><option value="">请选择本次投递简历（不自动上传）</option>{resumes.map(r=><option key={r.id} value={r.id} disabled={['pending','parsing','failed'].includes(r.status)}>{resumeChoiceLabel(r)}{r.target_role?` · ${r.target_role}`:''}</option>)}</select></label><p>姓名和联系方式取自主档案；教育、项目、实习和技能取自所选版本，不混用其他简历。确认的答案仅在相同简历及对应网站范围复用。</p><small>粘贴已登录页面的网址不会复制 Safari 的登录状态；请在职达打开的招聘浏览器中完成登录。验证码和最终提交仍由你掌握。</small></section>
-    {recoveryWarning&&<div className="chat-url-warning" role="alert">{recoveryWarning}<button disabled={!!busy} onClick={restoreExistingSession}>重新读取浏览器状态</button></div>}
-    {journeyResult&&<section className={`assist-result ${journeyResult.status==='ready_for_review'?'ready':'pending'}`} role="status"><h3>{journeyStatus(journeyResult.status)}</h3><p>{journeyResult.message}</p><small>本轮实际推进 {journeyResult.steps} 步 · 未点击最终提交</small>{journeyResult.events.length>0&&<details><summary>查看职达实际执行步骤</summary><ol>{journeyResult.events.map((event,index)=><li key={`${index}-${event.action}`}><strong>{workflowStageLabel(event.stage)}</strong> · {event.message}</li>)}</ol></details>}</section>}
-    {assistResult&&<div id="workbench-assist-result" className={`assist-result ${assistStatus(assistResult.status).tone}`} role="status"><h3>{assistStatus(assistResult.status).title}</h3><p>{assistResult.message}</p><p>{assistStatus(assistResult.status).detail}</p><small>本次执行 {assistResult.rounds} 轮 · 未点击最终提交</small>{assistResult.events.length>0&&<details open={assistResult.status!=='ready_for_review'}><summary>查看本轮实际步骤（{assistResult.events.length}）</summary><ol>{assistResult.events.map((event,index)=><li key={`${index}-${event.kind}`}><span>{event.message}</span>{(event.completed>0||event.failed>0)&&<small>完成 {event.completed} 项 · 失败 {event.failed} 项</small>}{Boolean(event.issues?.length)&&<ul>{event.issues?.map((issue,i)=><li key={i}>{issue.label}：{issue.message}</li>)}</ul>}</li>)}</ol></details>}</div>}
-    {Boolean(assistResult?.record_coverage?.length)&&<section className="card"><h3>本次简历的记录覆盖</h3><p>只有具体记录能唯一对应，才计入覆盖；个人信息中的最高学历不算完整教育经历。</p><ul>{assistResult?.record_coverage?.map(row=><li key={row.kind}><strong>{row.label}：{row.matched_records} / {row.source_total} 条已对应</strong>{row.ambiguous&&' · 存在归属歧义，需核对'}{row.missing_names.length>0&&<p>尚未覆盖：{row.missing_names.join('；')}{!row.can_expand&&'。当前没有可核验的新增入口，请先在官网查看栏目。'}</p>}</li>)}</ul><small>记录对应不代表必填检查通过、网站已保存或申请已提交。</small></section>}
-    {(workflow?.target?.company||workflow?.target?.job_title||taskTarget)&&<div className="browser-target"><Target size={18}/><div><strong>本次目标：{(workflow?.target?.company||taskTarget?.company)||'公司待确认'} · {(workflow?.target?.job_title||taskTarget?.job_title)||'先浏览岗位'}</strong><small>{[workflow?.target?.city||taskTarget?.city,workflow?.target?.recruitment_cycle||taskTarget?.recruitment_cycle].filter(Boolean).join(' · ')||'城市 / 批次待确认'} · 没有唯一匹配岗位时会请你选择，不会擅自换岗</small></div></div>}
-    {snapshot&&<section className="workbench-next"><div className="workbench-next-copy"><small>当前：{stalePage?'招聘网页已变化，旧计划已暂停':workflow?workflowStageLabel(workflow.stage):'正在读取招聘页面'}</small><h2>{stalePage?'职达需要重新识别当前页面':workspaceView.title}</h2><p>{stalePage?`刚检测到：${workflowStageLabel(observedChange!.stage)}。点击“让职达继续”会先重新读取页面，再决定安全动作；不会执行旧计划。临时答案未处理时会保持暂停。`:workspaceView.description}</p>{!journeyReady&&<p>连续推进能力尚未加载，请只读检查连接与升级状态；旧的查看能力仍可使用。</p>}{busy==='journey'&&<p role="status">职达正在重新识别页面、调用已配置模型分析并推进安全步骤；遇到登录、验证码或不确定事实会停下。请暂时不要改动招聘网页。</p>}</div><div className="workbench-next-actions"><button className="primary" disabled={!!busy||(!hasDraftEdits&&workspaceView.action!=='review'&&(!journeyReady||!backendReady))} onClick={nextWorkspaceStep}>{busy?<LoaderCircle className="spin" size={16}/>:<ArrowRight size={16}/>} {busy?'职达正在处理，请稍候':hasDraftEdits?'先处理补充答案':workspaceView.action==='review'?'查看人工终审清单':journeyButtonLabel(workflow?.stage)}</button><button className="secondary" disabled={!!busy} onClick={restoreExistingSession}><RefreshCw size={14}/>只读同步当前页</button><small>每次最多 4 个安全步骤，不会自动提交</small></div></section>}
-    {snapshot&&<div className="workbench-observed-job"><span>招聘网页识别到的岗位</span><strong>{observedJobTitle(observedChange||workflow)}</strong><small>{stalePage?'来自刚检测到的网页，尚未同步填写计划':'来自上次同步的网页内容；不是用你的目标岗位代替识别结果'}</small></div>}
-    {!canAnalyze&&hasDraftEdits&&<div className="workbench-retained-note">之前输入的答案仍保留，没有被清除。当前页面变化尚未同步或页面类型未确认，旧答案暂不执行。你可以保留并查看这些内容；只有明确清除后才会丢弃临时修改。<details><summary>查看保留的临时答案</summary>{Object.entries(answers).map(([selector,value])=><p key={selector}><strong>{snapshot?.fields.find(field=>field.selector===selector)?.question_text||snapshot?.fields.find(field=>field.selector===selector)?.label||'之前的表单项'}</strong>：{value}</p>)}{skippedSelectors.size>0&&<p>另外保留了 {skippedSelectors.size} 项“不填写”选择。</p>}</details><button className="secondary" disabled={!!busy} onClick={discardDraft}>清除之前的临时修改</button></div>}
-    {!snapshot&&initialJob&&<div className="selected-job-banner"><Target size={18}/><div><span>从推荐清单进入</span><strong>{initialJob.job.company} · {initialJob.job.title}</strong><small>{initialJob.match_score}% 匹配 · URL 已自动带入{initialResume?` · 简历：${resumeChoiceLabel(initialResume)}`:''}，下方点击“打开浏览器”即可开始</small></div></div>}
-    <details className="workbench-extra workbench-url" open={!snapshot}><summary>{snapshot?'当前页面与会话管理':'打开要申请的招聘页面'}</summary><section className="card"><SectionTitle n="01" title="打开招聘页面" sub="支持企业自建站与常见 ATS；未适配站点会退回通用表单识别"/><div className="url-row"><label className="field"><span>职位详情或申请页 URL</span><input disabled={!!busy} value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://company.example/jobs/..." onKeyDown={e=>e.key==='Enter'&&start()}/></label>{snapshot?<button className="secondary" disabled={!!busy} onClick={close}><X size={16}/>结束会话</button>:<button className="primary" disabled={!url||!!busy||browserOccupied} onClick={start}>{busy==='opening'?<LoaderCircle className="spin" size={17}/>:<ExternalLink size={17}/>}打开浏览器</button>}</div>{snapshot&&<div className="browser-status"><span className="live-dot"/><div><strong>{snapshot.title||'招聘页面'}</strong><small>{snapshot.url}</small></div><em>{recognitionProfileLabel(snapshot.recognition_profile)} · {snapshot.fields.length} 个字段</em></div>}</section></details>
-    {workflow&&<details className="workbench-extra"><summary>{workspaceView.showAccountTools?'账号与验证码辅助工具':'查看流程与登录识别详情'}</summary><fieldset disabled={stalePage} className="workbench-action-scope"><section className="card workflow-card"><div className="library-head"><SectionTitle n="02" title="投递流程导航" sub="Agent 先判断页面阶段，再只执行当前阶段的安全动作"/><button className="secondary" disabled={!!busy} onClick={refreshWorkflow}>{busy==='refreshing'?<LoaderCircle className="spin" size={16}/>:<RefreshCw size={16}/>}重新识别</button></div><WorkflowJourney stage={workflow.stage}/><div className="workflow-state"><div><span className={`stage-dot ${workflow.stage}`}/><div><strong>{workflowStageLabel(workflow.stage)}</strong><small>{workflow.adapter} {workflow.job_id&&`· 职位 ${workflow.job_id}`}</small></div></div><em>{workflow.page_step_current&&workflow.page_step_total?`网页第 ${workflow.page_step_current}/${workflow.page_step_total} 步`:`${workflow.form_fields} 个表单字段`}</em></div><p className="workflow-message">{workflow.message}</p>{workflow.authenticated&&<div className="auth-recognized"><ShieldCheck size={15}/><span><strong>已识别当前招聘网站登录状态</strong><small>{workflow.authentication_evidence.join(' · ')}；登录状态仅保存在该职达用户的本机专用浏览器档案中。</small></span></div>}
-      {workflow.authentication_methods.length>0&&<div className="method-row"><span>可用方式</span>{workflow.authentication_methods.map(method=><b key={method}>{method}</b>)}</div>}
-      {workflow.requires_consent&&<div className="human-gate"><AlertTriangle size={17}/><span><strong>需要你亲自确认</strong><small>请在打开的 Chrome 中阅读并决定是否同意隐私政策，Agent 不会代你勾选。</small></span></div>}
-      {workflow.stage==='registration_required'&&<div className="registration-panel"><div><strong>一次性注册信息</strong><small>仅填入当前 Chrome，不存入账号库、主档案或日志</small></div><div className="registration-grid">{(!workflow.registration_identifiers.length||workflow.registration_identifiers.includes('email'))&&<label className="verification-input"><span>邮箱</span><input type="email" autoComplete="email" value={registrationEmail} onChange={e=>setRegistrationEmail(e.target.value)}/></label>}{workflow.registration_identifiers.includes('phone')&&<label className="verification-input"><span>手机号</span><input type="tel" autoComplete="tel" value={registrationPhone} onChange={e=>setRegistrationPhone(e.target.value)}/></label>}{workflow.registration_requires_password&&<label className="verification-input"><span>本次注册密码</span><input type="password" autoComplete="new-password" value={registrationPassword} onChange={e=>setRegistrationPassword(e.target.value)} placeholder="至少 8 位，填入后立即清除"/></label>}</div></div>}
-      <div className="workflow-actions">{workflow.stage==='job_detail'&&<button className="primary" disabled={!!busy} onClick={enterApplication}>{busy==='advancing'?<LoaderCircle className="spin" size={17}/>:<ExternalLink size={17}/>}进入登录/申请流程</button>}{workflow.stage==='registration_required'&&<><button className="secondary" disabled={(workflow.registration_requires_password&&!registrationPassword)||!!busy} onClick={fillRegistration}>{busy==='registering'?<LoaderCircle className="spin" size={16}/>:<Save size={16}/>}填入注册信息</button><button className="primary" disabled={!!busy} onClick={createAccount}>{busy==='creating-account'?<LoaderCircle className="spin" size={16}/>:<Check size={16}/>}我已核对并同意，创建账号</button></>}{workflow.stage==='auth_required'&&<button className="primary" disabled={!!busy} onClick={refreshWorkflow}><RefreshCw size={16}/>我已完成登录，重新识别</button>}{(workflow.stage==='verification_required'||workflow.stage==='registration_required'&&Boolean(workflow.verification_channel))&&<><button className="secondary" disabled={!!busy} onClick={requestCode}>获取验证码</button><label className="verification-input"><span>本次验证码</span><input type="password" inputMode="numeric" autoComplete="one-time-code" value={verificationCode} onChange={e=>setVerificationCode(e.target.value)} placeholder="仅保留在当前页面内存"/></label><button className="secondary" disabled={!verificationCode||!!busy} onClick={()=>enterCode(false)}>只填入</button><button className="primary" disabled={!verificationCode||!!busy} onClick={()=>enterCode(true)}>填入并继续</button></>}{canAnalyze&&<button className="primary" disabled={!!busy} onClick={analyze}><Sparkles size={17}/>分析当前表单</button>}</div>
-      {workflow.final_submit_present&&<div className="submit-boundary"><ShieldCheck size={15}/>已识别最终提交按钮，系统不会点击。</div>}
-    </section></fieldset></details>}
-    {workflow&&!stalePage&&workspaceView.showNavigation&&<section id="workbench-navigation" className="browser-navigation workbench-result-section"><h3>{workspaceView.navigationCandidates.some(candidate=>candidate.kind==='open_job')?'请选择要申请的岗位':'可用招聘入口'}</h3><p>{workflow.navigation_blocker||'下面的入口来自当前网页。只有明确且唯一匹配目标时才允许 Agent 自动选择；你也可以直接指定。'}</p>{workspaceView.navigationCandidates.length?<div className="browser-navigation-list">{workspaceView.navigationCandidates.map(candidate=><button key={candidate.id} disabled={!!busy} onClick={()=>navigateCandidate(candidate)}><span><strong>{candidate.label}{candidate.matches_target?' · 与当前目标匹配':''}</strong><small>{candidate.url||`在当前招聘网页中${navigationAction(candidate.kind)}`}</small></span><ArrowRight size={16}/></button>)}</div>:<p>目前没有可安全使用的入口，请在招聘浏览器中展开职位列表，然后点击“重新识别”。</p>}<small>首页或职位列表不是可提交的表单，不会显示终审通过。</small></section>}
-    {workflow&&<details className="workbench-extra workbench-diagnostics"><summary>高级诊断与 Agent 执行记录<small>通常无需操作</small></summary><fieldset disabled={stalePage} className="workbench-action-scope">
-    {workflow?.site_route&&<div className="site-route-banner" role="status"><Globe2 size={19}/><div><strong>当前网站：{workflow.site_route.label}</strong><p>{workflow.site_route.note}</p></div><span>{workflow.site_route.matched_by==='fallback'?'通用处理':'已自动适配'}</span></div>}
-    {workflow&&<section className={`card application-agent-card ${agentTurn?.decision.risk_level||'low'}`}><div className="application-agent-head"><div><span className="demo-icon"><WandSparkles size={19}/></span><div><small>APPLICATION ORCHESTRATOR</small><h2>模型判断与执行说明</h2></div></div><div><button className="secondary" disabled={!!busy} onClick={assessAgent}>{busy==='agent-assessing'?<LoaderCircle className="spin" size={15}/>:<RefreshCw size={15}/>}重新评估</button><button className="secondary" disabled={!!busy||!agentTurn?.decision.can_execute} onClick={runAgentStep}>{busy==='agent-running'?<LoaderCircle className="spin" size={16}/>:<Play size={16}/>}{agentTurn?agentActionLabel(agentTurn.decision.next_action):'先查看当前页面'}</button></div></div>{agentTurn?<><div className="agent-decision-grid"><div><span>当前目标</span><strong>{agentTurn.decision.goal}</strong><p>{agentTurn.decision.summary}</p></div><div><span>建议下一步</span><strong>{agentActionLabel(agentTurn.decision.next_action)}</strong><p>{agentTurn.decision.rationale}</p></div><aside><b className={agentTurn.decision.model_status}>{agentTurn.decision.model_status==='model'?`模型规划 · ${agentTurn.decision.model}`:'本地安全规划'}</b><small>{agentTurn.decision.requires_user?'需要你的操作或确认':agentTurn.decision.can_execute?'可以由 Agent 执行':'当前仅观察'}</small></aside></div>{agentTurn.decision.blockers.length>0&&<div className="agent-blockers"><strong>当前阻塞</strong><ul>{agentTurn.decision.blockers.map(item=><li key={item}>{item}</li>)}</ul></div>}{agentTurn.decision.user_questions.length>0&&<div className="agent-user-gate"><AlertTriangle size={16}/><span>{agentTurn.decision.user_questions.join('；')}</span></div>}<div className="agent-history"><strong>任务记忆</strong><span>{agentTurn.checkpoint.events.slice(-4).map((event,index)=><small key={`${event.created_at}-${index}`}><b>{workflowStageLabel(event.stage)}</b>{event.summary}</small>)}</span></div></>:<div className="agent-awaiting">尚无额外模型评估。需要查看详细判断时，可以点击“重新评估”。</div>}</section>}
-    </fieldset></details>}
-    <details className="workbench-extra"><summary>投递知识与字段对照库<small>可选，遇到重复识别错误时再展开</small></summary><ApplicationKnowledge snapshot={snapshot} profile={profile} plan={plan} disabled={!!busy||stalePage} onBusyChange={value=>setBusy(value?'knowledge-saving':'')} onChanged={refreshKnowledgePlan} notify={notify}/></details>
-    {snapshot&&resumes.find(item=>item.id===selectedResume)&&<ResumeFactEditor key={selectedResume} resume={resumes.find(item=>item.id===selectedResume)!} disabled={!!busy} onBusy={value=>setBusy(value?'fact-saving':'')} onSaved={onFactSaved}/>}
-    {memoryFailures.length>0&&<div className="workbench-retained-note" role="alert"><strong>填写成功但未记住</strong><p>下面这些答案已通过网页回读，但记忆保存失败。可以单独重试记忆，不必再次填写网页。</p>{memoryFailures.map(selector=>{const action=plan?.actions.find(item=>item.selector===selector);const field=snapshot?.fields.find(item=>item.selector===selector);return <p key={selector}><span>{actionReviewTitle(action,field,'之前确认的答案')}：{answers[selector]}</span>{action&&<button disabled={!!busy||stalePage} onClick={()=>remember(action)}><Save size={13}/>记住本网站答案</button>}</p>})}</div>}
-    <div hidden={!canAnalyze}><div className="stack">
-    <section className="card workbench-fill-head">
-      <SectionTitle n="03" title="填写进度" sub="当前已进入可填写表单；只使用有依据的资料，执行后回读验证"/>
-      <div className="assist-primary">
-        <div><h3>自动补齐并核对</h3><p>检查当前页面 → 补齐可确定的资料 → 核对网页实际结果。遇到不确定项会停下询问，不代填个人决定。</p><small>每次最多执行 3 轮；不会勾选协议或点击最终提交。</small></div>
-        <button className="primary" disabled={Boolean(assistBlocker)} onClick={assistApplication}>{busy==='assisting'?<LoaderCircle className="spin" size={18}/>:<WandSparkles size={18}/>} {busy==='assisting'?'正在补齐并回读':'自动补齐并核对'}</button>
+  const nextWorkspaceStep=()=>{if(recoveryWarning&&!hasDraftEdits){void restoreExistingSession();return}if(hasDraftEdits){focusSection('workbench-results');notify('临时答案还没有处理，请先填写并验证；若只差记忆，点击“记住本网站答案”即可。');return}if(workspaceView.action==='review'){focusSection(plan?'workbench-results':'workbench-assist-result');return}if(!stalePage&&formStageReady(workflow,snapshot)){void assistApplication();return}if(workspaceView.action==='choose'&&workspaceView.navigationCandidates.some(candidate=>candidate.requires_user_choice)){focusSection('workbench-navigation');notify('请在下方选择要申请的招聘机构；不会替你猜志愿。');return}void runJourney()}
+  const userGroups=manualGroups.filter(group=>!group.checkboxGroup?.blockReason&&group.fields.every(isUserAnswerQuestion))
+  const systemGroups=manualGroups.filter(group=>!!group.checkboxGroup?.blockReason||!group.fields.every(isUserAnswerQuestion))
+  const userPending=userGroups.filter(groupUnanswered)
+  const submitSetup=(selection:{resumeId:string;url:string})=>{
+    const destination=inspectTaskUrl(selection.url)
+    if(destination.error){notify(destination.error);return}
+    if(snapshot&&snapshot.url!==destination.url){notify('已有填写页仍在连接。请先结束本次连接，再更换网址；不会把旧页面的答案填到新网站。');return}
+    if(openedSafari?.url!==destination.url)setOpenedSafari(null)
+    setUrl(destination.url);setWorkspaceSection('operation');setWorkspaceStage('workspace')
+  }
+  const beginFill=async()=>{
+    if(snapshot){await assistApplication();return}
+    if(!hasMatchingSafari){notify('请先连接你已经登录的招聘填写窗口。');return}
+    const connection=await start()
+    if(connection)await assistApplication(connection)
+  }
+  const userStatus=busy==='restoring'?'正在检查连接…':busy==='assisting'||busy==='filling'?'正在辅助填写，请暂时不要改动招聘网页。':busy?'正在处理，请稍候…':overallReady?'请到招聘官网核对，确认后自行提交。':userPending.length?'有资料需要你补充。':assistResult||execution?'填写已暂停，请核对官网；仍有项目需要处理。':snapshot?'点击下方按钮开始辅助填写。':'连接已登录的填写页后，即可开始。'
+  const operation=<div className="stack">
+    {recoveryWarning&&<div className="chat-url-warning" role="alert"><p>当前任务需要重新核对，未完成的答案仍保留。</p><button disabled={!!busy} onClick={restoreExistingSession}>重新检查连接</button></div>}
+    {!backendReady&&!busy&&<div className="chat-url-warning" role="alert">暂时无法连接职达后端。<button onClick={restoreExistingSession}>重新检查</button></div>}
+    <section className="card application-fill-card">
+      <h3>辅助投递</h3><p>职达会读取题目、匹配资料并填写；不确定的答案会在“待补充资料”中询问。</p>
+      <small>不会点击招聘官网的最终提交，不会替你同意声明。</small>
+      {!snapshot&&!hasMatchingSafari&&<ExistingSafariConnection url={url} disabled={!!busy||browserOccupied||!backendReady} notify={notify} onBusyChange={value=>setBusy(value?'choosing-window':'')} onBound={(result,openedUrl)=>setOpenedSafari(result.safari_window_token?{url:openedUrl,token:result.safari_window_token}:null)}/>}
+      {!snapshot&&hasMatchingSafari&&<p>已连接你指定的招聘窗口，不会另开或刷新。</p>}
+      {snapshot&&!formStageReady(workflow,snapshot)&&!busy&&<p role="alert">还没有确认这是信息填写页。请先在官网进入填写页面，然后重新同步；不会自动登录或换岗位。</p>}
+      <div className="review-buttons">
+        <button className="primary" disabled={Boolean(busy)||!backendReady||!selectedResume||(!snapshot&&!hasMatchingSafari)||Boolean(snapshot&&assistBlocker)} onClick={()=>void beginFill()}>{busy==='assisting'?<LoaderCircle className="spin" size={18}/>:<WandSparkles size={18}/>} {busy==='assisting'?'正在辅助填写…':assistResult||execution?'继续辅助填写':'投递（辅助填写）'}</button>
+        {snapshot&&<button className="secondary" disabled={!!busy||hasDraftEdits} onClick={restoreExistingSession}><RefreshCw size={14}/>同步当前页</button>}
+        {busy==='assisting'&&<button className="secondary" onClick={pauseAssist}>暂停</button>}
       </div>
-      <label className="assist-upload-choice"><input type="checkbox" checked={allowSiteParse} disabled={!!busy||stalePage||!selectedResume||hasDraftEdits} onChange={event=>setAllowSiteParse(event.target.checked)}/><span>先用网站解析所选简历<small>可选，默认不上传。会把所选文件交给当前招聘网站，可能覆盖网页已有字段；开始前会再次确认。</small></span></label>
-      <label className="assist-upload-choice"><input type="checkbox" checked={deferGovernmentId} disabled={!!busy||stalePage} onChange={event=>setDeferGovernmentId(event.target.checked)}/><span>本次先不填证件号码<small>仍会补齐其他资料；不会把缺少证件号码的表单显示为可提交。此选择不会成为永久身份资料。</small></span></label>
-      {assistBlocker&&!busy&&<p className="assist-help">{assistBlocker}</p>}
-      {busy==='assisting'&&<p className="assist-help" role="status">正在执行并读取招聘网页，模型分析可能需要一些时间。请暂时不要在招聘浏览器中改动或切换页面。</p>}
-      {snapshot&&needsMonthPrecisionConsent(snapshot.url,plan)&&<div className="assist-date-consent"><h3>这些日期只有年月，网站却要求填写到日</h3><p>不确定具体日期时，不会擅自补为 1 日。你可以逐项提供精确日期；也可以明确允许本次简历在汽车之家以每月 1 日作为月份占位，“至今”保持不变。</p><p>这个约定只用于网申填写，不代表真实精确日期，也不会修改简历中的原始日期。</p><button className="secondary" disabled={Boolean(assistBlocker)} onClick={confirmMonthPrecision}>{busy==='date-precision'?<LoaderCircle className="spin" size={16}/>:<Check size={16}/>}我确认允许使用月份占位，并记住此约定</button></div>}
-      <details className="workbench-more-actions"><summary>其他填写方式：只核对、仅 AI 分析或重新填写</summary><div className="review-buttons"><button className="secondary" disabled={!snapshot||!canAnalyze||!!busy} onClick={analyze}>{busy==='planning'?<LoaderCircle className="spin" size={16}/>:<ListChecks size={16}/>}只核对，不填写</button><button className="secondary" disabled={!snapshot||!canAnalyze||!!busy} onClick={analyzeWithAI}>{busy==='ai-planning'?<LoaderCircle className="spin" size={16}/>:<Sparkles size={16}/>}只用 AI 分析</button><button className="secondary" disabled={!snapshot||!canAnalyze||!!busy} onClick={smartAutofill}>{busy.startsWith('autofill-')?<LoaderCircle className="spin" size={17}/>:<WandSparkles size={17}/>}智能分层填写</button></div></details>
-      <div className="native-parser-toolbar"><div><strong>仅上传简历附件</strong><p>使用本次所选简历，不点击网站解析，不主动覆盖表单。每次上传需单独确认。</p></div><button type="button" className="secondary" disabled={!snapshot||!canAnalyze||!selectedResume||!!busy||stalePage||hasDraftEdits||Boolean(resumeAttachmentBlocker(snapshot))} onClick={uploadAttachmentOnly}>{busy==='attachment-uploading'?<LoaderCircle className="spin" size={16}/>:<UploadCloud size={16}/>}仅上传所选简历</button></div>
-      {snapshot&&resumeAttachmentBlocker(snapshot)&&<p className="assist-help">{resumeAttachmentBlocker(snapshot)}</p>}
-      <AutofillRoutingSummary plan={plan} busy={busy} userQuestions={unresolvedGroups.length} phaseProgress={phaseProgress} pendingOverride={pendingModelCount}/>
-      {hasDraftEdits&&<div className="autofill-edits-warning"><span>{Object.values(answers).some(value=>value.trim())?'本页有你的临时答案，智能填写不会覆盖。请先填写并验证，或明确清除修改。':'本页的“不填写”选择将随自动补齐一起核对；只对当前题目生效，不会清空网页已有值。'}</span><button type="button" disabled={!!busy} onClick={discardDraft}>清除本页临时修改</button></div>}
-      <details className="workbench-more-actions"><summary>可选：让招聘网站先解析简历附件</summary><div className="native-parser-toolbar"><label className="field"><span>本次任务简历（填写依据与附件一致）</span><select value={selectedResume} onChange={e=>void changeTaskResume(e.target.value)}><option value="">请选择一份简历</option>{resumes.map(r=><option value={r.id} key={r.id}>{resumeChoiceLabel(r)}{r.is_default?' · 默认':''}</option>)}</select></label><button className="secondary" disabled={!snapshot||!canAnalyze||!selectedResume||!!busy} onClick={importWithSite}>{busy==='site-parsing'?<LoaderCircle className="spin" size={16}/>:<UploadCloud size={16}/>}让招聘网站先解析</button></div></details>
-      {nativeImport&&<div className={`native-import-result ${nativeImport.status}`}><Files size={18}/><span><strong>{nativeImport.uploaded_file}</strong><small>{nativeImport.message}{nativeImport.trigger_clicked&&` · 已点击“${nativeImport.trigger_label}”`}</small></span><em>{nativeImport.changed_fields} 个字段变化</em></div>}
-      {snapshot&&!plan&&<div className="field-preview">{snapshot.fields.slice(0,8).map(field=><span key={field.selector}>{fieldDisplayLabel(field)}{field.required&&<b>*</b>}</span>)}{snapshot.fields.length>8&&<span>+{snapshot.fields.length-8}</span>}</div>}
-      {plan&&<>
-        <div className="plan-summary"><div><strong>{plan.site_type}</strong><span>{skippedSelectors.size?`本页 ${pendingModelCount} 项待模型分析，${unresolvedGroups.length} 题待确认；${skippedSelectors.size} 项本次留空（不代表必填检查通过）。`:plan.page_summary}</span></div><div><b>{readyCount}</b><small>需要补填/纠正</small></div><div><b>{unresolvedGroups.length}</b><small>等待用户回答</small></div></div>
-        {comparisons.length>0&&<details className="workbench-more-actions"><summary>查看所有字段与主档案的逐项对照（{comparisons.length}）</summary><div className="comparison-panel"><div className="comparison-head"><div><strong>网站解析核对</strong><small>网站现值与已确认主档案的差异</small></div><div className="comparison-counts"><span className="matched">一致 {comparisons.filter(x=>x.status==='matched').length}</span><span className="missing">漏填 {comparisons.filter(x=>x.status==='missing').length}</span><span className="conflict">冲突 {comparisons.filter(x=>x.status==='conflict').length}</span><span className="manual_review">人工核对 {comparisons.filter(x=>!pendingModelSelectors.has(x.selector)&&(x.status==='manual_review'||x.status==='unmapped'||x.status==='option_unavailable')).length}</span>{pendingModelCount>0&&<span className="manual_review">待模型 {pendingModelCount}</span>}<button onClick={()=>setShowMatched(value=>!value)}>{showMatched?'隐藏一致项':'查看一致项'}</button></div></div><div className="comparison-list">{visibleComparisons.length?visibleComparisons.map(item=><article className={`comparison-item ${item.status}`} key={item.key}><div className="comparison-title"><strong>{item.label}{item.required&&<b>*</b>}</strong><span>{comparisonStatusLabel(item.status)}</span></div><div className="comparison-values"><p><small>招聘网站</small><b>{item.site_value||'未填写'}</b></p><p><small>智达主档案</small><b>{item.expected_value||'没有可靠值'}</b></p></div>{item.options.length>0&&item.status!=='matched'&&<div className="comparison-options"><small>网页真实选项</small><span>{item.options.slice(0,12).join(' · ')}{item.options.length>12?' …':''}</span></div>}<footer>{item.recommendation}{item.value_source&&` · ${item.value_source}`}</footer></article>):<div className="success-empty compact"><ShieldCheck size={24}/><h3>{pendingModelCount?'仍有字段等待模型分析，当前尚未全部核对':'所有可核对字段均一致'}</h3></div>}</div></div></details>}
-        <details className="routing-actions"><summary>查看逐字段处理依据与修改入口（{visibleActions.length}）</summary>
-          <div className="action-list">{visibleActions.map((action,i)=>{
-            const field=snapshot?.fields.find(f=>f.selector===action.selector)
-            const skipped=skippedSelectors.has(action.selector)
-            const editing=editingSelectors.has(action.selector)
-            const manual=answers[action.selector]
-            const radioOptions=field?.field_type==='radio'?snapshot?.fields.filter(item=>item.field_type==='radio'&&radioKey(item)===radioKey(field))??[]:[]
-            const selectedRadio=radioOptions.find(item=>answers[item.selector]==='true')
-            const selectedRadioAction=plan.actions.find(item=>item.selector===selectedRadio?.selector)
-            const canEdit=Boolean(field&&field.field_type!=='file'&&field.field_type!=='section-button')
-            const shown=skipped?'本次不主动填写此项；已在网页填写的内容不会被清空。':manual||(action.needs_model?'交给模型分析题意与主档案对应关系，暂不需要你回答。':display(action.value)||action.reason)
-            const explanation=skipped?'仅本页的跳过选择，不会记成永久个人事实；必填检查仍按招聘网页进行。':manual?'由用户明确确认':[action.value_source,action.reason].filter(Boolean).join(' · ')
-            return <article key={action.selector+'-'+i} className={skipped?'will-skip':manual?'ready':action.needs_model?'awaiting-model':action.action==='ask_user'||action.sensitive?'needs-user':action.action==='skip'?'will-skip':'ready'}>
-              <span>{skipped?'本次跳过':manual?'已修改':action.needs_model?'待模型':action.action==='fill'?'填写':action.action==='select'?'选择':action.action==='check'?'勾选':action.action==='ask_user'?'询问':'无需填写'}</span>
-              <div><div className="action-heading"><strong>{actionReviewTitle(action,field)}</strong><div>
-                <b className={'routing-badge '+(skipped?'user':action.needs_model?'pending':action.resolution_source||'rules')}>{skipped?'本次留空':routeLabel(action,Boolean(manual))}</b>
-                {canEdit&&<button disabled={!!busy} onClick={()=>toggleEdit(action.selector)}>{editing?'收起':action.needs_model?'我来确认':'修改'}</button>}
-                {field?.field_type!=='file'&&field?.field_type!=='radio'&&<button disabled={!!busy} onClick={()=>toggleSkip(action.selector)}>{skipped?'恢复':'不填写'}</button>}
-              </div></div>
-              {editing&&canEdit?<div className="inline-answer">{field?.field_type==='radio'?<><select disabled={!!busy} aria-label={actionReviewTitle(action,field)} value={selectedRadio?.selector||''} onChange={e=>answerRadio(field,e.target.value)}><option value="">请选择真实答案</option>{radioOptions.map(option=><option value={option.selector} key={option.selector}>{option.option_label||option.option_value||option.label}</option>)}</select>{selectedRadioAction&&!selectedRadioAction.sensitive&&<button disabled={!!busy} onClick={()=>remember(selectedRadioAction)}><Save size={13}/>记住本网站答案</button>}</>:<>{field?.field_type==='checkbox'?<select disabled={!!busy} value={manual||''} onChange={e=>answer(action,e.target.value)}><option value="">请选择</option><option value="true">是，勾选</option><option value="false">否，不勾选</option></select>:field&&isSelectionField(field)&&!field.options.length?<span>尚未读到真实选项，请先在招聘网页定位；不会把自由文本当作已选答案。</span>:field?.options.length?<select disabled={!!busy} value={manual||String(action.value||'')} onChange={e=>answer(action,e.target.value)}><option value="">请选择</option>{field.options.map(option=><option value={option} key={option}>{option}</option>)}</select>:<input disabled={!!busy} value={manual??String(action.value||'')} onChange={e=>answer(action,e.target.value)} placeholder="在这里补充或修改"/>}{!action.sensitive&&<button disabled={!answers[action.selector]||!!busy} onClick={()=>remember(action)}><Save size={13}/>记住本网站答案</button>}</>}</div>:<p>{shown}</p>}
-              {!skipped&&action.review_hint&&<p className="routing-hint">{action.review_hint}</p>}
-              <small>{explanation}{action.sensitive&&' · 仅当前投递使用，不自动记忆'}</small>
-              {field&&<details className="review-original"><summary>网页原题与识别依据</summary><p>{fieldDisplayLabel(field)}{fieldContext(field,fieldDisplayLabel(field))&&' · '+fieldContext(field,fieldDisplayLabel(field))}</p><p>{field.recognition_evidence||'网页识别证据不足'}</p></details>}
-              </div><em>{skipped?'已跳过':action.needs_model?'待分析':manual?'100%':Math.round(action.confidence*100)+'%'}</em>
-            </article>
-          })}</div>
-        </details>
-      </>}
+      {userPending.length>0&&<button className="secondary" disabled={!!busy} onClick={()=>setWorkspaceSection('questions')}>补充资料并继续</button>}
+      {hasDraftEdits&&!busy&&<p>你补充的答案尚未处理，请到“待补充资料”保存并继续，不会覆盖这些输入。</p>}
+      {snapshot&&<p className="application-attachment-note">附件、照片请在官网上传；职达不会把未上传的材料显示为已完成。</p>}
+      {(systemGroups.length>0||pendingModelCount>0)&&!busy&&<p>还有网页项目未处理，不能视为填写完成。详细原因已留在开发检查中。</p>}
+      {overallReady&&<p className="application-review-ready"><ShieldCheck size={18}/>当前检查允许人工终审；请在官网检查全部内容并自行提交。</p>}
     </section>
-    {plan&&(manualGroups.length>0||pendingModelCount>0||hasDraftEdits)&&<section id="workbench-questions" className="card workbench-result-section">
-      <SectionTitle n="04" title="最后需要你确认的问题" sub="只留下确实缺少的个人事实、偏好和敏感决定；待模型分析的字段不会提前要求你回答"/>
-      <div className="form-grid two"><label className="field"><span>本次任务简历（智能填写不自动上传附件）</span><select disabled={!!busy} value={selectedResume} onChange={e=>void changeTaskResume(e.target.value)}><option value="">请选择本次投递简历</option>{resumes.map(r=><option value={r.id} key={r.id}>{resumeChoiceLabel(r)}{r.is_default?' · 默认':''}</option>)}</select></label></div>
-      {pendingModelCount>0&&<p className="manual-pending">{busy==='autofill-model'?'模型正在先处理歧义项，请稍候。':'仍有字段待模型分析，请先运行“智能分层填写”，或使用“只用 AI 分析”。'}当前下方只显示确实需要你提供的信息。</p>}
-      {manualGroups.length?<div className="answer-list">{manualGroups.map((group,index)=>{
-        const action=group.actions[0]
-        const field=group.fields[0]
-        const label=actionReviewTitle(action,field,group.label)
-        const rawLabel=fieldDisplayLabel(field)
-        const context=fieldContext(field,rawLabel)
-        const uncertain=!action.review_question&&fieldLabelUncertain(field)
-        const inspecting=busy==='inspecting:'+field.selector
-        const hint=action.review_hint||field.expected_input
-        const title=<div className="field-review-copy">
-          <div className="field-review-title"><strong>{index+1}. {label}</strong>{field.required&&<b>必填</b>}{uncertain&&<em>先核对网页原题</em>}<span className={'routing-badge '+(action.resolution_source||'user')}>{routeLabel(action,Boolean(answers[action.selector]))}</span></div>
-          {hint&&<div className="field-guidance"><b>请你确认</b><span>{hint}</span></div>}
-          <small>{action.reason||'主档案中没有可靠答案'} · {controlKind(field)}</small>
-          <details className="review-original"><summary>查看网页原题与识别依据</summary><p>{rawLabel}{context&&' · '+context}</p><p>{field.recognition_evidence||'网页识别证据不足'}</p></details>
-          <button type="button" className="field-locate" disabled={!!busy} onClick={()=>inspectField(field)}>{inspecting?<LoaderCircle className="spin" size={13}/>:<Target size={13}/>}在招聘网页定位{isSelectionField(field)&&!field.options.length?'并读取选项':''}</button>
-        </div>
-        if(group.kind==='radio'){
-          const selected=group.fields.find(item=>answers[item.selector]==='true')?.selector||''
-          const selectedAction=plan.actions.find(item=>item.selector===selected)
-          return <div className="answer-row" key={group.key}>{title}<div className="manual-control"><select disabled={!!busy} aria-label={label} value={selected} onChange={e=>answerRadio(field,e.target.value)}><option value="">请选择真实答案</option>{group.fields.map(option=><option value={option.selector} key={option.selector}>{option.option_label||option.option_value||option.label}</option>)}</select>{selectedAction&&!selectedAction.sensitive&&<button type="button" className="remember-answer" disabled={!!busy} onClick={()=>remember(selectedAction)}><Save size={13}/>记住本网站答案</button>}</div></div>
-        }
-        return <div className="answer-row" key={group.key}>{title}<div className="manual-control">
-          {field.field_type==='section-button'?<button type="button" className="secondary expand-section" disabled={!!busy} onClick={()=>expandSection(field)}>{busy==='expanding'?<LoaderCircle className="spin" size={15}/>:<Plus size={15}/>}在招聘网页展开并重新分析</button>
-          :field.field_type==='checkbox'?<select disabled={!!busy} aria-label={label} value={answers[action.selector]||''} onChange={e=>answer(action,e.target.value)}><option value="">请选择</option><option value="true">是，勾选</option><option value="false">否，不勾选</option></select>
-          :field.date_precision?<input type={field.date_precision} disabled={!!busy} aria-label={label} value={answers[action.selector]||''} onChange={e=>answer(action,e.target.value)}/>
-          :isSelectionField(field)&&!field.options.length?<div className="options-unavailable"><span>尚未读到招聘网站的真实选项，请先定位并展开下拉框。</span><button type="button" disabled={!!busy} onClick={()=>inspectField(field)}>{inspecting?<LoaderCircle className="spin" size={13}/>:<RefreshCw size={13}/>}读取选项</button></div>
-          :field.multiple&&field.options.length?<div className="option-checklist">{field.options.map(option=><label key={option}><input disabled={!!busy} type="checkbox" checked={split(answers[action.selector]||'').includes(option)} onChange={e=>answerMulti(action,option,e.target.checked)}/>{option}</label>)}</div>
-          :field.options.length?<select disabled={!!busy} aria-label={label} value={answers[action.selector]||''} onChange={e=>answer(action,e.target.value)}><option value="">请选择真实答案</option>{field.options.map(option=><option value={option} key={option}>{option}</option>)}</select>
-          :<input disabled={!!busy} aria-label={label} value={answers[action.selector]||''} onChange={e=>answer(action,e.target.value)} placeholder={field.placeholder||'请填写真实答案'}/>}
-          {field.field_type!=='section-button'&&!action.sensitive&&answers[action.selector]&&<button type="button" className="remember-answer" disabled={!!busy} onClick={()=>remember(action)}><Save size={13}/>记住本网站答案</button>}
-        </div></div>
-      })}</div>:pendingModelCount?<p className="manual-pending">暂时没有必须由你回答的问题。模型分析完成后会更新这里，当前还不能视为全部核对通过。</p>:<div className="success-empty compact"><ShieldCheck size={25}/><h3>没有需要补充的个人问题，请继续人工终审</h3></div>}
-    </section>}
-    {plan&&<section id="workbench-results" className="card workbench-result-section"><div className="execute-card"><div><SectionTitle n="05" title="填写、回读与提交前检查" sub="执行后重新读取网页值，并检查附件、人工确认项和页面错误"/>{execution&&<p className="execution-result"><Check size={15}/>{execution.verified} 项回读验证 · {execution.skipped} 项跳过 · {execution.failed} 项失败</p>}</div><div className="execute-actions">{plan&&<button className="secondary" disabled={!!busy} onClick={recheck}><RefreshCw size={15}/>{check?'重新检查':'检查当前页'}</button>}{canContinueWorkflow(workflow)&&check&&<button className="secondary" disabled={!manualNextReady||!!busy} onClick={continueStep}>{busy==='continuing'?<LoaderCircle className="spin" size={16}/>:<ExternalLink size={16}/>}检查通过，进入“{workflow?.safe_next_label}”</button>}<button className="secondary" disabled={!plan||(!readyCount&&!selectedResume)||!!busy} onClick={execute}>{busy==='filling'?<LoaderCircle className="spin" size={17}/>:<Play size={17}/>}填写并验证 {readyCount} 个字段</button></div></div>{check&&<div className={`preflight ${overallReady?'ready':'pending'}`}><div><ShieldCheck size={21}/><span><strong>{overallReady?'表单已具备人工终审条件':'还不能进入最终提交'}</strong><small>已填写 {check.filled_count} 项 · 必填项 {check.required_total} 个 · 待模型 {pendingModelCount} 项 · 待确认 {unresolvedGroups.length} 项 · 附件 {check.file_uploads.length} 个</small></span></div>{check.file_uploads.length>0&&<p>已上传：{check.file_uploads.join('、')}</p>}{unresolvedGroups.length>0&&<div><strong>等待你确认</strong><ul>{unresolvedGroups.map(group=><li key={group.key}>{group.label}</li>)}</ul></div>}{check.required_missing.length>0&&<div><strong>网页仍缺少</strong><ul>{check.required_missing.map((item,i)=><li key={`${item.selector}-${i}`}>{actionReviewTitle(plan?.actions.find(action=>action.selector===item.selector),snapshot?.fields.find(field=>field.selector===item.selector),item.label||item.field_type)}</li>)}</ul></div>}{execution&&execution.failed>0&&<div><strong>填写或回读失败</strong><ul>{execution.results.filter(item=>item.status==='failed'||!item.verified&&item.status==='filled').map((item,i)=><li key={`${item.selector}-failed-${i}`}>{item.label}：{item.message}</li>)}</ul></div>}{check.validation_errors.length>0&&<div><strong>页面校验提示</strong><ul>{check.validation_errors.map((item,i)=><li key={i}>{item}</li>)}</ul></div>}{check.human_challenges.length>0&&<div><strong>需要你手动完成</strong><ul>{check.human_challenges.map((item,i)=><li key={i}>{item}</li>)}</ul></div>}<footer><AlertTriangle size={14}/>当前阶段不会点击“{check.submit_labels[0]||'提交申请'}”。</footer></div>}</section>}
-    </div></div>
+    {check&&Boolean(check.human_challenges.length||check.validation_errors.length)&&<section className="card"><h3>需要在官网处理</h3><ul>{[...check.human_challenges,...check.validation_errors].map((item,index)=><li key={index}>{item}</li>)}</ul></section>}
+    <details className="workbench-extra"><summary>更换填写页或结束本次任务</summary><p>返回设置可以修改网址与简历；已有填写不会自动撤销。更换已连接的页面前，请先结束本次任务。</p><button disabled={!!busy} onClick={close}>结束本次连接</button></details>
   </div>
+  const questions=<div className="stack">
+    <section className="card">
+      <h3>只补充缺少的真实资料</h3><p>保存后先填写并核对，核对成功、复用范围明确的非敏感答案会按题意、简历版本和网站范围记住。不会把不同学历或经历混在一起。</p>
+      {!plan?<p>开始辅助填写后，需要你提供的资料会出现在这里。</p>:userGroups.length?<div className="answer-list">{userGroups.map(group=>{
+        const action=group.actions[0],field=group.fields[0]
+        // Display the verified website question, not a model-rewritten question.
+        const label=field.question_text||field.group_label||field.label
+        const selected=group.fields.find(item=>answers[item.selector]==='true')?.selector||''
+        return <div className="answer-row" key={group.key}>
+          <div className="field-review-copy"><div className="field-review-title"><strong>{label}</strong>{field.required&&<b>必填</b>}</div>{field.section_path?.length>0&&<p>{field.section_path.join(' / ')}</p>}</div>
+          <div className="manual-control">
+            {group.kind==='radio'?<select disabled={!!busy||stalePage} aria-label={label} value={selected} onChange={event=>answerRadio(field,event.target.value)}><option value="">请选择真实答案</option>{group.fields.map(option=><option key={option.selector} value={option.selector}>{option.option_label||option.option_value||option.label}</option>)}</select>
+            :group.kind==='checkbox'?<fieldset className="option-checklist" aria-label={label}><legend>请选择实际符合的选项，可多选</legend>{group.fields.map(option=><label key={option.selector}><input type="checkbox" disabled={!!busy||stalePage} checked={checkboxGroupChecked(option,answers)} onChange={event=>answerCheckboxGroup(group.checkboxGroup!,option.selector,event.target.checked)}/>{option.option_label||option.option_value||option.label}</label>)}</fieldset>
+            :field.field_type==='checkbox'?<select disabled={!!busy||stalePage} aria-label={label} value={answers[action.selector]||''} onChange={event=>answer(action,event.target.value)}><option value="">请选择</option><option value="true">是</option><option value="false">否</option></select>
+            :field.date_precision?<input type={field.date_precision} disabled={!!busy||stalePage} aria-label={label} value={answers[action.selector]||''} onChange={event=>answer(action,event.target.value)}/>
+            :field.multiple&&field.options.length?<div className="option-checklist">{field.options.map(option=><label key={option}><input type="checkbox" disabled={!!busy||stalePage} checked={split(answers[action.selector]||'').includes(option)} onChange={event=>answerMulti(action,option,event.target.checked)}/>{option}</label>)}</div>
+            :field.options.length?<select disabled={!!busy||stalePage} aria-label={label} value={answers[action.selector]||''} onChange={event=>answer(action,event.target.value)}><option value="">请选择真实答案</option>{field.options.map(option=><option key={option} value={option}>{option}</option>)}</select>
+            :field.field_type==='textarea'?<textarea disabled={!!busy||stalePage} aria-label={label} value={answers[action.selector]||''} onChange={event=>answer(action,event.target.value)}/>
+            :<input disabled={!!busy||stalePage} aria-label={label} value={answers[action.selector]||''} onChange={event=>answer(action,event.target.value)} placeholder="请填写真实答案"/>}
+            {action.sensitive&&<small>仅用于本次填写，不保存为可复用答案。</small>}
+            {group.kind==='checkbox'&&group.fields.some(item=>item.knowledge_block_reason?.startsWith('复选题记忆归属不明确：'))&&<small>本页有同名问题，暂不能确定下次的复用范围；这组答案仅用于本次填写。</small>}
+          </div>
+        </div>
+      })}</div>:<p>目前没有需要你补充的个人问题。这不代表官网全部填写完成。</p>}
+      {hasDraftEdits&&<div className="review-buttons"><button className="primary" disabled={!!busy||!canAnalyze||!plan||!readyCount} onClick={execute}>{busy==='filling'?<LoaderCircle className="spin" size={16}/>:<Save size={16}/>}保存答案并继续填写</button><button disabled={!!busy} onClick={discardDraft}>清除未保存修改</button></div>}
+      {!hasDraftEdits&&plan&&<button className="secondary" onClick={()=>setWorkspaceSection('operation')}>回到投递操作</button>}
+    </section>
+    {memoryFailures.length>0&&<section className="card" role="alert"><h3>答案尚未记住</h3><p>输入仍保留。核对官网后可单独重试保存；记忆重试不会重新填写官网。</p>{memoryFailures.map(selector=>{const action=plan?.actions.find(item=>item.selector===selector);return action?<p key={selector}>{actionReviewTitle(action,snapshot?.fields.find(field=>field.selector===selector))}<button disabled={!!busy||stalePage} onClick={()=>remember(action)}>重试记住答案</button></p>:null})}</section>}
+    {snapshot&&needsMonthPrecisionConsent(snapshot.url,plan)&&<section className="card"><h3>请确认日期填写方式</h3><p>简历只有年月、官网要求具体日期时，不会擅自补为1日。你可以提供精确日期，或确认以每月1日作为本网站的月份占位。</p><button disabled={Boolean(assistBlocker)} onClick={confirmMonthPrecision}>允许月份占位并记住</button></section>}
+    {!canAnalyze&&hasDraftEdits&&<section className="card"><p>页面已变化，以下未保存答案仍保留，暂不执行。</p>{Object.entries(answers).map(([selector,value])=><p key={selector}>{snapshot?.fields.find(field=>field.selector===selector)?.question_text||'之前的表单项'}：{value}</p>)}</section>}
+  </div>
+  const diagnostics=<div className="stack">
+    <section className="card"><h3>识别与执行检查</h3><p>此页供开发测试。识别缺口不要求用户补档案；隐藏诊断也不会把未完成的表单判为成功。</p>
+      <div className="review-buttons">
+        {!snapshot&&<button disabled={!!busy||!hasMatchingSafari||!backendReady} onClick={()=>void start()}>只连接并读取页面</button>}
+        <button disabled={!!busy} onClick={restoreExistingSession}>只读同步当前页</button>
+        {snapshot&&<button disabled={!!busy||!canAnalyze||hasDraftEdits} onClick={analyzeWithAI}>仅分析，不填写</button>}
+        {snapshot&&<button disabled={!!busy||stalePage} onClick={async()=>{if(!snapshot||busy)return;setBusy('control-diagnostics');try{setControlDiagnostics(await api.recognitionDiagnostics(snapshot.session_id))}catch(error){notify(message(error))}finally{setBusy('')}}}>读取控件结构</button>}
+      </div>
+      {snapshot&&<p>页面：{snapshot.title} · {snapshot.fields.length} 个控件 · {workflow?workflowStageLabel(workflow.stage):'阶段未确认'}{stalePage?' · 旧计划暂停':''}</p>}
+      {recoveryWarning&&<p role="alert">{recoveryWarning}</p>}
+      {systemGroups.length>0&&<details open><summary>识别缺口（不是用户事实问题）</summary><ul>{systemGroups.map(group=><li key={group.key}><strong>{group.label}</strong>：{group.checkboxGroup?.blockReason||group.fields.map(userQuestionBlockReason).filter(Boolean).join('；')}<button disabled={!!busy||stalePage} onClick={()=>inspectField(group.fields[0])}>定位检查</button></li>)}</ul></details>}
+    </section>
+    {snapshot?.extraction_report&&<FormExtractionQuality report={snapshot.extraction_report}/>}
+    {snapshot&&<ExtractionAudit snapshot={snapshot} resumeId={selectedResume} revision={plan?.context_token||''} disabled={!!busy||stalePage} onBusy={value=>setBusy(value?'extraction-audit':'')} notify={notify} onPageInvalidated={()=>{setObservedChange(workflow);setWorkflow(null);setCheck(null);setRecoveryWarning('招聘页面已变化或连接已失效。旧填写计划已暂停，临时答案保留，请先同步当前页。')}}/>}
+    {snapshot&&<PageObservation snapshot={snapshot} resumeId={selectedResume} revision={plan?.context_token||''} disabled={!!busy||stalePage} onBusy={value=>setBusy(value?'page-observation':'')} notify={notify}/>}
+    {controlDiagnostics&&<ControlDiagnostics data={controlDiagnostics}/>}
+    {assistProgress&&<AssistProgress progress={assistProgress} onCancel={pauseAssist}/>}
+    {assistResult&&<section className="card"><h3>{assistStatus(assistResult.status).title}</h3><p>{assistResult.message}</p><ol>{assistResult.events.map((event,index)=><li key={index}>{event.message}{Boolean(event.issues?.length)&&<ul>{event.issues?.map((issue,i)=><li key={i}>{issue.label}：{issue.message}</li>)}</ul>}</li>)}</ol>{Boolean(assistResult.record_coverage?.length)&&<ul>{assistResult.record_coverage?.map(row=><li key={row.kind}>{row.label}：{row.matched_records}/{row.source_total}；未覆盖：{row.missing_names.join('；')||'无'}</li>)}</ul>}</section>}
+    {plan&&<section className="card"><h3>逐项核对</h3><ul>{visibleActions.map((action,index)=><li key={action.selector+'-'+index}><strong>{actionReviewTitle(action,snapshot?.fields.find(field=>field.selector===action.selector))}</strong> · {action.action} · {action.reason}</li>)}</ul></section>}
+    {check&&<section className="card"><h3>提交前检查（不会自动提交）</h3><p>{overallReady?'允许人工终审':'仍未完成'} · 官网必填缺失 {check.required_missing.length} · 待模型 {pendingModelCount} · 未解决问题 {unresolvedGroups.length}</p><ul>{check.required_missing.map((item,index)=><li key={index}>{item.label||item.field_type}</li>)}{check.validation_errors.map((item,index)=><li key={'error'+index}>{item}</li>)}</ul>{execution&&<p>回读成功 {execution.verified} · 失败 {execution.failed}</p>}</section>}
+    <details className="workbench-extra"><summary>维护投递知识</summary><ApplicationKnowledge snapshot={snapshot} profile={profile} plan={plan} disabled={!!busy||stalePage} onBusyChange={value=>setBusy(value?'knowledge-saving':'')} onChanged={refreshKnowledgePlan} notify={notify}/></details>
+    {snapshot&&resumes.find(item=>item.id===selectedResume)&&<ResumeFactEditor key={selectedResume} resume={resumes.find(item=>item.id===selectedResume)!} disabled={!!busy} onBusy={value=>setBusy(value?'fact-saving':'')} onSaved={onFactSaved}/>}
+  </div>
+  return <ApplicationWorkspace stage={workspaceStage} section={workspaceSection} onSectionChange={setWorkspaceSection}
+    resumes={resumes.map(resume=>({id:resume.id,label:resumeChoiceLabel(resume),disabled:['pending','parsing','failed'].includes(resume.status)}))}
+    resumeId={selectedResume} onResumeChange={id=>void changeTaskResume(id)} url={url} onUrlChange={setUrl}
+    onContinue={submitSetup} onBackToSetup={()=>{if(!busy)setWorkspaceStage('setup')}} disabled={!!busy}
+    pendingCount={userPending.length} status={userStatus} applicationName={snapshot?.title||''}
+    operation={operation} questions={questions} diagnostics={diagnostics}/>
 }
-
 const workflowStageLabel=(stage:ApplicationWorkflowState['stage'])=>({homepage:'招聘首页',job_list:'岗位列表',job_detail:'职位详情',registration_required:'创建账号',auth_required:'需要登录',verification_required:'等待验证',profile_form:'在线简历',application_form:'申请表单',review:'提交前复核',unknown:'待识别'}[stage])
 const agentActionLabel=(action:ApplicationAgentTurn['decision']['next_action'])=>({browse_jobs:'浏览岗位入口',search_jobs:'搜索目标岗位',open_job:'打开指定岗位',start_application:'进入申请入口',analyze_and_fill:'分析、填写并回读',continue_application:'检查后进入下一页',refresh:'重新观察网页',wait_for_registration:'等待用户完成注册',wait_for_login:'等待用户登录',wait_for_verification:'等待用户验证',review_before_submit:'人工终审',stop:'暂停任务'}[action])
 const recognitionProfileLabel=(profile:string)=>({"tencent-campus":'腾讯适配',"moka-campus":'Moka 适配',"beisen-italent":'北森适配',"generic-semantic":'通用语义识别'}[profile]||profile||'通用语义识别')
 function WorkflowJourney({stage}:{stage:ApplicationWorkflowState['stage']}){const steps=['确认岗位','注册/登录','身份验证','填写申请','人工终审'];const index=['homepage','job_list','job_detail'].includes(stage)?0:stage==='registration_required'||stage==='auth_required'?1:stage==='verification_required'?2:stage==='profile_form'||stage==='application_form'?3:stage==='review'?4:0;return <div className="workflow-journey">{steps.map((label,i)=><div className={i<index?'done':i===index?'current':''} key={label}><span>{i<index?<Check size={12}/>:i+1}</span><small>{label}</small></div>)}</div>}
 const comparisonStatusLabel=(status:FieldComparison['status'])=>({matched:'一致',missing:'网站漏填',conflict:'识别冲突',manual_review:'人工核对',unmapped:'缺少资料',option_unavailable:'选项不匹配'}[status])
-const controlKind=(field:PageField)=>field.date_precision==='date'?'日期（年-月-日）':field.date_precision==='month'?'日期（年-月）':field.field_type==='section-button'?'需要先展开':field.field_type==='radio'?'单选题':field.field_type==='checkbox'?'勾选题':field.field_type==='select-multiple'||field.multiple?'下拉多选':field.field_type==='select-one'||field.field_type==='combobox'?'下拉单选':field.field_type==='textarea'?'长文本':'文本输入'
-const isSelectionField=(field:PageField)=>!field.date_precision&&(field.field_type==='select-one'||field.field_type==='select-multiple'||field.field_type==='combobox')
+const controlKind=(field:PageField)=>field.date_precision==='date'?'日期（年-月-日）':field.date_precision==='month'?'日期（年-月）':field.control_kind==='calendar'?'日历（格式待核实）':field.control_kind==='cascade'?'级联选择（需完整路径）':field.field_type==='section-button'?'需要先展开':field.field_type==='radio'?'单选题':field.field_type==='checkbox'?'勾选题':field.field_type==='select-multiple'||field.multiple?'下拉多选':field.field_type==='select-one'||field.field_type==='combobox'?'下拉单选':field.field_type==='textarea'?'长文本':'文本输入'
 const fieldDisplayLabel=(field:PageField,fallback='')=>{const primary=field.question_text||field.group_label||field.label;const uncertain=fieldLabelUncertain(field);return uncertain&&fallback&&!/^(未识别|field|question)/i.test(fallback)?fallback:primary||fallback||field.context||field.placeholder||`未识别字段 ${field.ordinal||''}`.trim()}
 const fieldContext=(field:PageField,label:string)=>{const parts=[field.context,field.help_text,...(field.nearby_labels||[]),...(field.section_path||[])].map(value=>(value||'').trim()).filter(value=>value&&value!==label);const context=[...new Set(parts)].slice(0,4).join(' · ');return context.length>360?`${context.slice(0,357)}…`:context}
 const fieldLabelUncertain=(field:PageField)=>field.recognition_confidence<.7||['generated','name','placeholder','context','unknown'].includes(field.label_source||'unknown')

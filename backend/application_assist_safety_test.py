@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from application_assist_test import Browser
 from app import application_assist as assist
-from app.browser_models import ApplicationAssistRequest, FillAction, FormPlan, PageField
+from app.browser_models import ActionResult, ApplicationAssistRequest, FillAction, FormPlan, PageField
+from app.execution_safety import ExecutionTargetChanged, execution_phase_label
 from app.form_agent import _local_safe_plan
 from app.form_routing import route_local_plan
 from app.models import CandidateProfile
@@ -27,6 +28,22 @@ class UnclearBrowser(Browser):
 
 
 async def run():
+    # Earlier widget causes survive a later navigation, but unknown exception
+    # text (including candidate answers) never enters an interruption receipt.
+    known_failure=ExecutionTargetChanged('synthetic navigation',results=[ActionResult(
+        selector='#date',label='日期',status='failed',
+        message='当前日历尚无经过验证的日期输入方式，请在官网核对；不会强写只读值 private-value')])
+    assert '日历输入方式尚未支持' in known_failure.attempted_issues[0].message
+    assert 'private-value' not in repr(known_failure.__dict__)
+    unknown_failure=ExecutionTargetChanged('synthetic navigation',results=[ActionResult(
+        selector='#date',label='日期',status='failed',message='private-error private-value')])
+    assert 'private-error' not in repr(unknown_failure.__dict__)
+    assert 'private-value' not in repr(unknown_failure.__dict__)
+    phase_failure=ExecutionTargetChanged('synthetic navigation', current_label='民族', current_phase='open_popup')
+    assert execution_phase_label('open_popup') in phase_failure.attempted_issues[0].message
+    unknown_phase=ExecutionTargetChanged('synthetic navigation', current_label='民族', current_phase='private-stage-answer')
+    assert 'private-stage-answer' not in repr(unknown_phase.__dict__)
+    assert '执行阶段尚未分类' in unknown_phase.attempted_issues[0].message
     assert assist.is_declaration(PageField(selector="#agree",name="agreechk",field_type="checkbox"))
     for question in ("是否同意异地工作", "Do you agree to relocate?", "是否获得该资格证书 certification"):
         assert not assist.is_declaration(PageField(selector="#preference",label=question,field_type="radio"))
@@ -64,6 +81,44 @@ async def run():
         assert len(browser.calls[0].actions)==1 and browser.calls[0].actions[0].selector=="#intro"
         assert len(result.pre_submit.required_missing)==1
 
+        # A visible value can match even when committing the widget failed
+        # (observed with an owned calendar panel). Final review must not erase
+        # that failure or announce completion just from the input string.
+        browser=Browser()
+        browser.values.update(country="中国",city="北京")
+        browser.options_loaded=True
+        original_execute=browser.execute
+        async def displayed_but_unverified(sid,payload,before_action=None,on_progress=None):
+            execution=await original_execute(sid,payload,before_action=before_action,on_progress=on_progress)
+            for item in execution.results:
+                if item.selector=="#name":
+                    item.status="failed"
+                    item.verified=False
+                    item.message="合成控件提交状态未通过核验"
+            execution.verified=sum(item.verified for item in execution.results)
+            execution.completed=execution.verified
+            execution.failed=sum(item.status=="failed" for item in execution.results)
+            return execution
+        browser.execute=displayed_but_unverified
+        result=await prepare(browser)
+        name=next(item for item in result.review.comparisons if item.selector=="#name")
+        assert browser.values["name"]==profile.name
+        assert name.status=="manual_review" and "不计为填写成功" in name.recommendation
+        assert result.status=="partial" and len(browser.calls)==1
+        assert result.review.summary.matched==2 and result.review.summary.manual_review>=1
+        # Same selector, different question: no stale failure association.
+        field=next(f for f in result.review.snapshot.fields if f.selector=="#name")
+        failure={field.selector:assist._field_identity(field)}
+        changed=field.model_copy(update={"question_text":"另一道题"})
+        unchanged=result.review.model_copy(deep=True)
+        unchanged.snapshot.fields=[changed if f.selector=="#name" else f for f in unchanged.snapshot.fields]
+        name2=next(item for item in unchanged.comparisons if item.selector=="#name")
+        name2.status="matched"
+        unchanged.summary.matched+=1
+        unchanged.summary.manual_review-=1
+        assist._retain_execution_failures(unchanged,failure)
+        assert name2.status=="matched"
+
         for exception in (asyncio.TimeoutError(),RuntimeError("private gateway details")):
             async def unavailable(snapshot):
                 raise exception
@@ -92,6 +147,30 @@ async def run():
         result=await prepare(browser,guard=changed_context)
         assert result.status=="blocked" and len(browser.calls)==1
         assert browser.values["name"]==profile.name and browser.values["intro"]==""
+
+        browser=UnclearBrowser()
+        browser.values["name"]=""
+        async def interrupted_batch(sid, payload, before_action=None, on_progress=None):
+            browser.calls.append(payload)
+            if on_progress:
+                on_progress(1, 'read_value')
+                on_progress(2, 'open_popup')
+            browser.values["name"]=profile.name
+            raise ExecutionTargetChanged("合成网页文档已重新加载", results=[ActionResult(
+                selector="#name", label="姓名", status="filled", verified=True,
+                actual_value="private-value", message="private-error")], current_label="下一题", current_phase="open_popup")
+        browser.execute=interrupted_batch
+        result=await prepare(browser)
+        assert result.status=="blocked" and result.rounds==0 and result.pre_submit is None
+        assert len(browser.calls)==1 and browser.values["intro"]==""
+        interrupted=next(e for e in result.events if e.kind=="write_interrupted")
+        assert interrupted.completed==interrupted.failed==0
+        assert "1项" in interrupted.message and "整批最终核对未完成" in interrupted.message
+        assert [item.label for item in interrupted.issues]==["姓名", "下一题"]
+        assert execution_phase_label('open_popup') in interrupted.issues[-1].message
+        assert all(e.completed == e.failed == 0 for e in result.events if e.kind == 'control')
+        assert "private-value" not in interrupted.model_dump_json()
+        assert "private-error" not in interrupted.model_dump_json()
 
         browser=Browser()
         browser.values.update(name=profile.name,country="中国",city="北京")

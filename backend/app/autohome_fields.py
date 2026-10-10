@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from playwright.async_api import Page
 
 from .field_semantics import education_level_hint
+from .form_observation import retain_adapter_evidence
 
 
 async def refine_autohome_fields(page: Page, data: list[dict]) -> list[dict]:
@@ -151,5 +152,5 @@ async def refine_autohome_fields(page: Page, data: list[dict]) -> list[dict]:
         if education:
             level = education_level_hint(degree) if degree else ("bachelor" if first_bachelor else "")
             patch["entity_scope"] = f"education:{level or 'unspecified'}"
-        result.append({**item, **patch})
+        result.append({**item, **retain_adapter_evidence(item, patch, 'autohome-owned')})
     return result

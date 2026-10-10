@@ -77,16 +77,20 @@ class Browser:
         return PreSubmitCheck(url=URL, required_total=len(snapshot.fields), filled_count=len(snapshot.fields)-len(missing),
                               required_missing=missing, ready=not missing, submit_labels=["提交申请"])
 
-    async def execute(self, sid, request, *args, before_action=None):
+    async def execute(self, sid, request, *args, before_action=None, on_progress=None):
         assert not args and not request.upload_resume and not request.resume_id
         self.calls.append(request)
         results = []
         loaded_before = self.options_loaded
-        for action in request.actions:
+        for index, action in enumerate(request.actions, 1):
+            if on_progress:
+                on_progress(index, "target_check")
             if before_action:
                 before_action()
             assert action.selector != "#agree" and action.action in {"fill", "select"}
             failed = self.fail or (action.selector.startswith("#city") and not loaded_before)
+            if on_progress:
+                on_progress(index, "write_value")
             if not failed:
                 if action.selector.startswith("#project"):
                     record, key = action.selector.removeprefix("#project").split("-")
@@ -96,6 +100,8 @@ class Browser:
                     self.values[key] = str(action.value)
             results.append(ActionResult(selector=action.selector, label=action.label,
                 status="failed" if failed else "filled", verified=not failed))
+            if on_progress:
+                on_progress(index, "read_value")
         if self.values["country"]:
             self.options_loaded = True  # dependent field gets a NEW selector
         return ExecutionResult(url=URL, completed=sum(r.verified for r in results), verified=sum(r.verified for r in results),
@@ -128,6 +134,12 @@ async def run():
         names = [a for call in browser.calls for a in call.actions if a.selector == "#name"]
         assert len(names) == 1  # dependent retry did not rewrite verified identity
         assert result.rounds == 2 and any(e.failed == 1 for e in result.events)
+        progress = [e for e in result.events if e.kind == "control"]
+        assert progress and all(e.completed == e.failed == 0 for e in progress)
+        assert all("尚未通过整批最终核对" in e.message for e in progress)
+        for value in (profile.name, profile.country_region, *profile.target_cities,
+                      *(p.name for p in profile.projects)):
+            assert value not in " ".join(e.message for e in progress)
         assert len(result.pre_submit.required_missing) == 1
         before = len(browser.calls)
         again = await prepare(browser)
@@ -148,9 +160,15 @@ async def run():
         async def model_after_failure(snapshot):
             model_calls.append(snapshot)
             return local(snapshot, profile)
-        with patch.object(assist, 'create_local_form_plan', side_effect=lambda snapshot, candidate:
-                          local(snapshot, candidate).model_copy(update={'routing_summary':
-                              local(snapshot, candidate).routing_summary.model_copy(update={'model_pending': 1})})):
+        def pending_local(snapshot, candidate):
+            plan = local(snapshot, candidate)
+            # A pending count alone is not a pending question. Supply an actual
+            # unresolved action, as a real router does.
+            plan.actions.append(FillAction(selector='#agree', label='合成疑难题目',
+                action='skip', needs_model=True, resolution_source='blocked'))
+            plan.routing_summary.model_pending = 1
+            return plan
+        with patch.object(assist, 'create_local_form_plan', side_effect=pending_local):
             all_failed = Browser(); all_failed.fail = True
             await assist.prepare_application(all_failed, 'fixture', request.model_copy(update={'use_model':True}),
                 profile, guard=lambda:None, model_plan=model_after_failure, stamp_plan=lambda p:p)

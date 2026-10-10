@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import {assistanceBackendReady,assistGuard,assistRequest,assistStatus,draftFieldsCompatible,monthPrecisionMemory,needsMonthPrecisionConsent,verifiedDraftEntries} from './applicationAssist.ts'
+import {assistanceBackendReady,assistFailure,assistGuard,assistRequest,assistStatus,draftFieldsCompatible,forgetAssistRun,monthPrecisionMemory,needsMonthPrecisionConsent,rememberAssistRun,rememberedAssistRun,verifiedDraftEntries,watchAssist} from './applicationAssist.ts'
 
-assert.deepEqual(assistRequest('resume-a'),{resume_id:'resume-a',allow_site_parse:false,use_model:true,max_rounds:3})
+assert.deepEqual(assistRequest('resume-a'),{resume_id:'resume-a',allow_site_parse:false,use_model:true,max_rounds:5})
 assert.equal(assistRequest('resume-a',true).allow_site_parse,true)
 assert.equal(assistRequest('resume-a').allow_site_parse,false,'Upload permission must not leak into a later request')
 const deferredField={selector:'#id',question_text:'证件号码',semantic_key:'candidate.government_id',container_key:'candidate',field_type:'text',options:[]}
-assert.deepEqual(assistRequest('resume-a',false,[deferredField],true),{resume_id:'resume-a',allow_site_parse:false,use_model:true,max_rounds:3,deferred_fields:[deferredField],defer_government_id:true})
+assert.deepEqual(assistRequest('resume-a',false,[deferredField],true),{resume_id:'resume-a',allow_site_parse:false,use_model:true,max_rounds:5,deferred_fields:[deferredField],defer_government_id:true})
 assert.equal(assistRequest('resume-a').defer_government_id,undefined,'A per-run ID deferral must not become permanent consent or fact')
 assert.equal(assistRequest('resume-a').deferred_fields,undefined,'A later request must not inherit old DOM selectors')
 assert.equal(assistanceBackendReady({resume_id:'resume-a'}),false,'A legacy resume-aware server still lacks safe assist')
@@ -61,3 +61,60 @@ for(const [key,value] of Object.entries({field_type:'text',field_signature:'othe
 }
 assert.equal(draftFieldsCompatible(['#city'],before,{...before,fields:[]}),false)
 console.log('application assist: request defaults, safety guards, statuses, and scoped date consent passed')
+
+let polls=0;const updates=[];const terminal={status:'needs_user',message:'合成缺项'}
+const recovered=await watchAssist(async()=>{polls++;return {status:polls<3?'running':'finished',result:polls<3?null:terminal}},p=>updates.push(p.status),()=>true,async()=>{})
+assert.deepEqual(recovered,terminal)
+assert.deepEqual(updates,['running','running','finished'])
+let failedReads=0
+await assert.rejects(watchAssist(async()=>{failedReads++;throw new Error('offline')},()=>{},()=>true,async()=>{}),/offline/)
+assert.equal(failedReads,4,'Read recovery is bounded and does not replay writes')
+let queuedReads=0,queueClock=0
+const queuedUpdates=[]
+assert.deepEqual(await watchAssist(async()=>{
+  if(++queuedReads<=6)throw Object.assign(new Error('receipt not registered'),{status:404})
+  return {status:'finished',result:terminal}
+},p=>queuedUpdates.push(p.status),()=>true,async()=>{queueClock+=1500},()=>queueClock),terminal)
+assert.equal(queuedReads,7,'A queued POST must not lose its watcher after four early 404s')
+assert.deepEqual(queuedUpdates,['finished'],'No invented progress during startup')
+let missingReads=0,missingClock=0
+await assert.rejects(watchAssist(async()=>{
+  missingReads++;throw Object.assign(new Error('no receipt'),{status:404})
+},()=>{},()=>true,async()=>{missingClock+=10000},()=>missingClock),/no receipt/)
+assert.equal(missingReads,12,'Missing startup receipt still times out after bounded grace and four failures')
+let seenReads=0
+await assert.rejects(watchAssist(async()=>{
+  if(++seenReads===1)return {status:'running',result:null}
+  throw Object.assign(new Error('receipt disappeared'),{status:404})
+},()=>{},()=>true,async()=>{}),/receipt disappeared/)
+assert.equal(seenReads,5,'A receipt that disappears after startup must not get the startup grace')
+for(const status of [401,403]){
+  let deniedReads=0
+  await assert.rejects(watchAssist(async()=>{
+    deniedReads++;throw Object.assign(new Error('access denied'),{status})
+  },()=>{},()=>true,async()=>{}),/access denied/)
+  assert.equal(deniedReads,1,'Do not keep polling a receipt after permission loss')
+}
+await assert.rejects(watchAssist(async()=>({status:'interrupted',message:'停止'}),()=>{},()=>true,async()=>{}),/停止/)
+assert.equal(await watchAssist(async()=>{throw new Error('must not read')},()=>{},()=>false,async()=>{}),null)
+const guardError=Object.assign(new Error('真实读取检查失败'),{status:409})
+const receiptError=new Error('本轮中断')
+assert.equal(assistFailure(guardError,receiptError),guardError,'Keep specific server guard diagnostic')
+assert.equal(assistFailure(new TypeError('Failed to fetch'),receiptError),receiptError,'Recover network failure from receipt without replay')
+
+const store=new Map()
+const storage={getItem:key=>store.get(key)??null,setItem:(key,value)=>store.set(key,value),removeItem:key=>store.delete(key)}
+const reference={session:'11111111-1111-4111-8111-111111111111',id:'22222222-2222-4222-8222-222222222222',started:10000}
+rememberAssistRun(storage,'owner-a',{...reference,answers:{private:'synthetic secret'},plan:'not for storage'})
+assert.deepEqual(rememberedAssistRun(storage,'owner-a','',11000),reference)
+assert.equal(rememberedAssistRun(storage,'owner-b','',11000),null,'Refresh cannot adopt another account receipt')
+assert.doesNotMatch([...store.values()].join(''),/secret|answers|plan/,'Only receipt IDs and timestamp are retained')
+assert.equal(rememberedAssistRun(storage,'owner-a','',reference.started+3600000),null,'Expired receipts do not reactivate stale tasks')
+rememberAssistRun(storage,'owner-a',reference)
+assert.equal(rememberedAssistRun(storage,'owner-a','',reference.started-1),null,'Future timestamps must not remain valid indefinitely')
+assert.equal(rememberedAssistRun(storage,'owner-a','#assist-session=not-a-uuid&assist-run=evil',11000),null)
+assert.deepEqual(rememberedAssistRun(storage,'owner-a',`#assist-session=${reference.session}&assist-run=${reference.id}`,11000),{...reference,started:11000},'A receipt link only identifies an owner-checked progress read')
+rememberAssistRun(storage,'owner-a',reference);forgetAssistRun(storage,'owner-a')
+assert.equal(rememberedAssistRun(storage,'owner-a','',11000),null)
+assert.doesNotThrow(()=>rememberAssistRun({setItem:()=>{throw new Error('blocked')}},'owner-a',reference))
+console.log('assist recovery: owner isolation, metadata-only storage, expiry and read-only receipt references passed')

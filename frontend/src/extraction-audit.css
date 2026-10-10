@@ -1,0 +1,19 @@
+.extraction-audit fieldset{border:0;padding:0;display:grid;gap:12px;min-width:0}
+.extraction-audit label{display:flex;align-items:flex-start;gap:8px;line-height:1.6}
+.extraction-audit input[type=checkbox]{flex:none;width:16px;height:16px;margin-top:4px}
+.extraction-audit fieldset>button{justify-self:start}
+.extraction-audit small{display:block;line-height:1.6;color:#657965}
+.extraction-audit details>summary{cursor:pointer}
+.extraction-audit fieldset details label{margin:10px 0}
+.extraction-audit-error{padding:12px;border:1px solid #dfbd8a;background:#fff8e9;border-radius:8px}
+.extraction-audit-result{border-top:1px solid #dce6dc;margin-top:18px;padding-top:18px}
+.extraction-audit-questions{display:grid;gap:8px;margin:14px 0}
+.extraction-audit-question{border:1px solid #dce6dc;border-radius:8px;padding:12px;background:#fbfdf9}
+.extraction-audit-question>summary{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;line-height:1.6}
+.extraction-audit-question>summary small{flex:none}
+.extraction-audit-question dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px}
+.extraction-audit-question dl>div{background:#f0f5ed;padding:8px;border-radius:6px}
+.extraction-audit-question dt{font-size:12px;color:#657965}
+.extraction-audit-question dd{margin:4px 0 0}
+.extraction-audit pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow:auto;font-size:12px}
+@media(max-width:600px){.extraction-audit-question>summary{display:grid;gap:4px}}

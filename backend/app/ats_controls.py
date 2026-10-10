@@ -25,7 +25,15 @@ async def scoped_option_entries(page, control, policy: ATSPolicy,
     """
     items = await control.evaluate(r"""(el, config) => {
       const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-      const visible = node => node.getClientRects().length > 0 && !node.closest('[aria-hidden="true"], [hidden]');
+      const visible = node => {
+        if(!node.getClientRects().length||node.closest('[aria-hidden="true"], [hidden]'))return false;
+        for(let p=node;p&&p!==document.body;p=p.parentElement){
+          const style=getComputedStyle(p),rect=p.getBoundingClientRect();
+          if(style.display==='none'||['hidden','collapse'].includes(style.visibility)||
+            (['hidden','clip'].includes(style.overflow)&&(rect.width===0||rect.height===0)))return false;
+        }
+        return true;
+      };
       const enabled = node => !node.matches(':disabled, [aria-disabled="true"], [data-disabled="true"]') &&
         !node.closest('[aria-disabled="true"]') && !/(?:^|[-_\s])disabled(?:$|[-_\s])/.test(String(node.className || ''));
       const optionNodes = root => [...root.querySelectorAll(config.options)]
@@ -37,6 +45,16 @@ async def scoped_option_entries(page, control, policy: ATSPolicy,
       if (ids.length) {
         roots = ids.map(id => document.getElementById(id)).filter(Boolean);
         if (!roots.length) return [];
+        // rc-select virtual lists link ARIA to a hidden accessibility mirror.
+        // The clickable options live beside that mirror in the SAME portal.
+        // Follow the proven owned ID upward, never borrow a global listbox.
+        const portals=[...new Set(roots.map(root=>{
+          const parents=[];for(let p=root;p&&p!==document.body;p=p.parentElement)
+            if(p.matches(config.popups)&&visible(p))parents.push(p);
+          return parents[parents.length-1];
+        }).filter(Boolean))];
+        if(portals.length===1&&roots.every(root=>portals[0].contains(root)))roots=portals;
+        else if(portals.length>1)return [];
       } else {
         const container = el.closest(config.containers || '.form-field, .form-item, .field, fieldset');
         const controls = container ? [...container.querySelectorAll('[role="combobox"], [aria-haspopup="listbox"]')]

@@ -10,6 +10,8 @@ import re
 from .browser_models import BrowserSnapshot, FillAction, FormPlan, FormRoutingSummary, PageField
 from .field_semantics import education_level_hint, entity_scope_for, normalize_text, semantic_key_for
 from .models import CandidateProfile
+from .form_field_policy import formal_employment_only
+from .form_observation import extraction_block_reason
 
 
 AUTOMATIC = {"fill", "select", "check"}
@@ -20,7 +22,7 @@ ROOT_EXTRAS = {
     "birth_date": ("出生日期", "candidate.birth_date"),
     "summary": ("个人简介", "candidate.summary"),
 }
-CREDENTIALS = re.compile(r"密码|验证码|校验码|登录|password|passcode|captcha|verification.?code|\botp\b", re.I)
+CREDENTIALS = re.compile(r"密码|验证码|校验码|登录|password|passcode|captcha|verification.?code|one-time-code|one[_ ]time[_ ]code|\botp\b", re.I)
 
 
 def profile_targets() -> dict[str, tuple[str, str]]:
@@ -46,7 +48,9 @@ def _hard_boundary(field: PageField) -> str:
     if field.field_type in {"password", "hidden", "file", "section-button"} or CREDENTIALS.search(text):
         return "账号凭据、验证码、附件和展开操作需要使用专门入口，不由字段模型处理"
     if mapper._is_third_party(field):
-        return "请提供该联系人的真实资料，不能使用你本人的姓名或电话"
+        return "请提供该家属或联系人的真实资料，不能使用你本人的姓名、学历或联系方式"
+    if formal_employment_only(field):
+        return "官网只接受正式劳动合同/社保工作经历，不能用实习经历代替；请确认真实情况"
     if any(hint in text for hint in mapper.SENSITIVE_HINTS):
         return "这是敏感信息或承诺事项，需要你本人确认，模型不能替你决定"
     if field.knowledge_block_reason and not field.knowledge_block_reason.startswith(("仅检索到", "已找到参考规则")):
@@ -122,6 +126,18 @@ def route_local_plan(plan: FormPlan, snapshot: BrowserSnapshot, profile: Candida
         action.review_question = question_for_user(field)
         action.review_hint = action.reason
         action.needs_model = False
+        if record_blocker := mapper._record_binding_blocker(field):
+            action.action, action.value, action.resolution_source = "ask_user", "", "blocked"
+            action.user_confirmed = False
+            action.reason = action.review_hint = record_blocker
+            continue
+        observation_blocker = extraction_block_reason(field)
+        if observation_blocker:
+            action.action, action.value, action.resolution_source = "ask_user", "", "blocked"
+            action.user_confirmed = False
+            action.reason = action.review_hint = (observation_blocker +
+                "；这是页面读取问题，不是缺少你的资料。请先定向重新读取原题或核对控件归属，不需要猜答案")
+            continue
         if action.action == "ask_user" and action.resolution_source == "user":
             action.value = ""
             continue  # Missing personal precision cannot be supplied by a model.
@@ -179,6 +195,10 @@ def grounded_model_action(proposal: FillAction, field: PageField,
                           review_question=title or question_for_user(field), review_hint=reason, reason=reason)
 
     boundary = _hard_boundary(field)
+    if record_blocker := mapper._record_binding_blocker(field):
+        return ask(record_blocker)
+    if observation_blocker := extraction_block_reason(field):
+        return ask(observation_blocker + "；先重新读取原题，不将附近文字或模型猜测当作自动填写依据")
     if boundary:
         return ask(boundary)
     quote = proposal.question_evidence.strip()

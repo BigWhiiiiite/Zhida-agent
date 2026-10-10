@@ -5,6 +5,7 @@ export type ApplicationAnswerMemory = { id:string;question:string;normalized_que
 export type ResumeProfile = {
   name:string; english_name:string; gender:'男'|'女'|'其他'|'未识别'; birth_date:string; age:number|null;
   phone:string; email:string; country_region:string; nationality:string; ethnicity:string; political_status:string; marital_status:string; qq:string; wechat:string; location:string; hometown:string; hukou_location:string; address:string; website:string; github:string; linkedin:string;
+  height_cm?:number|null; weight_kg?:number|null; student_origin?:string; veteran_status?:''|'是'|'否'; study_continuity?:''|'是'|'否'; formal_employment_status?:''|'有'|'无';
   target_role:string; target_industries:string[]; target_cities:string[]; preferred_business_groups:string[]; interview_preferences:string[]; willing_to_relocate:string; campus_candidate_type:string; available_date:string; internship_duration:string;
   days_per_week:string; expected_salary:string; remote_preference:string; summary:string;
   education:Education[]; internships:Experience[]; projects:Project[]; skills:string[]; languages:string[]; certificates:string[]; awards:string[]; application_answers:Record<string,string>; application_answer_memory:ApplicationAnswerMemory[];
@@ -17,18 +18,38 @@ export type ResumeRecord = { id:string; filename:string; label:string; profile:R
 export type ResumeFactTargets = { resume_id:string;revision:string;records:{record_key:string;section:'education'|'internships'|'projects';label:string;attributes:{key:string;label:string;value:string}[]}[];warnings:string[] }
 export type ConfirmedResumeFact = { revision:string;record_key:string;attribute:string;value:string;confirmed:true }
 export type Conflict = { id:string; field_path:string; current_value:unknown; incoming_value:unknown; resume_id:string; resume_label:string; status:string; resolution:unknown; created_at:string }
+export type CascadeObservation = {
+  control_kind:'cascade';read_only:true;scope:'owned_current_visible_layers';options_capture:'dependent';
+  layers:{visible_layer_index:number;declared_level:number|null;visible_option_count:number;truncated:boolean;
+    options:{text:string;text_truncated:boolean;disabled:boolean;branch:boolean}[]}[];
+  observed_layer_count:number;truncated:boolean;complete:false;limitations:string[];
+}
 export type PageField = {
+  question_candidates?:{text:string;source:string;owned:boolean}[];
+  required_evidence?:string[];options_capture?:string;
+  cascade_observation?:CascadeObservation|null;
+  constraints?:{input_type:string;input_mode:string;pattern:string;min_length:number|null;max_length:number|null;minimum:string;maximum:string;step:string};
+  observation?:{version:number;question_status:'verified'|'unverified'|'missing'|'ambiguous';options_status:'not_applicable'|'native_complete'|'group_complete'|'observed_subset'|'unavailable'|'deferred'|'dependent'|'calendar';required_status:'required'|'not_marked';required_evidence:string[];record_status:'not_applicable'|'container_observed'|'unresolved'|'ambiguous';issues:string[]}|null;
   date_precision?:''|'date'|'month';
+  control_kind?:string; control_evidence?:string;
   region_picker?:boolean;region_value_path?:string;
+  knowledge_block_reason?:string;
   selector:string; label:string; question_text:string; label_source:string; context:string; help_text:string; nearby_labels:string[]; section_path:string[]; recognition_confidence:number; placeholder:string; ordinal:number; name:string; field_type:string; required:boolean; options:string[];
   current_value:string; accept:string; role:string; group_label:string; option_label:string;
   option_value:string; multiple:boolean; readonly:boolean; autocomplete:string; section:string;
   semantic_key:string; entity_scope:string; field_signature:string; signature_rank:number; container_key:string; record_keys?:string[]; control_group_key:string; expected_input:string; recognition_evidence:string;
 }
 export type SiteRoute = { adapter:string;label:string;matched_by:'host'|'dom'|'fallback';evidence:string[];tools:string[];note:string }
-export type BrowserSnapshot = { session_id:string; url:string; title:string; recognition_profile:string; site_route:SiteRoute; fields:PageField[] }
+export type FormExtractionReport = {version:number;scope:'current_visible_document';capture_status:'observed'|'partial'|'unknown';observed_controls:number;captured_controls:number;intentionally_excluded_controls:number;unmapped_controls:number;question_count:number;verified_questions:number;unclear_questions:number;options_pending_questions:number;ambiguous_record_questions:number;embedded_regions:number;unread_shadow_regions:number;pending_sections:string[];limitations:string[];issues:{label:string;reason:string;selector:string}[]}
+export type BrowserSnapshot = { session_id:string; url:string; title:string; browser_engine?:'safari'|'chromium'; recognition_profile:string; site_route:SiteRoute; fields:PageField[];extraction_report?:FormExtractionReport|null }
+export type ObservationConsent = {enabled:boolean;context_token:string}
+export type ExtractionAuditRequest = {context_token:string;use_model:boolean;inspect_controls:boolean;include_images:boolean}
+export type ExtractionAuditReview = {question_id:string;interpretation:string;control_kind:string;verdict:'clear'|'needs_observation'|'conflict';issue:string;next_observation:string;evidence:string[]}
+export type ExtractionAuditQuestion = {question_id:string;title:string;section_path:string[];selectors:string[];control_kind:string;required_status:string;options_status:string;record_status:string;observed_options:string[];issues:string[];model_review:ExtractionAuditReview|null}
+export type ExtractionAuditResult = {session_id:string;read_only:true;scope:'current_visible_document';model_status:'complete'|'partial'|'unavailable'|'not_requested';model_name:string;total_questions:number;model_reviewed_questions:number;model_batches:number;observations_requested:number;observations_received:number;images_supplied:number;input_manifest:Record<string,unknown>;coverage:FormExtractionReport;limitations:string[];questions:ExtractionAuditQuestion[]}
+export type PageRegionObservation = {selector:string;scope:string;accessibility_source:string;accessibility:string;context:Record<string,unknown>;image_data_url:string;limitations:string[];read_only:boolean;privacy_note:string}
 export type ApplicationTarget = { company:string;job_title:string;city:string;recruitment_cycle:string;source_url:string }
-export type NavigationCandidate = { id:string;label:string;url:string;kind:'browse_jobs'|'search_jobs'|'open_job';matches_target:boolean }
+export type NavigationCandidate = { id:string;label:string;url:string;kind:'browse_jobs'|'search_jobs'|'open_job';matches_target:boolean;entry_scope?:'navigation'|'organization';requires_user_choice?:boolean }
 export type ChatConversationSummary = { id:string;title:string;created_at:string;updated_at:string }
 export type ChatMessage = { id:string;role:'user'|'assistant';content:string;created_at:string;image_names:string[] }
 export type ChatTaskDraft = { company:string;job_title:string;city:string;recruitment_cycle:string;url:string;intent:'apply'|'recommend'|'profile'|'clarify';summary:string;warnings:string[];links:{url:string;source:'text'|'qr'|'image';verified:boolean}[];needs_confirmation:boolean }
@@ -56,7 +77,8 @@ export type FormReviewResult = { snapshot:BrowserSnapshot;plan:FormPlan;comparis
 export type AutofillPhaseResult = { phase:'rules'|'model';review:FormReviewResult;execution:ExecutionResult }
 export type ApplicationAssistRequest = { resume_id:string;allow_site_parse:boolean;use_model:boolean;max_rounds:number;defer_government_id?:boolean;deferred_fields?:PageField[] }
 export type ApplicationRecordCoverage = {kind:'education'|'internships'|'projects';label:string;source_total:number;website_records:number;matched_records:number;missing_names:string[];ambiguous:boolean;can_expand:boolean}
-export type ApplicationAssistResult = { status:'ready_for_review'|'needs_user'|'blocked'|'partial';message:string;snapshot:BrowserSnapshot;review:FormReviewResult|null;pre_submit:PreSubmitCheck|null;events:{kind:string;message:string;completed:number;failed:number;issues?:{label:string;message:string}[]}[];rounds:number;record_coverage?:ApplicationRecordCoverage[] }
+export type ApplicationAssistResult = { status:'ready_for_review'|'needs_user'|'blocked'|'partial';message:string;snapshot:BrowserSnapshot;review:FormReviewResult|null;pre_submit:PreSubmitCheck|null;events:{kind:string;message:string;completed:number;failed:number;issues?:{label:string;message:string}[]}[];rounds:number;model_calls?:number;record_coverage?:ApplicationRecordCoverage[] }
+export type ApplicationAssistProgress = {run_id:string;status:'running'|'finished'|'interrupted';phase:string;message:string;events:ApplicationAssistResult['events'];result:ApplicationAssistResult|null;cancel_requested:boolean}
 export type NativeResumeImportResult = { snapshot:BrowserSnapshot;uploaded_file:string;trigger_clicked:boolean;trigger_label:string;changed_fields:number;status:'parsed'|'uploaded'|'needs_user_action';message:string }
 export type RequiredFieldIssue = { selector:string; label:string; field_type:string }
 export type PreSubmitCheck = { url:string; ready:boolean; required_total:number; filled_count:number; required_missing:RequiredFieldIssue[]; validation_errors:string[]; human_challenges:string[]; file_uploads:string[]; submit_labels:string[] }

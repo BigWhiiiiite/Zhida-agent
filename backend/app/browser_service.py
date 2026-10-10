@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import logging
 import mimetypes
 import os
 import re
 import socket
+import sys
 import time
 import unicodedata
 from pathlib import Path
@@ -28,6 +30,7 @@ from .ats_adapters import (continue_application, create_account, fill_registrati
 from .browser_models import (ActionResult, BrowserSnapshot, ExecutePlanRequest, ExecutionResult,
                              NativeResumeImportResult, PageField, PreSubmitCheck, RequiredFieldIssue)
 from .field_semantics import enrich_fields
+from .option_vocabulary import OPTION_ALIASES
 from .job_navigation import execute_navigation, choose_candidate, workflow_fingerprint
 from .target_identity import target_identity_blocker
 from .autohome_fields import refine_autohome_fields
@@ -37,10 +40,30 @@ from .autohome_attachment import (inspect_autohome_attachment,
                                  confirm_autohome_resume_parse)
 from .recognition_diagnostics import inspect_recognition_structure, inspect_component_shapes
 from .phoenix_fields import refine_phoenix_fields, CHOICE_STATE_JS, PHOENIX_SELECT_VALUE_JS
+from .ant_resume_records import (refine_ant_resume_fields, inspect_ant_resume_records,
+                                inspect_ant_resume_rejections)
 from .phoenix_calendar import (calendar_ids, calendar_for, calendar_precision,
                                select_calendar_date)
 from .phoenix_region import select_region, read_open_region_path, audited_region_path
 from .region_facts import region_values_match
+from .browser_loading import wait_for_rendered_content
+from .external_browser import validate_external_url
+from .safari_browser import SafariContext
+from .form_field_policy import family_subject, formal_employment_only, is_declaration
+from .structured_controls import (classify_controls, preview_calendar, preview_cascade,
+                                  select_ant_calendar, select_ant_cascade)
+from .execution_safety import ExecutionTargetChanged as _ExecutionTargetChanged, execution_identity_changes
+from .form_observation import (annotate_fields, build_report, extraction_block_reason,
+                               merge_observed_metadata, refresh_report)
+
+
+def configured_browser_engine() -> str:
+    engine = os.getenv("APP_BROWSER_ENGINE", "auto").strip().lower()
+    if engine == "auto":
+        return "safari" if sys.platform == "darwin" else "chromium"
+    if engine not in {"safari", "chromium"}:
+        raise ValueError("APP_BROWSER_ENGINE 只支持 auto、safari 或 chromium")
+    return engine
 
 
 SENSITIVE_FIELD_HINTS = {
@@ -51,14 +74,6 @@ SENSITIVE_FIELD_HINTS = {
     "身份证", "证件号码", "证件号", "护照号码", "护照号", "实名认证", "national id", "id number", "passport number",
     "emergency contact", "next of kin", "guardian", "referee", "recommender",
     "紧急联系人", "紧急联络人", "家属联系人", "监护人", "推荐人", "证明人",
-}
-
-# Legal acknowledgement is not a profile fact. Even a forged/old
-# user_confirmed flag must not turn it into an automated browser action.
-LEGAL_ACKNOWLEDGEMENT_HINTS = {
-    "承诺", "声明", "真实可信", "真实性", "我保证", "法律责任", "协议", "条款", "隐私",
-    "consent", "privacy", "terms", "legal", "declaration", "attest", "certify",
-    "acknowledge", "undertaking",
 }
 
 MANUAL_CONFIRM_FIELD_HINTS = {
@@ -77,12 +92,6 @@ UNHELPFUL_FIELD_LABEL = re.compile(
 OPAQUE_FIELD_NAME = re.compile(
     r"^(?:field|question|input|select|item|value|answer)?[-_.\[\]0-9a-f]{5,}$",
     re.I,
-)
-OPTION_ALIASES = (
-    {"男", "male", "man"}, {"女", "female", "woman"},
-    {"中国", "中国大陆", "中华人民共和国", "china", "mainlandchina", "chn"},
-    {"远程", "线上", "远程面试", "线上面试", "remote", "online"},
-    {"英语", "英文", "english"}, {"普通话", "中文", "汉语", "mandarin", "chinese"},
 )
 SAFE_RESUME_PARSE_LABEL = re.compile(
     r"^(?:开始)?(?:解析简历|简历解析|智能解析|自动解析|上传并解析|导入简历|从简历导入|"
@@ -116,10 +125,6 @@ NATIVE_WRITE_IDENTITIES = r"""selectors => Object.fromEntries(selectors.map(sele
     section: section ? [section.tagName, section.id, caption(section.querySelector('legend,h1,h2,h3,h4,[role="heading"]'))] : [],
   }];
 }))"""
-
-
-class _ExecutionTargetChanged(ValueError):
-    """An observed target change must stop the batch, not skip one action."""
 
 
 def _normalized_option(value: str) -> str:
@@ -267,7 +272,7 @@ def _finalize_field_metadata(items: list[dict[str, object]]) -> None:
         item["question_text"] = label
         item["label_source"] = source
         default_confidence = {
-            "explicit": .98, "aria-labelledby": .96, "nearby": .92, "aria": .86,
+            "explicit": .98, "aria-labelledby": .96, "nearby": .6, "aria": .86,
             "container-owned": .95,
             "attribute": .78, "context": .72, "placeholder": .62, "name": .45,
             "generated": .1, "unknown": .1,
@@ -277,6 +282,9 @@ def _finalize_field_metadata(items: list[dict[str, object]]) -> None:
             confidence = float(raw_confidence) if raw_confidence not in (None, "") else default_confidence
         except (TypeError, ValueError):
             confidence = default_confidence
+        # Familiar wording does not prove ownership of an adjacent control.
+        if source not in {"explicit", "aria-labelledby", "container-owned", "aria"}:
+            confidence = min(confidence, default_confidence)
         item["recognition_confidence"] = max(0, min(1, confidence))
 
 
@@ -321,7 +329,7 @@ def _finalize_choice_metadata(items: list[dict[str, object]]) -> None:
         key = _clean_metadata(item.get("control_group_key"), 500)
         if not key:
             name = _clean_metadata(item.get("name"), 500)
-            key = f"name:{name}" if name else ""
+            key = f"{item.get('field_type')}:{item.get('container_key', '')}:name:{name}" if name else ""
         if key:
             groups.setdefault(key, []).append(item)
 
@@ -340,10 +348,24 @@ def _finalize_choice_metadata(items: list[dict[str, object]]) -> None:
         candidates = [
             value
             for item in group
-            for value in (item.get("group_label"), item.get("context"), item.get("section"))
+            for value in (item.get("group_label"), item.get("question_text"), item.get("context"))
         ]
         prompt = ""
+        if len(group) == 1 and group[0].get('field_type') == 'checkbox':
+            item = group[0]
+            question = _clean_metadata(item.get('question_text'), 500)
+            exact_owned = (item.get('label_source') in {'explicit', 'aria-labelledby', 'container-owned', 'aria'}
+                           and any(evidence.get('owned') and
+                                   _clean_metadata(evidence.get('text'), 500).casefold() == question.casefold()
+                                   for evidence in item.get('question_candidates', [])))
+            # A standalone attestation's statement is both its caption and its
+            # single option. Preserve only an exact, independently owned local
+            # statement; execution still denies every declaration via policy.
+            if question and exact_owned and is_declaration(PageField.model_validate(item)):
+                prompt = question
         for candidate in candidates:
+            if prompt:
+                break
             cleaned = _strip_choice_suffix(str(candidate or ""), options)
             if (_useful_field_label(cleaned) and not _choice_only_text(cleaned, options)
                     and len(cleaned) > 1):
@@ -363,10 +385,11 @@ def _finalize_choice_metadata(items: list[dict[str, object]]) -> None:
             item["question_text"] = prompt
             item["label"] = prompt
             if not prompt.startswith("未识别的"):
-                if not (item.get("label_source") in {"explicit", "aria-labelledby"}
+                if not (item.get("label_source") in {"explicit", "aria-labelledby", "container-owned", "aria"}
                         and previous_question == prompt):
                     item["label_source"] = "nearby"
-                item["recognition_confidence"] = max(float(item.get("recognition_confidence") or 0), .92)
+                if item["label_source"] == "nearby":
+                    item["recognition_confidence"] = min(float(item.get("recognition_confidence") or .6), .6)
             item["options"] = options
 
 
@@ -386,6 +409,14 @@ def _changed_field_count(before: BrowserSnapshot, after: BrowserSnapshot) -> int
     )
 
 
+class NavigationNoProgressError(ValueError):
+    """An attempted safe navigation stopped; this is not a lost browser session."""
+
+    def __init__(self, message: str, workflow: ApplicationWorkflowState):
+        super().__init__(message)
+        self.workflow = workflow
+
+
 class BrowserDemoService:
     def __init__(self) -> None:
         self.playwright: Playwright | None = None
@@ -396,6 +427,7 @@ class BrowserDemoService:
         self.target = ApplicationTarget()
         self._stalled_navigation: set[str] = set()
         self._option_probe_shapes: dict[str, list[dict]] = {}
+        self._keep_safari_window = False
 
     @staticmethod
     def profile_directory(user_id: str) -> Path:
@@ -416,21 +448,89 @@ class BrowserDemoService:
             raise ValueError("请输入完整的 http:// 或 https:// 招聘页面地址")
         if parsed.username or parsed.password:
             raise ValueError("URL 中不能包含用户名或密码")
+        host = parsed.hostname.lower().rstrip(".")
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("当前地址是本机页面，不是招聘官网。请在职达打开的 Safari 窗口中切回招聘网站标签页，再连接")
+        # Apply the same public-domain syntax/port policy as ordinary opening.
+        # DNS is still checked for automation; opening a normal window is not
+        # permission to read/fill a redirected local or private destination.
+        value = validate_external_url(url)
         try:
-            addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+            addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                           type=socket.SOCK_STREAM)
+            if not addresses:
+                raise ValueError(f"招聘域名 {host} 没有返回可验证的地址，未连接自动填写")
             for item in addresses:
                 ip = ipaddress.ip_address(item[4][0])
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                    raise ValueError("Demo 只允许访问公开招聘网站")
+                if not ip.is_global or ip.is_multicast:
+                    if ip.version == 4 and ip in ipaddress.ip_network("198.18.0.0/15"):
+                        reason = "测试网段地址，可能是代理的 Fake-IP 占位地址"
+                        action = "请检查代理的 DNS/Fake-IP 设置，对该招聘域名使用真实 DNS 后重试"
+                    else:
+                        reason = "本机、内网或保留地址"
+                        action = "请核对 Safari 地址栏是否仍为招聘官网；若是，请把此提示和网址发给我排查"
+                    raise ValueError(f"招聘域名 {host} 解析到了{reason}。为保护本机数据，未连接自动填写。{action}")
         except socket.gaierror as exc:
-            raise ValueError("无法解析这个网站地址") from exc
-        return url.strip()
+            raise ValueError(f"职达暂时无法解析招聘域名 {host}。浏览器能打开不代表后端 DNS 一定可用；请检查网络或代理后重试") from exc
+        return value
 
     async def start(self, url: str, user_id: str = "local",
-                    target: ApplicationTarget | None = None) -> BrowserSnapshot:
+                    target: ApplicationTarget | None = None, safari_page=None) -> BrowserSnapshot:
         url = self._validate_url(url)
         await self.close()
         self.target = target.model_copy(deep=True) if target else ApplicationTarget()
+        engine = configured_browser_engine()
+        if engine == "safari":
+            phase = "launch"
+            try:
+                if sys.platform != "darwin":
+                    raise RuntimeError("Safari 模式仅支持 macOS，请设置 APP_BROWSER_ENGINE=chromium")
+                if self._enabled("APP_BROWSER_HEADLESS", False):
+                    raise ValueError("Safari 普通窗口不支持无界面模式，请关闭 APP_BROWSER_HEADLESS")
+                self.context = SafariContext()
+                if safari_page is not None:
+                    self.context = safari_page.context
+                    self.page = safari_page
+                    self._keep_safari_window = True
+                    await self.page.ensure_available()
+                else:
+                    self.page = await self.context.new_page(url)
+                self.session_id = str(uuid4())
+                phase = "current_url_validation"
+                try:
+                    self._validate_url(await self.page.read_url())
+                except ValueError as exc:
+                    raise ValueError("检查职达绑定的 Safari 招聘页时失败：" + str(exc)) from exc
+                self.page.url_validator = self._validate_url
+                phase = "automation_connection"
+                await self.page.wait_for_load_state("domcontentloaded", timeout=60000)
+                # A reused window may now be at login, job detail or an application.
+                # Observe its real URL, never navigate it back to the initial homepage.
+                phase = "current_url_validation"
+                try:
+                    self._validate_url(self.page.url)
+                except ValueError as exc:
+                    raise ValueError("检查当前 Safari 标签页时失败：" + str(exc)) from exc
+                phase = "rendered_content"
+                await wait_for_rendered_content(self.page)
+                phase = "snapshot"
+                return await self.snapshot()
+            except Exception as exc:
+                retained = bool(self.context and self.context.pages)
+                if retained and not self._keep_safari_window:
+                    # Connection errors must not erase the user's opened site.
+                    # Drop only our handles; no active filling session remains.
+                    self.context.release_windows()
+                await self.close()
+                logging.getLogger(__name__).warning(
+                    "browser_start_failed engine=safari phase=%s error_type=%s window_retained=%s",
+                    phase, type(exc).__name__, retained,
+                )
+                # No silent fallback that unexpectedly opens Chrome.
+                if retained:
+                    raise RuntimeError("Safari 招聘窗口已保留，但自动识别未连接；没有执行填写。"
+                                       "你可以先手动浏览，或使用‘直接打开招聘网站’。连接原因：" + str(exc)) from exc
+                raise
         self.playwright = await async_playwright().start()
         try:
             channel = os.getenv("APP_BROWSER_CHANNEL", "chrome")
@@ -461,6 +561,7 @@ class BrowserDemoService:
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await self.page.wait_for_timeout(int(field_profile_for_url(url)["load_delay_ms"]))
+            await wait_for_rendered_content(self.page)
             return await self.snapshot()
         except Exception:
             await self.close()
@@ -479,6 +580,8 @@ class BrowserDemoService:
 
     async def workflow_state(self, session_id: str) -> ApplicationWorkflowState:
         page = self._require(session_id)
+        if isinstance(self.context, SafariContext):
+            await page.refresh()
         state = await inspect_application_page(page, session_id, self.target)
         conflict = target_identity_blocker(state)
         if conflict:
@@ -547,7 +650,9 @@ class BrowserDemoService:
                 after = await self.workflow_state(session_id)
         if request.intent != "refresh" and workflow_fingerprint(before) == workflow_fingerprint(after):
             self._stalled_navigation.add(operation)
-            raise ValueError("已尝试操作，但未观察到网址、阶段、岗位或候选列表变化；未确认流程前进，已停止自动重复")
+            message = "已尝试操作，但未观察到网址、阶段、岗位或候选列表变化；未确认流程前进，已停止自动重复"
+            after.navigation_blocker = message
+            raise NavigationNoProgressError(message, after)
         return after
 
     async def fill_registration(self, session_id: str,
@@ -581,22 +686,61 @@ class BrowserDemoService:
         await request_verification_code(page, request.channel, value)
         return await inspect_application_page(page, session_id, self.target)
 
-    async def snapshot(self, *, probe_options: bool = True) -> BrowserSnapshot:
+    async def snapshot(self, *, probe_options: bool = False) -> BrowserSnapshot:
         if not self.page or not self.session_id:
             raise LookupError("浏览器会话尚未启动")
+        document = await self.page.evaluate_handle('() => document')
+        try:
+            result = await self._snapshot_bound_document(probe_options=probe_options)
+            if not await document.evaluate('original => original === document'):
+                raise ValueError('读取控件期间网页已重新加载；旧表单信息已丢弃，请重新读取当前页面')
+            return result
+        finally:
+            try:
+                await document.dispose()
+            except Exception:
+                pass
+
+    async def _snapshot_bound_document(self, *, probe_options: bool = False) -> BrowserSnapshot:
+        """Capture questions without UI actions unless a preview is explicit.
+
+        Initial connection, synchronization and execution readbacks must not
+        expand unrelated dropdowns (including account/declaration widgets).
+        Missing options remain explicit; bounded observation tools or the
+        executor inspect a proven field when it is actually needed.
+        """
+        if not self.page or not self.session_id:
+            raise LookupError("浏览器会话尚未启动")
+        if isinstance(self.context, SafariContext):
+            await self.page.refresh()
+        document_url = self.page.url
         site_route = await route_for_page(self.page)
+        await self._assert_snapshot_document(document_url, phase="site_routing")
         policy = policy_for(site_route.adapter)
         recognition_profile = policy.field_profile()
-        data = await self.page.evaluate("""
+        captured = await self.page.evaluate("""
         profile => {
           const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+          const captionCopy = node => {
+            const clone=node.cloneNode(true);
+            const originals=[...node.querySelectorAll('*')],copies=[...clone.querySelectorAll('*')];
+            originals.forEach((original,index)=>{
+              const style=getComputedStyle(original);
+              if (original.closest('[hidden],[aria-hidden="true"]') || style.display==='none' ||
+                  ['hidden','collapse'].includes(style.visibility)) copies[index]?.remove();
+            });
+            clone.querySelectorAll('input, select, textarea, option, button, script, style, svg, [hidden], [aria-hidden="true"], [role="option"], [role="radio"], [role="checkbox"]').forEach(item=>item.remove());
+            return clone;
+          };
+          const captionCache=new WeakMap();
           const labelText = node => {
             if (!node) return '';
-            const clone = node.cloneNode(true);
-            clone.querySelectorAll('input, select, textarea, option, button, script, style, svg, [hidden], [aria-hidden="true"], [role="option"], [role="radio"], [role="checkbox"]').forEach(item => item.remove());
-            return clean(clone.innerText || clone.textContent);
+            if (captionCache.has(node)) return captionCache.get(node);
+            const clone=captionCopy(node);
+            const result=clean(clone.innerText || clone.textContent);
+            captionCache.set(node,result); return result;
           };
-          const normalizeFieldText = value => clean(value).replace(/[＊*]+\s*$/g, '').trim();
+          const normalizeFieldText = value => clean(value).replace(/^[＊*]+\s*|[＊*]+\s*$/g, '').trim();
           const meaningfulFieldText = value => {
             const text = normalizeFieldText(value);
             return Boolean(text && text.length > 1 && !/^[+()\-.、。．\s\d/:：]+$/.test(text));
@@ -636,10 +780,18 @@ class BrowserDemoService:
             if (containerOwned) return containerOwned;
             return ranked[0] && ranked[0].score > -20 ? ranked[0] : {text: '', source: 'unknown', score: -1000};
           };
+          const questionEvidence = candidates => {
+            const evidence = candidates.map(item => ({text:normalizeFieldText(item.text).slice(0,500),
+              source:item.source, owned:['explicit','aria-labelledby','container-owned','aria'].includes(item.source)}))
+              .filter(item => meaningfulFieldText(item.text));
+            const distinct=[...new Map(evidence.map(item => [item.source+'|'+item.text,item])).values()];
+            return [...distinct.filter(item => item.owned).slice(0,8),
+                    ...distinct.filter(item => !item.owned).slice(0,4)];
+          };
           const placeholder = value => /^(select|select one|choose|choose one|please choose|请选择|请选择一项|暂未选择|未选择|点击选择|搜索并选择)[.\\s…]*$/i.test(clean(value));
           const customWrapperSelector = [
             ...(profile?.control_selectors || []),
-            '.ant-select-selector', '.arco-select-view', '.el-select__wrapper', '.ivu-select-selection',
+            '.ant-select-selector', '.ant-select-selection', '.ant-calendar-picker', '.ant-picker', '.ant-cascader-picker', '.ant-cascader', '.arco-select-view', '.el-select__wrapper', '.ivu-select-selection',
             '.semi-select', '.t-select__wrap', '[class*="select-selector"]',
             '[class*="select__selector"]', '[class*="select-view"]',
             '[class*="cascader-picker"]', '[class*="picker-input"]'
@@ -647,14 +799,36 @@ class BrowserDemoService:
           const customSelector = '[role="combobox"], [aria-haspopup="listbox"], ' + customWrapperSelector;
           const radioSelector = ['input[type="radio"]', '[role="radio"]', ...(profile?.radio_selectors || [])].join(', ');
           const controlSelector = 'input, select, textarea, [role="checkbox"], [role="combobox"], [aria-haspopup="listbox"], ' + radioSelector;
+          const renderedCache = new WeakMap();
           const rendered = el => {
             if (!el || el.closest('[hidden], [aria-hidden="true"]')) return false;
+            if (renderedCache.has(el)) return renderedCache.get(el);
             for (let node = el; node && node !== document; node = node.parentElement) {
               const style = getComputedStyle(node);
-              if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility)) return false;
+              if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility)) {
+                renderedCache.set(el, false); return false;
+              }
             }
-            return el.getClientRects().length > 0;
+            const result = el.getClientRects().length > 0;
+            renderedCache.set(el, result); return result;
           };
+          // Upload widgets intentionally hide their native file input. It still
+          // belongs to the visible local widget and must count when proving a
+          // question owner; otherwise its title competes with upload tips.
+          const renderedControl = el => rendered(canonical(el)) ||
+            (el.type === 'file' && !el.closest('[hidden],[aria-hidden="true"]') && rendered(el.parentElement));
+          const captionSelector = 'label,legend,[class*="label" i],[class*="caption" i],[class*="title" i]';
+          const helperSelector = 'small,.help,.hint,.tip,.description,[class*="help" i],[class*="error" i],[class*="tip" i]';
+          const ownedCaptionCache=new WeakMap();
+          const ownedCaptionText = node => {
+            if (!node) return '';
+            if (ownedCaptionCache.has(node)) return ownedCaptionCache.get(node);
+            const clone=captionCopy(node);
+            clone.querySelectorAll(helperSelector+',header,nav,[role="navigation"]').forEach(item=>item.remove());
+            const result=clean(clone.innerText || clone.textContent);
+            ownedCaptionCache.set(node,result); return result;
+          };
+          const questionTitleSelector = 'legend,.application-label,.question-label,[data-qa="question-label"],.ant-form-item-label,.el-form-item__label,.arco-form-label-item,[class*="question-title"],[class*="questionTitle"],[class*="form-title"],.resume-form-title';
           // Deeply wrapped controls often have no label[for]. Find the smallest
           // owner with exactly one logical control and its own distinct caption.
           // A placeholder, dropdown option, sibling question or section heading
@@ -665,30 +839,44 @@ class BrowserDemoService:
             for (let depth = 0; node && depth < 14 && node !== document.body; depth += 1, node = node.parentElement) {
               if (node.matches('header, nav, [role="navigation"], [role="search"]')) return null;
               const logical = [...new Set([...node.querySelectorAll(controlSelector + ', ' + customSelector)]
-                .filter(item => item.type !== 'hidden' && !item.disabled && rendered(canonical(item)))
+                .filter(item => item.type !== 'hidden' && !item.disabled && renderedControl(item))
                 .map(canonical))];
               if (logical.length !== 1 || logical[0] !== canonical(el)) continue;
               const captions = [...node.children].filter(child => child !== el && !child.contains(el) &&
-                !child.querySelector(controlSelector + ', ' + customSelector) && rendered(child))
-                .map(child => ({node: child, text: normalizeFieldText(labelText(child))}))
+                !child.matches('header,nav,[role="navigation"],'+helperSelector) &&
+                !child.querySelector(controlSelector + ', ' + customSelector) && rendered(child) &&
+                (child.matches(captionSelector) || child.querySelector(captionSelector)))
+                .map(child => ({node: child, text: normalizeFieldText(ownedCaptionText(child))}))
                 .filter(item => meaningfulFieldText(item.text) && item.text.length <= 220 && !excluded.test(item.text));
               const distinct = [...new Map(captions.map(item => [normalizedToken(item.text), item])).values()];
               if (distinct.length !== 1) continue;
               const caption = distinct[0];
               if (!caption.node.matches('label, legend, [class*="label" i], [class*="caption" i], [class*="title" i]') &&
                   !caption.node.querySelector('label, legend, [class*="label" i], [class*="caption" i], [class*="title" i]')) continue;
-              return {node, caption: caption.text};
+              return {node, caption: caption.text, captionNode: caption.node};
             }
             return null;
           };
-          const fieldContainer = el => el.closest('.form-item.form-item--phoenix') || el.closest([
+          // Ant option labels contain "form-item" / "checkbox-group-item".
+          // They own an answer, not the entire question. Substring selectors
+          // must never stop at such a label or split one question into options.
+          const choiceOptionWrapper = node => node?.matches('input,[role="radio"],[role="checkbox"],label,.ant-radio,.ant-checkbox,.ant-radio-wrapper,.ant-checkbox-wrapper,[class*="checkbox-group-item"],[class*="radio-group-item"]');
+          const fieldContainerSelector = [
             ...(profile?.question_containers || []),
             '.application-question', '.application-additional', 'fieldset', '[role="radiogroup"]', '[role="group"]',
             '.form-field', '.field', '.ant-form-item', '.arco-form-item', '.el-form-item',
             '.form-group', '.atsx-form-item', '[class*="form-item"]', '[class*="formItem"]',
             '[class*="form_item"]', '[class*="question-item"]', '[class*="questionItem"]',
             '[data-qa*="question"]', '[data-field]'
-          ].join(', '));
+          ].join(', ');
+          const fieldContainer = el => {
+            const phoenix = el.closest('.form-item.form-item--phoenix');
+            if (phoenix) return phoenix;
+            for (let node=el; node && node!==document.body; node=node.parentElement) {
+              if (!choiceOptionWrapper(node) && node.matches(fieldContainerSelector)) return node;
+            }
+            return null;
+          };
           const semanticContainer = el => {
             const owned = ownedQuestion(el);
             if (owned) return owned.node;
@@ -790,6 +978,10 @@ class BrowserDemoService:
             }
             return values.slice(0, 8);
           };
+          const knownSectionTitles = new Set(['个人信息','个人基本信息','基本信息','教育经历','教育背景',
+            '实习经历','实习经验','学生实践经验','项目经历','项目经验','语言能力','IT技能','技能',
+            '工作经历','正式工作经历','个人荣誉','获奖情况','证书','简历附件','附件',
+            '家庭成员及社会关系','其他','其他信息','诚信声明']);
           const sectionPathFor = el => {
             const values = [];
             const push = value => {
@@ -801,6 +993,22 @@ class BrowserDemoService:
               'legend', 'h1', 'h2', 'h3', 'h4', 'h5', '[role="heading"]',
               '[class*="section-title"]', '[class*="sectionTitle"]'
             ].join(', ');
+            // An Ant resume section has its own direct header before its
+            // content. This is section evidence only, not a record identity.
+            const resumeSection = el.closest('.resume-tpl-wrap');
+            if (resumeSection && rendered(resumeSection)) {
+              const sectionCaption = child => normalizeFieldText(labelText(child))
+                .replace(/\s*[+＋]?\s*添加\s*$/, '').trim();
+              const titles = [...resumeSection.children].filter(child =>
+                rendered(child) && !child.contains(el) && !child.matches('nav,[role="navigation"],'+helperSelector) &&
+                !child.querySelector(controlSelector+', '+customSelector) &&
+                (child.matches('.resume-tpl-title,.resume-tpl-header,.resume-tpl-head') ||
+                 knownSectionTitles.has(sectionCaption(child))));
+              const captions = titles.map(sectionCaption)
+                .filter(text=>meaningfulFieldText(text) && text.length<=160);
+              if (new Set(captions).size===1 && titles.every(title=>
+                  Boolean(title.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING))) push(captions[0]);
+            }
             let node = semanticContainer(el) || el.parentElement;
             for (let depth = 0; node && depth < 9 && node !== document.body; depth += 1, node = node.parentElement) {
               const directHeading = [...node.children].find(child => child.matches?.(sectionSelector));
@@ -832,28 +1040,117 @@ class BrowserDemoService:
             ? radioSelector
             : 'input[type="checkbox"], [role="checkbox"]';
           const visibleChoices = (root, fieldType) => [...(root?.querySelectorAll(choiceSelectorFor(fieldType)) || [])]
-            .filter(item => !item.disabled && (item.getClientRects().length || item.closest('label')?.getClientRects().length || item.parentElement?.getClientRects().length));
+            .filter(item => !item.disabled && !item.closest('[hidden],[aria-hidden="true"]') &&
+              (rendered(item) || rendered(item.closest('label')) || rendered(item.parentElement)));
           const commonAncestor = nodes => {
             let candidate = nodes[0] || null;
             while (candidate && !nodes.every(node => candidate.contains(node))) candidate = candidate.parentElement;
             return candidate;
           };
+          const checkboxGroupSelector = '[role="group"],.ant-checkbox-group,.arco-checkbox-group,.el-checkbox-group,.ivu-checkbox-group,[class*="checkbox-group"]';
+          const radioGroupSelector = '.phoenix-radio-group,.ant-radio-group,.arco-radio-group,.el-radio-group,.ivu-radio-group,[role="radiogroup"],[role="group"]';
+          const declaredChoiceGroup = (target, fieldType) => {
+            const selector=fieldType==='radio' ? radioGroupSelector : checkboxGroupSelector;
+            for (let node=target.parentElement; node && node!==document.body; node=node.parentElement) {
+              if (!choiceOptionWrapper(node) && node.matches(selector)) return node;
+              if (node.matches('form,header,nav,[role="navigation"]')) break;
+            }
+            return null;
+          };
+          const onlyChoiceMembers = (root, members) => {
+            const expected = new Set(members.map(canonical));
+            const logical = [...new Set([...root.querySelectorAll(controlSelector+', '+customSelector)]
+              .filter(item=>item.type!=='hidden' && !item.disabled && renderedControl(item)).map(canonical))];
+            return logical.length===expected.size && logical.every(item=>expected.has(item));
+          };
+          const declarationText = /承诺|声明|真实可信|真实性|我保证|法律责任|协议|条款|隐私|consent|privacy|terms|legal|declaration|attest|certify|acknowledge|undertaking/i;
+          const singleChoiceStatement = el => {
+            const target = inputFor(el) || el;
+            let node = target.closest('label') || target.parentElement;
+            for (let depth=0; node && depth<5 && node!==document.body; depth++,node=node.parentElement) {
+              if (node.matches('header,nav,[role="navigation"]')) return null;
+              const logical = [...new Set([...node.querySelectorAll(controlSelector+', '+customSelector)]
+                .filter(item=>item.type!=='hidden' && !item.disabled && renderedControl(item)).map(canonical))];
+              if (logical.length!==1 || logical[0]!==canonical(el)) return null;
+              const parts = node.matches('label') ? [node] : [...node.children].filter(child=>
+                !child.contains(target) && !child.matches(helperSelector) &&
+                !child.querySelector(controlSelector+', '+customSelector) && rendered(child));
+              const captions = parts.map(part=>({node:part,text:normalizeFieldText(labelText(part))}))
+                .filter(part=>meaningfulFieldText(part.text) && part.text.length<=300 && declarationText.test(part.text));
+              const distinct = [...new Map(captions.map(part=>[normalizedToken(part.text),part])).values()];
+              if (distinct.length===1) return {node,caption:distinct[0].text,captionNode:distinct[0].node};
+            }
+            return null;
+          };
+          const boundedCheckboxMembers = (members, target) => {
+            const choices=members.filter(member=>!singleChoiceStatement(member));
+            if (!choices.includes(target)) return [];
+            const root=commonAncestor(choices);
+            if (!root || root===document.body || root===document.documentElement) return [];
+            const independentGroup=[...root.querySelectorAll(checkboxGroupSelector)]
+              .some(group=>!choiceOptionWrapper(group) && !group.contains(target) && visibleChoices(group,'checkbox').length);
+            const independentTitle=[...root.querySelectorAll(questionTitleSelector)]
+              .some(caption=>{
+                let owner=caption.parentElement;
+                while(owner && owner!==root && !visibleChoices(owner,'checkbox').length) owner=owner.parentElement;
+                return owner && owner!==root && !owner.contains(target) && visibleChoices(owner,'checkbox').length;
+              });
+            const owners=new Set(choices.map(member=>fieldContainer(member))
+              .filter(owner=>owner && owner.querySelector(questionTitleSelector)));
+            return independentGroup || independentTitle || owners.size>1 ? [] : choices;
+          };
           const choiceMembersFor = (el, fieldType) => {
             const input = inputFor(el);
             const target = input && (input.type || '').toLowerCase() === fieldType ? input : el;
-            if (target.name && target.matches(`input[type="${fieldType}"]`)) {
-              const scope = target.form || document;
-              const named = [...scope.querySelectorAll(`input[type="${fieldType}"][name="${CSS.escape(target.name)}"]`)]
-                .filter(item => !item.disabled);
-              if (named.length) return named;
+            if (fieldType==='checkbox' && singleChoiceStatement(el)) return [el];
+            const declared = declaredChoiceGroup(target,fieldType);
+            const fieldOwner=fieldContainer(target);
+            const local = declared || (fieldType!=='checkbox' || fieldOwner?.querySelector(questionTitleSelector) ? fieldOwner : null) || ownedQuestion(target)?.node ||
+              (fieldType==='radio' ? entityContainerFor(target) : null);
+            // A declared owned group outranks native name: components may
+            // omit names or reuse them across records, and an option's name
+            // must not truncate the observed group to a singleton.
+            const observedMembers=visibleChoices(declared,fieldType);
+            if (declared && observedMembers.length && !onlyChoiceMembers(declared,observedMembers)) return [el];
+            if (declared && fieldType==='radio') {
+              const names=observedMembers.map(member=>member.matches('input[type="radio"]') ? clean(member.name) : '');
+              if (names.some(Boolean) && new Set(names).size!==1) return [el];
             }
-            const declared = el.closest(fieldType === 'radio' ? '.phoenix-radio-group, [role="radiogroup"]' : '[role="group"]');
-            const declaredMembers = visibleChoices(declared, fieldType);
+            const declaredMembers = fieldType==='checkbox' ? boundedCheckboxMembers(observedMembers,target) : observedMembers;
             if (declaredMembers.length >= 2) return declaredMembers;
+            if (target.name && target.matches(`input[type="${fieldType}"]`)) {
+              // Repeated education rows may reuse a name. Prefer the owned
+              // question/record, not every similarly named input in the form.
+              // Equal checkbox names do not establish a shared question across
+              // the whole form. Radios retain native name grouping as fallback.
+              const scope = local || (fieldType==='radio' ? target.form || document : null);
+              let named = [...(scope?.querySelectorAll(`input[type="${fieldType}"][name="${CSS.escape(target.name)}"]`) || [])]
+                .filter(item => !item.disabled && (rendered(item) || rendered(item.closest('label')) || rendered(item.parentElement)));
+              if (fieldType==='checkbox') named=boundedCheckboxMembers(named,target);
+              if (named.length>=2 && scope && onlyChoiceMembers(commonAncestor(named)||scope,named)) return named;
+            }
             let node = el.parentElement;
             for (let depth = 0; node && depth < 9 && node !== document.body; depth += 1, node = node.parentElement) {
               const members = visibleChoices(node, fieldType);
-              if (members.length >= 2 && members.length <= 20) return members;
+              if (members.length >= 2 && members.length <= 20) {
+                const expected = new Set(members.map(canonical));
+                const logical = [...new Set([...node.querySelectorAll(controlSelector+', '+customSelector)]
+                  .filter(item=>item.type!=='hidden' && !item.disabled && renderedControl(item)).map(canonical))];
+                const independentGroup = [...node.querySelectorAll(fieldType==='radio' ? radioGroupSelector : checkboxGroupSelector)]
+                  .some(group=>!choiceOptionWrapper(group) && !group.contains(el) && visibleChoices(group,fieldType).length);
+                const independentTitle = [...node.querySelectorAll(questionTitleSelector)]
+                  .some(caption=>{
+                    let owner=caption.parentElement;
+                    while(owner && owner!==node && !visibleChoices(owner,fieldType).length) owner=owner.parentElement;
+                    return owner && owner!==node && !owner.contains(el) && visibleChoices(owner,fieldType).length;
+                  });
+                const owners = new Set(members.map(member=>fieldContainer(member))
+                  .filter(owner=>owner && owner.querySelector(questionTitleSelector)));
+                if (logical.length!==expected.size || !logical.every(item=>expected.has(item)) ||
+                    independentGroup || independentTitle || owners.size>1 || node.querySelector('header,nav,[role="navigation"]')) return [el];
+                return members;
+              }
+              if (node===local || node.matches('form,header,nav,[role="navigation"]')) break;
             }
             return [el];
           };
@@ -891,8 +1188,39 @@ class BrowserDemoService:
             return !remaining;
           };
           let choiceGroupSequence = 0;
+          const ownedChoiceQuestion = (group, members) => {
+            const expected = new Set(members.map(canonical));
+            let node = group;
+            for (let depth=0; node && depth<8 && node!==document.body; depth++,node=node.parentElement) {
+              const logical = [...new Set([...node.querySelectorAll(controlSelector+', '+customSelector)]
+                .filter(item => item.type!=='hidden' && !item.disabled &&
+                  (renderedControl(item)||rendered(item.closest('label'))||rendered(item.parentElement)))
+                .map(canonical))];
+              if (logical.length!==expected.size || !logical.every(item=>expected.has(item))) continue;
+              const captions = [...node.children].filter(child =>
+                !members.some(member=>child.contains(member)) && !child.querySelector(controlSelector+', '+customSelector) &&
+                !child.matches('header,nav,[role="navigation"],.resume-tpl-title,.resume-tpl-header,.resume-tpl-head,h1,h2,h3,h4,h5,[role="heading"],'+helperSelector) && rendered(child))
+                .map(child=>({node:child,text:normalizeFieldText(ownedCaptionText(child))}))
+                .filter(item=>meaningfulFieldText(item.text) && item.text.length<=220 &&
+                  !choiceOnlyText(item.text,members.map(member=>member.value||member.getAttribute('aria-label')||'')));
+              const distinct=[...new Map(captions.map(item=>[item.text,item])).values()];
+              if (distinct.length===1) return {node,caption:distinct[0].text,captionNode:distinct[0].node};
+            }
+            return null;
+          };
+          const choiceGroupCache = new WeakMap();
           const choiceGroupInfoFor = (el, fieldType) => {
             if (!['radio', 'checkbox'].includes(fieldType)) return null;
+            if (choiceGroupCache.has(el)) return choiceGroupCache.get(el);
+            const statement = fieldType==='checkbox' ? singleChoiceStatement(el) : null;
+            if (statement) {
+              const group=statement.node;
+              const marker=group.getAttribute('data-zhida-choice-group') || `zhida-choice-${Date.now()}-${choiceGroupSequence++}`;
+              group.setAttribute('data-zhida-choice-group',marker);
+              return {group,members:[el],options:[statement.caption],question:statement.caption,
+                source:'container-owned',key:marker,captionNode:statement.captionNode,
+                evidence:questionEvidence([{text:statement.caption,source:'container-owned'}]),statement:statement.caption};
+            }
             const members = choiceMembersFor(el, fieldType);
             let group = commonAncestor(members);
             if (!group || group === document || group === document.documentElement || group === document.body) {
@@ -902,6 +1230,11 @@ class BrowserDemoService:
               labelText(item.id ? document.querySelector(`label[for="${CSS.escape(item.id)}"]`) : null) ||
               labelText(item.closest('label')) || item.getAttribute('aria-label') || item.innerText || item.value
             )).filter(Boolean);
+            const ownedChoice = ownedChoiceQuestion(group, members);
+            const groupOwner = ownedChoice?.node || fieldContainer(group) || group;
+            const phoenixOwner = el.closest('.form-item.form-item--phoenix');
+            const phoenixOwnsGroup = phoenixOwner && [...phoenixOwner.querySelectorAll(controlSelector)]
+              .every(control=>members.some(member=>canonical(member)===canonical(control)));
             const questionSelector = [
               ...(profile?.label_selectors || []),
               'legend', '.application-label', '.question-label', '[data-qa="question-label"]',
@@ -911,12 +1244,18 @@ class BrowserDemoService:
               '[class*="question-title"]', '[data-testid*="question"]'
             ].join(', ');
             const candidates = [
-              {text: el.closest('.form-item.form-item--phoenix')?.querySelector(':scope > .form-item__title')?.innerText, source:'container-owned'},
+              {text:ownedChoice?.caption,source:'container-owned'},
+              {text: phoenixOwner?.querySelector(':scope > .form-item__title')?.innerText,
+               source:phoenixOwnsGroup ? 'container-owned' : 'nearby'},
               {text: labelledBy(group), source: 'aria-labelledby'},
               {text: group?.getAttribute('aria-label'), source: 'aria'},
-              ...[...(group?.querySelectorAll(questionSelector) || [])]
+              ...[...(groupOwner?.querySelectorAll(questionSelector) || [])]
                 .map(node => ({text: labelText(node), source:
-                  node.tagName === 'LEGEND' && node.parentElement === group ? 'explicit' : 'nearby'})),
+                  node.tagName === 'LEGEND' && node.parentElement === group ? 'explicit' :
+                  (fieldContainer(node.parentElement) === groupOwner &&
+                   [...groupOwner.querySelectorAll(controlSelector)].every(control=>members.some(member=>canonical(member)===canonical(control))) &&
+                   !node.querySelector(controlSelector) &&
+                   !members.some(member => node.contains(member)) ? 'container-owned' : 'nearby')})),
               ...nearbyLabelCandidates(group || el).map(text => ({text, source: 'nearby'})),
               {text: precedingLabel(group || el), source: 'preceding'}
             ];
@@ -931,13 +1270,21 @@ class BrowserDemoService:
             const cleanedCandidates = candidates.map(item => ({
               ...item, text: stripChoiceSuffix(item.text, options)
             })).filter(item => item.text && item.text.length <= 300 && !choiceOnlyText(item.text, options));
-            const bestQuestion = bestFieldText(cleanedCandidates, options);
+            // Unowned nearby text cannot become a checkbox question. A local
+            // group caption or explicit accessible title is required; a missing
+            // title is safer than borrowing a header or another question.
+            const bestQuestion = bestFieldText(cleanedCandidates.filter(item=>
+              ['container-owned','explicit','aria-labelledby','aria'].includes(item.source)), options);
             const question = bestQuestion.text;
             const marker = group ? (group.getAttribute('data-zhida-choice-group') ||
               `zhida-choice-${Date.now()}-${choiceGroupSequence++}`) : '';
             if (group && marker) group.setAttribute('data-zhida-choice-group', marker);
             if (group && question) group.setAttribute('data-zhida-choice-label', question);
-            return {group, members, options, question, source: bestQuestion.source, key: marker};
+            const result = {group, members, options, question, source: bestQuestion.source, key: marker,
+              captionNode:ownedChoice?.captionNode,
+              evidence:questionEvidence(cleanedCandidates)};
+            members.forEach(member=>choiceGroupCache.set(member,result));
+            return result;
           };
           const contextFor = el => {
             const preferred = semanticContainer(el);
@@ -956,13 +1303,22 @@ class BrowserDemoService:
             const target = input || el;
             const explicit = target.id ? document.querySelector(`label[for="${CSS.escape(target.id)}"]`) : null;
             const wrapping = target.closest('label') || el.closest('label');
+            const wrappingOwnsTarget = wrapping &&
+              [...new Set([...wrapping.querySelectorAll(controlSelector+', '+customSelector)].map(canonical))]
+                .every(control=>control===canonical(el));
             const question = semanticContainer(el);
             const questionLabel = question?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"]');
             const optionLabel = labelText(explicit) || labelText(wrapping);
             const groupLabel = clean(choiceInfo?.question || questionLabel?.innerText || nearbyLabel(el));
             const internalName = (target.getAttribute('name') || '').includes('[');
             if (choiceInfo?.question) {
-              return {text: clean(choiceInfo.question), source: choiceInfo.source || 'nearby', confidence: .96};
+              const ownedSource=['explicit','aria-labelledby','container-owned','aria'].includes(choiceInfo.source);
+              return {text: clean(choiceInfo.question), source: choiceInfo.source || 'nearby',
+                confidence:ownedSource ? .96 : .6, evidence:choiceInfo.evidence};
+            }
+            if (['radio','checkbox'].includes(fieldType)) {
+              return {text:fieldType==='radio' ? '未识别的单选题' : '未识别的复选题',
+                source:'generated',confidence:.1,evidence:choiceInfo?.evidence || []};
             }
             const owned = ownedQuestion(el);
             // ATS components often use a div instead of label[for]. Treat it
@@ -988,14 +1344,14 @@ class BrowserDemoService:
                 if (node === el || node.contains(el) || node.querySelector(controlSelector + ', ' + customSelector)) return false;
                 const owner = (node.parentElement && fieldContainer(node.parentElement)) || semanticContainer(node);
                 return owner === question;
-              }).map(node => normalizeFieldText(labelText(node)))
+              }).map(node => normalizeFieldText(ownedCaptionText(node)))
                 .filter(text => meaningfulFieldText(text) && text.length <= 300);
               const distinct = [...new Map(labels.map(text => [normalizedToken(text), text])).values()];
               return distinct.length === 1 ? distinct[0] : '';
             };
             const candidates = [
-              {text: labelText(explicit), source: 'explicit'},
-              {text: labelText(wrapping), source: 'explicit'},
+              {text: ownedCaptionText(explicit), source: 'explicit'},
+              {text: ownedCaptionText(wrapping), source: wrappingOwnsTarget ? 'explicit' : 'nearby'},
               {text: labelledBy(target) || labelledBy(el), source: 'aria-labelledby'},
               {text: owned?.caption || ownedContainerLabel(), source: 'container-owned'},
               {text: groupLabel || nearbyLabel(el), source: 'nearby'},
@@ -1010,19 +1366,30 @@ class BrowserDemoService:
             if ((internalName || ['file'].includes(target.type)) && groupLabel) {
               candidates.unshift({text: groupLabel, source: 'nearby'});
             }
-            const candidate = bestFieldText(candidates, choiceInfo?.options || []);
+            const titleCandidates = ['file','checkbox'].includes(fieldType) ? candidates.filter(item=>
+              ['explicit','aria-labelledby','container-owned','aria'].includes(item.source) &&
+              !/^(?:上传文件|选择文件|文件大小|upload file|choose file|file size)(?:$|[\s:：]|大小|不能|不应|不得)/i.test(normalizeFieldText(item.text))) : candidates;
+            const candidate = bestFieldText(titleCandidates, choiceInfo?.options || []);
+            if (!candidate.text && ['file','checkbox'].includes(fieldType)) {
+              // Keep this explicit gap through the legacy metadata finalizer;
+              // it must not replace a missing local caption with a help tip or
+              // a distant header from nearby_labels/context.
+              return {text:fieldType==='file' ? '未识别的附件题目' : '未识别的复选题',
+                source:'generated',confidence:.1,evidence:questionEvidence(candidates)};
+            }
             const confidence = candidate.source === 'container-owned' ? .96 :
               Math.max(.1, Math.min(.99, (candidate.score + 20) / 85));
-            return {text: candidate.text, source: candidate.source, confidence};
+            return {text: candidate.text, source: candidate.source, confidence,
+              evidence:questionEvidence(candidates)};
           };
           const groupLabelFor = (el, choiceInfo) => {
             if (choiceInfo?.question) return clean(choiceInfo.question);
             const group = semanticContainer(el);
             return clean(group?.querySelector('.application-label, legend, .question-label, [data-qa="question-label"], .ant-form-item-label, .arco-form-label-item, .el-form-item__label, [class*="form-label"], [class*="field-label"], [class*="formLabel"], [class*="fieldLabel"], [class*="questionTitle"]')?.innerText || nearbyLabel(el));
           };
-          const optionLabelFor = el => {
+          const optionLabelFor = (el, choiceInfo) => {
             const explicit = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
-            return clean(labelText(explicit) || labelText(el.closest('label')) || el.getAttribute('aria-label') || el.innerText || el.value);
+            return clean(labelText(explicit) || labelText(el.closest('label')) || el.getAttribute('aria-label') || el.innerText || choiceInfo?.statement || el.value);
           };
           const sectionFor = el => {
             const entity = entityContainerFor(el);
@@ -1037,12 +1404,24 @@ class BrowserDemoService:
             controlSelector + ', ' + customSelector
           )];
           const canonical = el => {
+            // A custom radio wrapper and its native input are one target, not
+            // two answers. Role-only widgets without native inputs stay intact.
+            if (el.matches('[role="radio"],[role="checkbox"]')) {
+              const type=el.getAttribute('role');
+              const native=el.querySelector(`input[type="${type}"]`);
+              if (native) return native;
+            }
             // Select2's hidden native select is 1px, not display:none. It and
             // the adjacent visible combobox are one logical control.
             if (el.matches('select.select2-hidden-accessible') && el.nextElementSibling?.matches('.select2-container')) {
               const widget = el.nextElementSibling.querySelector('[role="combobox"]');
               if (widget) return widget;
             }
+            // Generic '*picker-input*' also matches the readonly child of a
+            // calendar. Prefer its proven outer widget, deduplicate once, and
+            // retain the outer control as the commit/readback target.
+            const structured = el.closest('.ant-calendar-picker, .ant-picker, .ant-cascader-picker, .ant-cascader');
+            if (structured) return structured;
             const wrapper = el.closest(customWrapperSelector);
             if (wrapper) return wrapper;
             if (el.matches(customSelector)) return el;
@@ -1054,16 +1433,25 @@ class BrowserDemoService:
             }
             return el;
           };
-          const elements = [...new Set(candidates.map(canonical))]
+          const allLogical = [...new Set(candidates.map(canonical))];
+          const inventoryLogical = [...new Set([...allLogical, ...document.querySelectorAll(
+            '[role="textbox"],[contenteditable="true"],[aria-haspopup="tree"],[aria-haspopup="dialog"]')].map(canonical))];
+          const visibleLogical = inventoryLogical.filter(el => {
+            const target=inputFor(el)||el;
+            return !el.closest('[hidden],[aria-hidden="true"]') &&
+              (target.type==='file' || rendered(el) || rendered(el.closest('label')) || rendered(el.parentElement));
+          });
+          const elements = allLogical
             .filter(el => {
               const role = (el.getAttribute('role') || '').toLowerCase();
               const type = (el.type || '').toLowerCase();
               const customSelect = role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox' || el.matches(customSelector);
               const optionInput = ['radio', 'checkbox'].includes(type) || ['radio', 'checkbox'].includes(role);
+              if (el.closest('header,nav,[role="navigation"],[role="search"]')) return false;
               if (!customSelect && !optionInput && ['hidden','submit','button','image','reset','password'].includes(type)) return false;
               const optionVisible = optionInput && (el.closest('label')?.getClientRects().length || el.parentElement?.getClientRects().length);
               const target = inputFor(el) || el;
-              if (el.closest('.phoenix-date-picker, .phoenix-selectList__list')) return false;
+              if (el.closest('.phoenix-date-picker, .phoenix-selectList__list, .ant-calendar, .ant-picker-dropdown, .ant-select-dropdown, .ant-cascader-menus')) return false;
               const search = /^(?:搜索职位关键词|搜索職位關鍵詞|搜索岗位|search for job keywords)$/i.test(clean(target.getAttribute('placeholder'))) || type === 'search';
               if (search && (el.closest('header, nav, [role="search"], [role="navigation"]') ||
                   (!fieldContainer(el) && !ownedQuestion(el)))) return false;
@@ -1086,7 +1474,7 @@ class BrowserDemoService:
             const label = labelInfo.text.slice(0, 500);
             const nearbyLabels = nearbyLabelCandidates(el);
             const sectionPath = sectionPathFor(el);
-            const entityContainer = entityContainerFor(el);
+            const entityContainer = entityContainerFor(choiceInfo?.group || el);
             const containerMarker = entityContainer ? (entityContainer.getAttribute('data-zhida-container') ||
               `zhida-container-${Date.now()}-${containerSequence++}`) : '';
             if (entityContainer && containerMarker) entityContainer.setAttribute('data-zhida-container', containerMarker);
@@ -1096,8 +1484,52 @@ class BrowserDemoService:
             if (['radio', 'checkbox'].includes(fieldType)) {
               options = choiceInfo?.options || [];
             }
+            const owner = fieldContainer(el) || semanticContainer(el);
+            const requiredEvidence = [];
+            if (el.required || input?.required) requiredEvidence.push('HTML required');
+            const ownerControls = owner ? [...new Set([...owner.querySelectorAll(controlSelector+', '+customSelector)].map(canonical))] : [];
+            const ownerBelongs = ownerControls.length>0 && ownerControls.every(control=>
+              choiceInfo ? choiceInfo.members.some(member=>canonical(member)===control) : canonical(el)===control);
+            if ([el,input,choiceInfo?.group,ownerBelongs?owner:null].some(node => node?.getAttribute('aria-required')==='true'))
+              requiredEvidence.push('ARIA required');
+            // Asterisks are checked only on this question's owned caption, not
+            // the text of a whole section or another field's validation error.
+            // Deep Ant templates place their title beside the inner form row,
+            // outside .ant-form-item. Reuse the exact caption node already
+            // proven to own this control/choice group; a nearby star is not
+            // permission to mark another question required.
+            let ownedCaption = choiceInfo?.captionNode || ownedQuestion(el)?.captionNode;
+            if (choiceInfo?.statement) {
+              // A statement's option label can be inside the input wrapper;
+              // its required star may live on the matching question caption.
+              // Look only within a proven singleton owner, never the section.
+              for (let node=el.parentElement,depth=0; node && node!==document.body && depth<12; node=node.parentElement,depth++) {
+                if (!onlyChoiceMembers(node,choiceInfo.members)) break;
+                const captions=[...node.children].filter(child=>child.matches(questionTitleSelector) &&
+                  !child.contains(el) && !child.querySelector(controlSelector+', '+customSelector) && rendered(child) &&
+                  normalizedToken(ownedCaptionText(child))===normalizedToken(labelInfo.text));
+                if (captions.length===1) {ownedCaption=captions[0];break;}
+              }
+            }
+            const exactOwnedCaption = ownedCaption &&
+              normalizedToken(ownedCaptionText(ownedCaption))===normalizedToken(labelInfo.text) ? ownedCaption : null;
+            const ownedLabel = (input?.id ? document.querySelector(`label[for="${CSS.escape(input.id)}"]`) : null) ||
+              exactOwnedCaption ||
+              (ownerBelongs ? [...(owner?.querySelectorAll('.ant-form-item-label, .el-form-item__label, .arco-form-label-item, :scope > label, :scope > legend')||[])]
+                .find(node=>normalizedToken(ownedCaptionText(node))===normalizedToken(labelInfo.text)) : null);
+            if (ownedLabel && (/[＊*✱]/.test(ownedCaptionText(ownedLabel)) ||
+                /[＊*✱]/.test(getComputedStyle(ownedLabel,'::before').content) ||
+                /[＊*✱]/.test(getComputedStyle(ownedLabel,'::after').content) ||
+                ownedLabel.matches('.ant-form-item-required,[aria-required="true"]') ||
+                [...ownedLabel.querySelectorAll('.ant-form-item-required,.required,[class*="required-mark"]')]
+                  .some(mark=>rendered(mark) && !mark.closest(helperSelector))))
+              requiredEvidence.push('当前题目标签的必填标记');
+            const lengthAttribute = key => {
+              const raw=(input||el).getAttribute(key);
+              return raw!==null && /^\\d+$/.test(raw) ? Number(raw) : null;
+            };
             // Custom options are read through the same scoped tool used by execution.
-            const selectedItems = customSelect ? [...el.querySelectorAll('[class*="selection-item"], [class*="selected-value"], [class*="selected-item"]')]
+            const selectedItems = customSelect ? [...el.querySelectorAll('[class*="selection-item"], [class*="selected-value"], [class*="selected-item"], .ant-select-selection-selected-value')]
               .map(item => clean(item.innerText || item.textContent)).filter(value => value && !placeholder(value)) : [];
             const phoenixContent = el.matches('.phoenix-select') ? el.querySelector('.phoenix-select__content') : null;
             const customValue = phoenixContent ? clean(phoenixContent.innerText) :
@@ -1105,26 +1537,33 @@ class BrowserDemoService:
             return {
               selector: `[data-zhida-field="${marker}"]`, label, question_text: label,
               label_source: labelInfo.source, recognition_confidence: labelInfo.confidence || 0,
+              question_candidates:labelInfo.evidence || [],
               context, help_text: helpTextFor(el), nearby_labels: nearbyLabels,
               section_path: sectionPath, placeholder: placeholderText, ordinal: index + 1,
               name: el.getAttribute('name') || el.querySelector('input')?.getAttribute('name') || el.getAttribute('id') || '', field_type: fieldType,
-              required: el.required || input?.required || el.getAttribute('aria-required') === 'true' ||
-                choiceInfo?.group?.getAttribute('aria-required') === 'true' || choiceInfo?.members.some(item => item.required) || /[*✱]/.test(label), options,
+              required: Boolean(requiredEvidence.length>0 || choiceInfo?.members.some(item => item.required)),
+              required_evidence:requiredEvidence, options,
+              options_capture:input?.tagName==='SELECT' ? 'native_complete' :
+                ['radio','checkbox'].includes(fieldType) ? 'group_complete' : '',
+              constraints:{input_type:(input?.type||'').toLowerCase(), input_mode:input?.getAttribute('inputmode')||'',
+                pattern:input?.getAttribute('pattern')||'', min_length:lengthAttribute('minlength'),
+                max_length:lengthAttribute('maxlength'), minimum:input?.getAttribute('min')||'',
+                maximum:input?.getAttribute('max')||'', step:input?.getAttribute('step')||''},
               current_value: el.type === 'file' ? [...(el.files || [])].map(file => file.name).join(', ') :
                 (input?.tagName === 'SELECT' ? [...input.selectedOptions]
                   .map(option => clean(option.textContent || option.value)).filter(value => value && !placeholder(value)).join(', ') :
                 (['checkbox','radio'].includes(fieldType) ? String(el.checked ?? el.getAttribute('aria-checked') === 'true') :
                   clean(el.value || (customSelect ? customValue : '')))),
               accept: el.getAttribute('accept') || '', role,
-              group_label: groupLabelFor(el, choiceInfo).slice(0, 500),
-              option_label: ['radio','checkbox'].includes(fieldType) ? optionLabelFor(el).slice(0, 500) : '',
+              group_label: (fieldType==='checkbox' ? choiceInfo?.question || '' : groupLabelFor(el, choiceInfo)).slice(0, 500),
+              option_label: ['radio','checkbox'].includes(fieldType) ? optionLabelFor(el,choiceInfo).slice(0, 500) : '',
               option_value: ['radio','checkbox'].includes(fieldType) ? clean(el.value || el.getAttribute('data-value') || el.innerText) : '',
               multiple: Boolean(el.multiple || el.getAttribute('aria-multiselectable') === 'true' ||
                 /multiple|multi|tags/.test(String(el.className || '').toLowerCase()) ||
                 /multiple|multi|tags/.test(String(el.closest('[class]')?.className || '').toLowerCase())),
               readonly: Boolean(el.readOnly || el.querySelector('input')?.readOnly || el.getAttribute('aria-readonly') === 'true'),
               autocomplete: input?.getAttribute('autocomplete') || el.getAttribute('autocomplete') || '',
-              section: (sectionFor(el) || sectionPath[sectionPath.length - 1] || '').slice(0, 500), container_key: containerMarker,
+              section: (sectionPath[sectionPath.length - 1] || sectionFor(el) || '').slice(0, 500), container_key: containerMarker,
               control_group_key: choiceInfo?.key || ''
             };
           });
@@ -1163,12 +1602,93 @@ class BrowserDemoService:
               container_key: '', control_group_key: ''
             });
           }
-          return [...fields, ...expanders];
+          const embedded = [...document.querySelectorAll('iframe,frame')].filter(rendered).length;
+          // querySelectorAll does not cross a Shadow boundary. Enumerate open
+          // roots recursively for COVERAGE ONLY, including nested hosts. Do
+          // not read labels, values or component/private state inside them.
+          const surfaceControlSelector = 'input:not([type="hidden"]),select,textarea,[role="combobox"],[role="radio"],[role="checkbox"],[role="textbox"],[contenteditable="true"]';
+          const composedRendered = el => {
+            if (!el || !el.getClientRects().length) return false;
+            for (let node=el; node && node!==document; node=node.parentElement || node.getRootNode()?.host) {
+              if (node.matches?.('[hidden],[aria-hidden="true"],[inert]')) return false;
+              const style=getComputedStyle(node);
+              if (style.display==='none' || ['hidden','collapse'].includes(style.visibility)) return false;
+            }
+            return true;
+          };
+          let shadow = 0;
+          const inspectShadowSurfaces = root => {
+            for (const host of root.querySelectorAll('*')) {
+              const openRoot=host.shadowRoot;
+              if (!openRoot) continue;
+              if ([...openRoot.querySelectorAll(surfaceControlSelector)].some(composedRendered)) shadow += 1;
+              inspectShadowSurfaces(openRoot);
+            }
+          };
+          inspectShadowSurfaces(document);
+          const pending = [];
+          for (const node of document.querySelectorAll('[aria-expanded="false"],[role="tab"][aria-selected="false"]')) {
+            const caption=clean(node.innerText||node.getAttribute('aria-label'));
+            if (rendered(node) && caption && caption.length<100 && semanticPattern.test(caption)) pending.push(caption);
+          }
+          // Known native/observed section boundaries can contain a folded
+          // record without ARIA expanded metadata. Its own direct heading is
+          // evidence of an unread region, not permission to borrow an ancestor
+          // title or click an Add/expand control. Never inspect hidden values.
+          const surfaceSections = 'section,fieldset,.resume-tpl-wrap';
+          const popupSurfaces = '.phoenix-date-picker,.phoenix-selectList__list,.ant-calendar,.ant-picker-dropdown,.ant-select-dropdown,.ant-cascader-menus,.ant-cascader-dropdown';
+          const capturedSurfaceControls = new Set(fields.map(field=>document.querySelector(field.selector)).filter(Boolean));
+          for (const section of document.querySelectorAll(surfaceSections)) {
+            const headings=[...section.children].filter(node => rendered(node) &&
+              (section.matches('.resume-tpl-wrap') ||
+                node.matches('legend,h1,h2,h3,h4,h5,[role="heading"],.section-title,[class*="section-title"],[class*="sectionTitle"]')) &&
+              !node.querySelector(controlSelector+', '+customSelector))
+              .map(node=>clean(labelText(node)).replace(/\s*[+＋]?\s*添加\s*$/,'').trim());
+            const titles=[...new Set(headings.filter(title=>knownSectionTitles.has(title)))];
+            if (titles.length!==1) continue;
+            const title=titles[0];
+            const ownControls=[...new Set([...section.querySelectorAll(controlSelector+', '+customSelector)]
+              .map(canonical))].filter(control=>control.closest(surfaceSections)===section &&
+                !control.closest(popupSurfaces) &&
+                !['hidden','password','submit','button','image','reset'].includes((inputFor(control)?.type||control.type||'').toLowerCase()));
+            if (ownControls.some(control=>!rendered(control) && !capturedSurfaceControls.has(control))) {
+              pending.push(title+'（已发现未呈现控件）');
+              continue;
+            }
+            const ownAdd=[...section.querySelectorAll('button,[role="button"]')].some(button=>
+              button.closest(surfaceSections)===section && rendered(button) && !button.disabled &&
+              !button.matches('[aria-disabled="true"]') && !button.querySelector(controlSelector) &&
+              addPattern.test(clean(button.innerText||button.textContent||button.getAttribute('aria-label'))));
+            if (!ownControls.length && ownAdd) pending.push(title+'（有新增入口，记录尚未呈现）');
+          }
+          const excluded = visibleLogical.filter(el => !elements.includes(el) && (
+            (['hidden','password','submit','button','image','reset'].includes((inputFor(el)?.type||el.type||'').toLowerCase()) &&
+              !el.hasAttribute('aria-haspopup')) ||
+            el.disabled || inputFor(el)?.disabled || el.closest('header,nav,[role="search"],[role="navigation"],.ant-picker-dropdown,.ant-calendar,.ant-select-dropdown,.ant-cascader-menus')
+          )).length;
+          return {fields:[...fields, ...expanders], inventory:{
+            observed_controls:visibleLogical.length,
+            captured_controls:fields.length, intentionally_excluded_controls:excluded,
+            embedded_regions:embedded, unread_shadow_regions:shadow,
+            pending_sections:[...new Set(pending)].slice(0,30)}};
         }
         """, recognition_profile)
+        # Compatibility for existing isolated transports. Missing inventory
+        # remains unknown coverage, never a fabricated completeness claim.
+        data = captured.get('fields', []) if isinstance(captured, dict) else captured
+        inventory = captured.get('inventory', {}) if isinstance(captured, dict) else {}
+        await self._assert_snapshot_document(document_url, phase="question_capture")
         # Component libraries often render options only after the combobox opens.
         # Opening a list is read-only and lets the review UI present the real choices.
+        await classify_controls(self.page, data)
+        await self._assert_snapshot_document(document_url, phase="control_classification")
         self._option_probe_shapes = {}
+        # Native Safari incurs an Apple Events round trip per locator operation.
+        # Discovering every optional menu serially must not prevent reading the
+        # already rendered form or filling independently proven text/choices.
+        # No option cache: dependent menus are always re-read at execution time.
+        safari_preview = isinstance(self.context, SafariContext)
+        preview_deadline = time.monotonic() + 10 if safari_preview else None
         for item in data:
             locator = self.page.locator(item["selector"]).first
             if policy.name == "beisen-italent" and item.get("field_type") == "combobox":
@@ -1186,49 +1706,59 @@ class BrowserDemoService:
                     item["options"] = []
                     item["help_text"] = "网页使用日历输入，填写真实日期后核验外层控件的已选值"
                     continue
+            if not probe_options and item.get("field_type") == "combobox" and not item.get("options"):
+                self._mark_deferred_options(item)
+                continue
             if not probe_options or item.get("field_type") != "combobox" or item.get("options"):
                 continue
+            # Even explicit bulk discovery may not click an unowned question,
+            # a declaration, or an unknown widget. Diagnosis cannot grant a
+            # broader operation capability than mapping/execution.
+            probe_field = PageField.model_validate(item)
+            annotate_fields([probe_field])
+            if (extraction_block_reason(probe_field) or is_declaration(probe_field)
+                    or probe_field.control_kind == "unknown"):
+                self._mark_deferred_options(item)
+                continue
+            if item.get('control_kind') == 'cascade':
+                # A root province is not a selectable complete address. Never
+                # flatten nested menus into an ordinary select option list.
+                item['help_text'] = '网页是级联选择；需要完整路径，逐层读取后核验最终选中值'
+                continue
+            remaining = preview_deadline - time.monotonic() if safari_preview else None
+            if safari_preview and remaining <= 0:
+                self._mark_deferred_options(item)
+                continue
             try:
-                if policy.name == "beisen-italent":
-                    await self._dismiss_options(locator, policy)
-                calendars_before = await calendar_ids(self.page) if policy.name == "beisen-italent" else set()
-                before_open = await visible_popup_ids(self.page, policy)
-                already_open = await scoped_option_entries(self.page, locator, policy)
-                if already_open:
-                    entries = already_open
+                await self._assert_snapshot_document(document_url, phase="before_option_preview")
+                if safari_preview:
+                    # Cancel a slow read, not the complete form. Cleanup below
+                    # closes only this preview's menu and never chooses a value.
+                    await asyncio.wait_for(self._preview_field_options(item, locator, policy),
+                                           timeout=min(3, remaining))
                 else:
-                    await locator.click(timeout=1800)
-                    if policy.name == "beisen-italent":
-                        await self.page.wait_for_timeout(150)
-                        panel = await calendar_for(locator, self.page, calendars_before)
-                        precision = await calendar_precision(panel)
-                        if precision:
-                            await locator.evaluate("(el, value) => el.dataset.zhidaDatePrecision = value", precision)
-                            item["date_precision"] = precision
-                            item["help_text"] = "网页日历要求" + ("年月日" if precision == "date" else "年月") + "；不会用日历单格作为完整日期"
-                            item["options"] = []
-                            self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
-                            await self._dismiss_options(locator, policy)
-                            continue
-                    entries = await self._wait_for_options(locator, policy, before_open)
-                item["options"] = list(dict.fromkeys(text for text, _ in entries))
-                if policy.name == "beisen-italent" and entries and any([
-                        await option.evaluate("el=>el.matches('.area-item-name')") for _, option in entries]):
-                    item["region_picker"] = True
-                    await locator.evaluate("el=>el.dataset.zhidaRegionPicker='true'")
-                    item['region_value_path'] = await read_open_region_path(
-                        self.page, locator, entries, item.get('current_value', ''))
-                    self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
-                if policy.name == "beisen-italent" and not entries:
-                    self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
-                await self._dismiss_options(locator, policy)
+                    await self._preview_field_options(item, locator, policy)
+            except asyncio.TimeoutError:
+                self._mark_deferred_options(item)
             except Exception:
                 item["options"] = item.get("options", [])
+            finally:
+                # A read may trigger a redirect/expired login. Never close or
+                # probe the old field on the replacement document.
+                await self._assert_snapshot_document(document_url, phase="after_option_preview")
+                # A cancelled preview can leave a portal open. An outer form
+                # cancellation must still propagate; never retry a value write.
+                if safari_preview:
+                    try:
+                        await asyncio.wait_for(self._dismiss_options(locator, policy), timeout=2)
+                    except asyncio.TimeoutError as exc:
+                        raise ValueError("关闭网页选项预览超时；已停止，请在官网关闭下拉菜单后同步") from exc
         _finalize_field_metadata(data)
         _finalize_choice_metadata(data)
         if policy.name == "beisen-italent":
             data = await refine_phoenix_fields(self.page, data)
         data = await refine_autohome_fields(self.page, data)
+        data = await refine_ant_resume_fields(self.page, data)
         attachment = await inspect_autohome_attachment(self.page)
         for item in data:
             if item.get("container_key") == "autohome:attachment" and attachment.get("attachment_present"):
@@ -1245,10 +1775,90 @@ class BrowserDemoService:
                          "current_value": "", "required": False})
         _finalize_field_metadata(data)
         fields = enrich_fields([PageField.model_validate(item) for item in data], self.page.url)
+        annotate_fields(fields)
+        title = await self.page.title()
+        await self._assert_snapshot_document(document_url, phase="snapshot_finalization")
         return BrowserSnapshot(
-            session_id=self.session_id, url=self.page.url, title=await self.page.title(),
+            session_id=self.session_id, url=document_url, title=title,
+            browser_engine="safari" if isinstance(self.context, SafariContext) else "chromium",
             recognition_profile=str(recognition_profile["name"]), site_route=site_route, fields=fields,
+            extraction_report=build_report(fields, inventory),
         )
+
+    async def _assert_snapshot_document(self, expected_url: str, *, phase: str = "document_check") -> None:
+        if isinstance(self.context, SafariContext):
+            # Metadata check against the bound window, not the frontmost tab.
+            # Test transports may only expose refresh; the production adapter
+            # has a cheaper URL-only command that executes no page script.
+            if hasattr(self.page, 'read_url'):
+                await self.page.read_url()
+            else:
+                await self.page.refresh()
+        if self.page.url != expected_url:
+            # Fixed phase names only: never emit URLs, tokens, selectors,
+            # question text, browser storage or candidate values to logs.
+            logging.getLogger(__name__).warning("snapshot_stopped phase=%s reason=url_changed", phase)
+            step = {"site_routing": "识别站点时", "question_capture": "读取题目时",
+                    "control_classification": "核对控件类型时", "before_option_preview": "展开选项前",
+                    "after_option_preview": "展开选项后", "snapshot_finalization": "完成题目读取时"}.get(phase, "读取控件时")
+            raise ValueError(step + '招聘页面已跳转；旧表单已丢弃，没有继续填写。请同步当前页并检查登录状态')
+
+    @staticmethod
+    def _mark_deferred_options(item):
+        # Empty means unavailable, never a fabricated free-text dropdown.
+        item["options"] = []
+        item["options_capture"] = "deferred"
+        item["help_text"] = (item.get("help_text", "") +
+            "；下拉选项尚未读取完成，不代表可随意输入；有确定答案时执行器会重新读取并唯一匹配，"
+            "无法匹配则保留给你确认").lstrip("；")
+
+    async def _preview_field_options(self, item, locator, policy):
+        if item.get('control_kind') == 'cascade':
+            item['cascade_observation'] = await preview_cascade(self.page, locator)
+            item['options'] = []  # visible columns are not one flat option list
+            item['options_capture'] = 'dependent'
+            item['help_text'] = '；'.join(item['cascade_observation']['limitations'])
+            return
+        if item.get('control_kind') == 'calendar':
+            precision = await preview_calendar(self.page, locator)
+            item['date_precision'] = precision
+            item['options'] = []
+            item['help_text'] = ('官网日历要求年月日，不会擅自补日' if precision == 'date' else
+                                 '官网日历要求年月' if precision == 'month' else '日历格式尚未核实，不能当普通下拉选择')
+            return
+        if policy.name == "beisen-italent":
+            await self._dismiss_options(locator, policy)
+        calendars_before = await calendar_ids(self.page) if policy.name == "beisen-italent" else set()
+        before_open = await visible_popup_ids(self.page, policy)
+        entries = await scoped_option_entries(self.page, locator, policy)
+        if not entries:
+            await locator.click(timeout=1800)
+            if policy.name == "beisen-italent":
+                await self.page.wait_for_timeout(150)
+                panel = await calendar_for(locator, self.page, calendars_before)
+                precision = await calendar_precision(panel)
+                if precision:
+                    await locator.evaluate("(el, value) => el.dataset.zhidaDatePrecision = value", precision)
+                    item["date_precision"] = precision
+                    item["help_text"] = "网页日历要求" + ("年月日" if precision == "date" else "年月") + "；不会用日历单格作为完整日期"
+                    item["options"] = []
+                    self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
+                    await self._dismiss_options(locator, policy)
+                    return
+            entries = await self._wait_for_options(locator, policy, before_open)
+        item["options"] = list(dict.fromkeys(text for text, _ in entries))
+        item["options_capture"] = "observed_subset" if entries else "unavailable"
+        if policy.name == "beisen-italent" and entries and any([
+                await option.evaluate("el=>el.matches('.area-item-name')") for _, option in entries]):
+            item["region_picker"] = True
+            await locator.evaluate("el=>el.dataset.zhidaRegionPicker='true'")
+            item['region_value_path'] = await read_open_region_path(
+                self.page, locator, entries, item.get('current_value', ''))
+            self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
+        if policy.name == "beisen-italent" and not entries:
+            self._option_probe_shapes[item.get("label", "")] = await inspect_component_shapes(self.page)
+        if not isinstance(self.context, SafariContext):
+            await self._dismiss_options(locator, policy)
 
     async def snapshot_for(self, session_id: str) -> BrowserSnapshot:
         self._require(session_id)
@@ -1256,6 +1866,7 @@ class BrowserDemoService:
 
     async def recognition_diagnostics(self, session_id: str) -> dict:
         result = await inspect_recognition_structure(self._require(session_id))
+        result["ant_resume_records"] = await inspect_ant_resume_rejections(self.page)
         result["option_probe_shapes"] = self._option_probe_shapes
         return result
 
@@ -1269,7 +1880,10 @@ class BrowserDemoService:
         """
         page = self._require(session_id)
         initial_url = page.url
-        deadline = time.monotonic() + 5.0
+        # Safari's Apple Events transport has per-read IPC cost. A five-second
+        # wall clock can expire before two observations even of a loaded form.
+        # Still bounded: no navigation, reload or value writes during settling.
+        deadline = time.monotonic() + (60.0 if isinstance(self.context, SafariContext) else 5.0)
         previous = None
         parsed = urlparse(initial_url)
         autohome = (parsed.scheme == "https" and parsed.netloc.casefold() in {
@@ -1320,13 +1934,13 @@ class BrowserDemoService:
                 for field in snapshot.fields
             ))
             if ready and signature == previous:
-                # Menu discovery is an active, bounded preview after structural
-                # stability. It must not consume the 5-second loading detector
-                # and falsely classify a rendered multi-select form as loading.
+                # A third passive read validates stable question ownership.
+                # Options are discovered only through an explicit, scoped
+                # observation or during execution, never by sweeping the form.
                 try:
-                    enriched = await asyncio.wait_for(self.snapshot(), timeout=45)
+                    enriched = await asyncio.wait_for(self.snapshot(probe_options=False), timeout=45)
                 except asyncio.TimeoutError as exc:
-                    raise ValueError("表单已加载，但读取网页选项超时；已停止填写，请重新核对选项") from exc
+                    raise ValueError("表单已加载，但只读核对题目超时；已停止填写，请同步当前页") from exc
                 if page.url != initial_url or enriched.url != initial_url:
                     enriched.fields = []
                 else:
@@ -1337,7 +1951,7 @@ class BrowserDemoService:
                     if after_probe.stage not in {"profile_form", "application_form", "review", "unknown"}:
                         enriched.fields = []
                     elif structure(snapshot) != structure(enriched):
-                        raise ValueError("读取选项时表单题目或记录归属已变化，已停止旧计划，请重新识别")
+                        raise ValueError("只读核对时表单题目或记录归属已变化，已停止旧计划，请重新识别")
                 return enriched
             previous = signature if ready else None
             if attempt < 7:
@@ -1360,7 +1974,8 @@ class BrowserDemoService:
             "kind": kinds[item["semantic_section"]], "record_count": item["record_count"],
             "container_key": item["container_key"], "record_keys": list(item["record_keys"]),
             "label": item["label"],
-        } for item in [*await discover_autohome_sections(page), *await inspect_phoenix_sections(page)]
+        } for item in [*await discover_autohome_sections(page), *await inspect_phoenix_sections(page),
+                      *await inspect_ant_resume_records(page)]
             if item["semantic_section"] in kinds]
 
     async def expand_missing_section(self, session_id: str, candidate: dict) -> BrowserSnapshot:
@@ -1374,11 +1989,11 @@ class BrowserDemoService:
     async def inspect_field(self, session_id: str, selector: str) -> BrowserSnapshot:
         """Bring one collected field into view and retry read-only option discovery."""
         page = self._require(session_id)
-        before = await self.snapshot()
+        before = await self.snapshot(probe_options=False)
         field = next((item for item in before.fields if item.selector == selector), None)
         if not field:
             raise LookupError("字段已经变化，请重新分析当前页面")
-        if field.field_type in {"file", "section-button"}:
+        if field.field_type in {"file", "section-button", "password", "hidden"} or is_declaration(field):
             raise ValueError("这个控件不支持定位读取，请使用对应的上传或展开按钮")
         locator = page.locator(selector).first
         if not await locator.count():
@@ -1402,17 +2017,128 @@ class BrowserDemoService:
         }
         """)
         if field.field_type == "combobox":
-            try:
-                await locator.click(timeout=3000)
-                await page.wait_for_timeout(450)
-            except Exception:
-                pass
-        refreshed = await self.snapshot()
-        try:
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
+            observations = await self.observe_form_controls(session_id, [selector])
+            refreshed = await self.snapshot(probe_options=False)
+            merge_observed_metadata(refreshed, observations)
+        else:
+            refreshed = await self.snapshot(probe_options=False)
+            refresh_report(refreshed)
+        await self._assert_snapshot_document(before.url)
         return refreshed
+
+    async def observe_page_region(self, session_id: str, selector: str, *, include_image: bool = False,
+                                  expected_snapshot=None, bring_into_view: bool = False,
+                                  audit_only: bool = False):
+        """Read an exact collected question, never arbitrary pages or a desktop."""
+        from .page_observation import observe_region
+        from .form_routing import CREDENTIALS
+
+        page = self._require(session_id)
+        before = await self.snapshot(probe_options=False)
+        field = next((f for f in before.fields if f.selector == selector), None)
+        if not field:
+            raise ValueError('只允许观察当前已采集的题目，请先同步页面')
+        if expected_snapshot is not None:
+            expected = next((f for f in expected_snapshot.fields if f.selector == selector), None)
+            if not expected or before.url != expected_snapshot.url or any(
+                    getattr(expected,k)!=getattr(field,k) for k in (
+                        'field_type','question_text','container_key','control_group_key','current_value',
+                        'question_candidates','constraints','required_evidence')):
+                raise ValueError('模型持有的题目已变化，未读取新题目，停止旧分析')
+        if (field.field_type in {'password','hidden','section-button'}
+                or not audit_only and (is_declaration(field) or field.field_type == 'file')
+                or CREDENTIALS.search(' '.join((field.label,field.question_text,field.name,field.autocomplete)))):
+            raise ValueError('账号、验证码、声明、附件和展开按钮不进入题目观察工具')
+        await self._assert_snapshot_document(before.url)
+        if bring_into_view:
+            # Only the exact scanner-issued, guarded target. No click, input,
+            # expansion, or navigation; whole-page audits need offscreen rows.
+            await page.locator(selector).scroll_into_view_if_needed(timeout=3000)
+            await self._assert_snapshot_document(before.url)
+        result = await observe_region(page, selector, include_image=include_image)
+        await self._assert_snapshot_document(before.url)
+        after = await self.snapshot(probe_options=False)
+        fresh = next((f for f in after.fields if f.selector == selector), None)
+        if not fresh or after.url != before.url or any(getattr(fresh,k)!=getattr(field,k) for k in (
+                'field_type','question_text','container_key','control_group_key','current_value',
+                'question_candidates','constraints','required_evidence')):
+            raise ValueError('观察期间题目身份或资料发生变化，已丢弃结果，请重新同步')
+        return result
+
+    async def observe_form_controls(self, session_id: str, selectors: list[str], *,
+                                    expected_snapshot: BrowserSnapshot | None = None,
+                                    expected_workflow=None) -> list[PageField]:
+        """A bounded model tool: observe ONLY collected, non-declaration fields.
+
+        Opens a menu/calendar, never selects/inputs/submits. The caller owns
+        the operation lock; its existing task/owner guards still apply.
+        """
+        from .form_routing import CREDENTIALS
+        from .extraction_audit import document_fingerprint
+
+        if not selectors or len(set(selectors)) != len(selectors) or len(selectors) > 4:
+            raise ValueError('每次只允许核对1至4个当前表单控件')
+        state = await self.workflow_state(session_id)
+        if expected_workflow is not None and execution_identity_changes(expected_workflow, state):
+            raise ValueError('打开控件前岗位或表单步骤已变化，停止旧观察')
+        if state.stage not in {'profile_form','application_form','review'} or state.navigation_blocker:
+            raise ValueError('当前不是可核对的申请表，已停止控件观察')
+        snapshot = await self.snapshot(probe_options=False)
+        if expected_snapshot is not None and document_fingerprint(expected_snapshot) != document_fingerprint(snapshot):
+            raise ValueError('打开控件前题目、记录或填写值已变化，停止旧观察；请重新同步')
+        baseline = document_fingerprint(snapshot)
+        fields = {field.selector:field for field in snapshot.fields}
+        if any(selector not in fields for selector in selectors):
+            raise ValueError('只能核对本次已读取的字段，不能使用其他网页或任意选择器')
+        requested = [fields[selector] for selector in selectors]
+        if any(is_declaration(f) or f.field_type in {'file','password','hidden','section-button'}
+                or CREDENTIALS.search(' '.join((f.label,f.question_text,f.name,f.autocomplete)))
+                for f in requested):
+            raise ValueError('声明、附件、账号或展开操作不进入模型控件工具')
+        if any(extraction_block_reason(f) for f in requested):
+            raise ValueError('题干、控件类型或记录归属未核实，不能打开选项；请先定向读取原题上下文')
+        policy = policy_for(snapshot.site_route.adapter)
+        observations = []
+        for field in requested:
+            # An earlier menu can trigger a reactive form rebuild. Check the
+            # whole document again BEFORE clicking the next target, not only
+            # at batch end (an old combobox may now be a submit button).
+            live_snapshot = await self.snapshot(probe_options=False)
+            live_state = await self.workflow_state(session_id)
+            if (execution_identity_changes(state, live_state) or live_state.navigation_blocker
+                    or baseline != document_fingerprint(live_snapshot)):
+                raise ValueError('打开控件前题目、岗位、步骤或填写值已变化，停止旧观察；请重新同步')
+            await self._assert_snapshot_document(snapshot.url)
+            item = field.model_dump()
+            control = self.page.locator(field.selector)
+            if field.field_type == 'combobox':
+                try:
+                    await asyncio.wait_for(self._preview_field_options(item, control, policy), timeout=15)
+                except asyncio.TimeoutError:
+                    self._mark_deferred_options(item)
+                finally:
+                    await self._assert_snapshot_document(snapshot.url)
+                    await self._dismiss_options(control, policy)
+            observations.append(PageField.model_validate(item))
+        after = await self.snapshot(probe_options=False)
+        after_state = await self.workflow_state(session_id)
+        current = {f.selector:f for f in after.fields}
+        if execution_identity_changes(state, after_state) or after_state.navigation_blocker:
+            raise ValueError('核对控件时网页阶段或地址改变，停止旧计划')
+        if baseline != document_fingerprint(after):
+            raise ValueError('核对控件时表单题目、记录归属或填写值变化，已丢弃结果；请重新同步')
+        for field in requested:
+            fresh = current.get(field.selector)
+            if fresh is None or any(getattr(fresh,k) != getattr(field,k) for k in (
+                'field_type','question_text','container_key','control_group_key','current_value',
+                'control_kind','question_candidates','constraints','required_evidence','section_path',
+                'entity_scope','record_evidence','required')):
+                raise ValueError('核对控件时原题、记录归属或填写值改变，请先同步，不会沿用旧计划')
+        by_selector = {field.selector:field for field in observations}
+        combined = [by_selector.get(field.selector, field) for field in after.fields]
+        annotate_fields(combined)
+        current = {field.selector:field for field in combined}
+        return [current[selector] for selector in selectors]
 
     async def expand_section(self, session_id: str, selector: str, candidate_id: str = "") -> BrowserSnapshot:
         page = self._require(session_id)
@@ -1546,7 +2272,7 @@ class BrowserDemoService:
           const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
           const customWrapperSelector = [
             ...(profile?.control_selectors || []),
-            '.ant-select-selector', '.arco-select-view', '.el-select__wrapper', '.ivu-select-selection',
+            '.ant-select-selector', '.ant-select-selection', '.ant-calendar-picker', '.ant-picker', '.ant-cascader-picker', '.ant-cascader', '.arco-select-view', '.el-select__wrapper', '.ivu-select-selection',
             '.semi-select', '.t-select__wrap', '[class*="select-selector"]',
             '[class*="select__selector"]', '[class*="select-view"]',
             '[class*="cascader-picker"]', '[class*="picker-input"]'
@@ -1558,7 +2284,8 @@ class BrowserDemoService:
             return clean(question?.getAttribute('data-zhida-choice-label') || explicit?.innerText || question?.querySelector('.application-label, legend, .question-label')?.innerText ||
               el.closest('label')?.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name);
           };
-          const canonical = el => el.closest(customWrapperSelector) || (el.matches(customSelector) ? el : (el.closest(customSelector) || el));
+          const canonical = el => el.closest('.ant-calendar-picker, .ant-picker, .ant-cascader-picker, .ant-cascader') ||
+            el.closest(customWrapperSelector) || (el.matches(customSelector) ? el : (el.closest(customSelector) || el));
           const candidates = [...new Set([...document.querySelectorAll(
             'input, select, textarea, [role="radio"], [role="checkbox"], ' + customSelector
           )].map(canonical))].filter(el => {
@@ -1707,12 +2434,14 @@ class BrowserDemoService:
     async def _wait_for_options(self, control, policy, before_open, wanted: str = ""):
         # Poll only the current control's menu, bounded by the selected ATS policy.
         entries = []
-        for elapsed in range(0, policy.option_wait_ms + 1, 100):
+        deadline = time.monotonic() + policy.option_wait_ms / 1000
+        while True:
             entries = await scoped_option_entries(self.page, control, policy, before_open)
             if entries and (not wanted or _best_option(wanted, [text for text, _ in entries])):
                 return entries
-            if elapsed < policy.option_wait_ms:
-                await self.page.wait_for_timeout(100)
+            if time.monotonic() >= deadline:
+                break
+            await self.page.wait_for_timeout(100)
         return entries
 
     async def _dismiss_options(self, control, policy) -> None:
@@ -1747,17 +2476,44 @@ class BrowserDemoService:
         return await scoped_option_entries(self.page, control, policy)
 
     async def _select_custom(self, field: PageField, values: list[str], *,
-                             before_write: Callable[[], Awaitable[None]] | None = None) -> list[str]:
+                             before_write: Callable[[], Awaitable[None]] | None = None,
+                             on_stage: Callable[[str], None] | None = None) -> list[str]:
         selected: list[str] = []
+        def stage(name):
+            if on_stage:
+                on_stage(name)
         policy = policy_for((await route_for_page(self.page)).adapter)
+        if field.control_kind == 'calendar' and not field.date_precision:
+            # Passive snapshots deliberately do not open every menu. Probe
+            # this one owned calendar just before execution, never infer its
+            # precision from a date-like caption or from the requested value.
+            stage('date_precision')
+            _, calendar_control = await self._resolve_field(field)
+            if before_write:
+                await before_write()
+            field.date_precision = await preview_calendar(self.page, calendar_control)
         if field.date_precision:
-            if policy.name != 'beisen-italent' or len(values) != 1:
+            if len(values) != 1:
                 raise ValueError("日期控件来源或目标不明确，已停止填写")
             _, control = await self._resolve_field(field)
             await self._dismiss_options(control, policy)
-            value = await select_calendar_date(self.page, control, values[0], field.date_precision, before_write)
+            stage('select_option')
+            if field.control_kind == 'calendar':
+                value = await select_ant_calendar(self.page, control, values[0], field.date_precision, before_write)
+            elif policy.name == 'beisen-italent':
+                value = await select_calendar_date(self.page, control, values[0], field.date_precision, before_write)
+            else:
+                raise ValueError('尚无可核验的日历执行器，不会当普通输入框填写')
             await self._dismiss_options(control, policy)
             return [value]
+        if field.control_kind == 'calendar':
+            raise ValueError('日历格式尚未核实，已停止；不会在日期框搜索选项')
+        if field.control_kind == 'cascade':
+            stage('open_popup')
+            if len(values) != 1:
+                raise ValueError('级联控件需要一个明确的完整路径')
+            _, control = await self._resolve_field(field)
+            return await select_ant_cascade(self.page, control, values[0], _best_option, before_write)
         if field.region_picker and policy.name == 'beisen-italent':
             if len(values) != 1:
                 raise ValueError('地区只能填写一个明确的行政区路径')
@@ -1772,20 +2528,27 @@ class BrowserDemoService:
             await control.scroll_into_view_if_needed(timeout=3000)
             if policy.name == "beisen-italent" and await control.evaluate("el=>el.matches('.phoenix-select')"):
                 await self._dismiss_options(control, policy)
+            stage('popup_check')
             before_open = await visible_popup_ids(self.page, policy)
             entries = await scoped_option_entries(self.page, control, policy)
             if not entries:
+                stage('open_popup')
                 if before_write:
                     await before_write()
                 await control.click(timeout=8000)
+                stage('read_options')
                 entries = await self._wait_for_options(control, policy, before_open, wanted)
             match = _best_option(wanted, [text for text, _ in entries])
             if not match:
                 search = control if await control.evaluate("el => el.tagName === 'INPUT'") else control.locator("input").first
                 if await search.count() and await search.is_editable():
+                    stage('search_options')
                     if before_write:
                         await before_write()
-                    await search.fill(wanted)
+                    if isinstance(self.context, SafariContext):
+                        await search.fill(wanted, keep_focus=True)
+                    else:
+                        await search.fill(wanted)
                     entries = await self._wait_for_options(control, policy, before_open, wanted)
                     match = _best_option(wanted, [text for text, _ in entries])
             if not match:
@@ -1797,6 +2560,7 @@ class BrowserDemoService:
                 await self.page.keyboard.press("Escape")
                 raise ValueError(f"“{wanted}”对应多个网页选项，请在网页中核对层级后选择")
             option = matches[0]
+            stage('select_option')
             if before_write:
                 await before_write()
             # In the observed region picker, clicking the row text enters the
@@ -1868,7 +2632,7 @@ class BrowserDemoService:
                 return actual
             return await control.evaluate("""el => {
               const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-              const selected = [...el.querySelectorAll('[class*="selection-item"], [class*="selected-value"], [class*="selected-item"]')]
+              const selected = [...el.querySelectorAll('[class*="selection-item"], [class*="selected-value"], [class*="selected-item"], .ant-select-selection-selected-value')]
                 .map(item => clean(item.innerText || item.textContent)).filter(Boolean);
               return selected.join(', ') || clean(el.getAttribute('aria-valuetext') || el.querySelector('input')?.value || el.innerText);
             }""")
@@ -1877,38 +2641,67 @@ class BrowserDemoService:
     async def execute(self, session_id: str, request: ExecutePlanRequest,
                       resume_path: Path | None = None, *,
                       resume_filename: str = '',
-                      before_action: Callable[[], None] | None = None) -> ExecutionResult:
+                      before_action: Callable[[], None] | None = None,
+                      on_progress: Callable[[int, str], None] | None = None) -> ExecutionResult:
+        page = self._require(session_id)
+        document = await page.evaluate_handle('() => document')
+        try:
+            return await self._execute_bound_document(session_id, request, resume_path,
+                resume_filename=resume_filename, before_action=before_action,
+                document=document, on_progress=on_progress)
+        finally:
+            try:
+                await document.dispose()
+            except Exception:
+                pass  # A navigation already destroyed this document's handle.
+
+    async def _execute_bound_document(self, session_id: str, request: ExecutePlanRequest,
+                      resume_path: Path | None = None, *, resume_filename: str = '',
+                      before_action: Callable[[], None] | None = None, document,
+                      on_progress: Callable[[int, str], None] | None = None) -> ExecutionResult:
         page = self._require(session_id)
         workflow = await self.workflow_state(session_id)
         if workflow.navigation_blocker:
             raise ValueError(workflow.navigation_blocker)
         if workflow.stage in {"homepage", "job_list", "job_detail", "auth_required", "registration_required", "verification_required"}:
             raise ValueError("当前不是可填写的申请表；不会向首页、岗位筛选或登录控件写入个人资料")
-        # Keep entry blockers first. A reload can reuse both URL and selectors;
-        # browser-owned timeOrigin identifies its document without DOM markers.
-        document_origin = await page.evaluate("() => performance.timeOrigin")
+        # A real reload can reuse both URL and selectors. Compare the actual
+        # Document object instead of a privacy-rounded numeric timeOrigin.
+        results: list[ActionResult] = []
+        current_label = ""
+        current_phase = "target_check"
+        action_index = 0
 
-        def execution_identity(state: ApplicationWorkflowState) -> tuple:
-            # Field counts, options and values are deliberately excluded:
-            # reactive forms may change them while the same step is filled.
-            return (state.url, state.stage, state.job_id, state.job_title,
-                    state.page_step_current, state.entry_confirmation_required)
+        def stage(name):
+            nonlocal current_phase
+            current_phase = name
+            if on_progress:
+                on_progress(action_index, name)
+
+        def interrupted(reason):
+            return _ExecutionTargetChanged(
+                f"填写安全检查停止：{reason}；已停止旧填写计划，请重新识别当前页面后再继续",
+                results=results, current_label=current_label, current_phase=current_phase)
 
         async def ensure_current_page() -> None:
-            message = "填写期间页面、岗位或申请步骤已变化，已停止旧填写计划；请重新识别当前页面后再继续"
             if self._require(session_id) is not page:
-                raise _ExecutionTargetChanged(message)
+                raise interrupted("连接的招聘窗口已变化")
             current = await self.workflow_state(session_id)
             if current.navigation_blocker:
-                raise _ExecutionTargetChanged(current.navigation_blocker)
-            if execution_identity(current) != execution_identity(workflow) or page.url != workflow.url:
-                raise _ExecutionTargetChanged(message)
+                raise interrupted("当前页面的目标或导航检查未通过")
+            changed = execution_identity_changes(workflow, current)
+            if page.url != workflow.url and "网页地址" not in changed:
+                changed.append("网页地址")
+            if changed:
+                raise interrupted("、".join(changed) + "变化")
             try:
-                same_document = await page.evaluate("origin => performance.timeOrigin === origin", document_origin)
+                same_document = await document.evaluate('original => original === document')
             except Exception as exc:
-                raise _ExecutionTargetChanged(message) from exc
-            if not same_document or self.page is not page:
-                raise _ExecutionTargetChanged(message)
+                raise interrupted("网页文档已重新加载或无法核对原文档") from exc
+            if not same_document:
+                raise interrupted("网页文档已重新加载（即使地址未变化）")
+            if self.page is not page:
+                raise interrupted("连接的招聘窗口已变化")
 
         snapshot = await self.snapshot()
         fields = {field.selector: field for field in snapshot.fields}
@@ -1923,10 +2716,8 @@ class BrowserDemoService:
             live = await page.evaluate(NATIVE_WRITE_IDENTITIES, [current.selector])
             if (live.get(current.selector) != expected or any(
                     getattr(original, key) != getattr(current, key) for key in metadata)):
-                raise _ExecutionTargetChanged(
-                    "填写期间字段题干、类型或所属记录已变化，已停止旧填写计划；请重新识别后再继续")
+                raise interrupted("字段题干、类型或所属记录变化")
 
-        results: list[ActionResult] = []
         applied_selectors: set[str] = set()
         if before_action:
             before_action()
@@ -1935,6 +2726,7 @@ class BrowserDemoService:
                              any(hint in f"{field.label} {field.name}".lower()
                                  for hint in ("resume", "cv", "curriculum", "简历"))]
             for field in resume_fields[:1]:
+                current_label = field.label or "Resume/CV"
                 try:
                     await ensure_current_page()
                     await ensure_native_field(field, field)
@@ -1957,9 +2749,12 @@ class BrowserDemoService:
                 except Exception as exc:
                     results.append(ActionResult(selector=field.selector, label=field.label or "Resume/CV",
                                                 status="failed", message=str(exc)[:240]))
-        for action in request.actions:
+                current_label = ""
+        for action_index, action in enumerate(request.actions, 1):
+            current_label = action.label
             # Profile updates can arrive through a different API while this
             # batch awaits browser I/O. Stop before the next old-value write.
+            stage('target_check')
             await ensure_current_page()
             if before_action:
                 before_action()
@@ -1969,12 +2764,10 @@ class BrowserDemoService:
             ))).lower() if field else ""
             deterministically_sensitive = any(hint in field_description for hint in SENSITIVE_FIELD_HINTS)
             deterministically_manual = any(hint in field_description for hint in MANUAL_CONFIRM_FIELD_HINTS)
-            acknowledgement = " ".join(filter(None, (
-                field.label, field.question_text, field.group_label, field.option_label, field.name,
-            ))).casefold() if field else ""
-            legal_acknowledgement = bool(field and field.field_type in {"checkbox", "radio"} and
-                                        (any(hint in acknowledgement for hint in LEGAL_ACKNOWLEDGEMENT_HINTS)
-                                         or field.name.casefold() in {"agreechk", "agreement", "consent"}))
+            legal_acknowledgement = bool(field and is_declaration(field))
+            observation_blocker = extraction_block_reason(field) if field else ''
+            subject_requires_confirmation = bool(field and (
+                family_subject(field) or formal_employment_only(field)))
             compatible = bool(field) and (
                 (action.action == "fill" and field.field_type not in {"checkbox", "radio", "select-one", "select-multiple", "combobox"})
                 or (action.action == "select" and field.field_type in {"select-one", "select-multiple", "combobox"})
@@ -1982,6 +2775,7 @@ class BrowserDemoService:
             )
             unsafe = (
                 field is None
+                or bool(observation_blocker)
                 or legal_acknowledgement
                 or action.action not in {"fill", "select", "check"}
                 or not compatible
@@ -1989,14 +2783,19 @@ class BrowserDemoService:
                 or (action.sensitive and not action.user_confirmed)
                 or (deterministically_sensitive and not action.user_confirmed)
                 or (deterministically_manual and not action.user_confirmed)
+                or (subject_requires_confirmation and not action.user_confirmed)
                 or action.confidence < request.min_confidence
             )
             if unsafe:
                 results.append(ActionResult(selector=action.selector, label=action.label, status="skipped",
-                                            message="声明、承诺或协议必须由本人在招聘网页阅读并勾选" if legal_acknowledgement
-                                            else "需要确认、敏感或置信度不足"))
+                                            message=observation_blocker or ("声明、承诺或协议必须由本人在招聘网页阅读并确认" if legal_acknowledgement
+                                            else "家属资料需要本人明确确认，不能直接使用候选人的姓名、学历或联系方式" if field and family_subject(field)
+                                            else "官网只接受正式工作经历，不能直接使用实习；请确认真实正式工作情况" if field and formal_employment_only(field)
+                                            else "需要确认、敏感或置信度不足")))
+                current_label = ""
                 continue
             try:
+                stage('resolve')
                 field, locator = await self._resolve_field(field)
                 if execution_policy.name == 'beisen-italent':
                     await self._dismiss_options(locator, execution_policy)
@@ -2009,11 +2808,13 @@ class BrowserDemoService:
                 if before_action:
                     before_action()
                 expected_values = ([str(action.value)] if field.region_picker else _split_values(action.value))
+                stage('write_value')
                 if action.action == "fill":
                     await locator.fill(str(action.value), timeout=8000)
                 elif action.action == "select":
                     if field.field_type == "combobox":
-                        await self._select_custom(field, expected_values[:20], before_write=ensure_write_target)
+                        await self._select_custom(field, expected_values[:20], before_write=ensure_write_target,
+                                                  on_stage=stage)
                     else:
                         await self._select_native(field, expected_values, before_write=ensure_write_target)
                 elif action.action == "check":
@@ -2038,6 +2839,7 @@ class BrowserDemoService:
                             await ensure_write_target()
                             await locator.click(timeout=8000)
                 applied_selectors.add(action.selector)
+                stage('read_value')
                 await ensure_native_field(fields[action.selector], field)
                 actual = await self._read_field_value(field)
                 if field.field_type in {"checkbox", "radio"}:
@@ -2059,8 +2861,10 @@ class BrowserDemoService:
             except Exception as exc:
                 results.append(ActionResult(selector=action.selector, label=action.label, status="failed",
                                             message=str(exc)[:240]))
+            current_label = ""
         if before_action:
             before_action()
+        stage('settle')
         await page.wait_for_timeout(800)
         await ensure_current_page()
         # A reactive ATS may normalize or clear a value after the input event.
@@ -2068,6 +2872,8 @@ class BrowserDemoService:
         # based on final DOM state instead of an optimistic immediate read.
         actions_by_selector = {action.selector: action for action in request.actions}
         for result in results:
+            current_label = result.label
+            stage('final_verify')
             action = actions_by_selector.get(result.selector)
             field = fields.get(result.selector)
             if (result.status not in {"filled", "failed"} or result.selector not in applied_selectors
@@ -2097,10 +2903,13 @@ class BrowserDemoService:
                     # exception cannot be reclassified as a successful write.
                     result.status = "filled"
                     result.message = "页面稳定后回读验证成功"
+            except _ExecutionTargetChanged:
+                raise
             except Exception as exc:
                 result.status = "failed"
                 result.verified = False
                 result.message = str(exc)[:240]
+        current_label = ""
         check = await self.pre_submit_check(session_id)
         return ExecutionResult(url=page.url, completed=sum(r.status == "filled" for r in results),
                                skipped=sum(r.status == "skipped" for r in results),
@@ -2110,7 +2919,7 @@ class BrowserDemoService:
                                results=results, pre_submit=check)
 
     async def close(self) -> None:
-        if self.context:
+        if self.context and not self._keep_safari_window:
             try:
                 await self.context.close()
             except Exception:
@@ -2126,6 +2935,7 @@ class BrowserDemoService:
             except Exception:
                 pass
         self.playwright = None; self.browser = None; self.context = None; self.page = None; self.session_id = None
+        self._keep_safari_window = False
         self.target = ApplicationTarget()
         self._stalled_navigation.clear()
 

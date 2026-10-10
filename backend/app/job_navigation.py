@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 from playwright.async_api import Page
 
 from .browser_models import ApplicationTarget, NavigationCandidate
+from .recruitment_entrances import ORGANIZATION_ENTRANCES_JS
 
 
 LIST_LABEL = re.compile(r"^(校园招聘|校招职位|招聘职位|招聘岗位|职位列表|岗位列表|查看职位|查看岗位|全部职位|全部岗位|投递简历|加入我们|campus jobs|careers|jobs|view jobs|open positions)$", re.I)
@@ -234,6 +235,8 @@ async def observe_navigation(page: Page, target: ApplicationTarget | None = None
       }
       const detailContent=descriptionIn(document.body);
       const nodes=[...document.querySelectorAll('a[href], button, [role="button"], input[type="search"], input[placeholder], input[aria-label]')].filter(visible);
+      const organizations=(__ORGANIZATION_ENTRANCES__)();
+      for(const node of organizations.keys()) if(!nodes.includes(node)) nodes.push(node);
       // The official campus script delegates positionClick to these div cards.
       // Mark the title, never the card centre, which can hit .applybtn instead.
       // No destination URL is invented for an in-place detail expansion.
@@ -292,7 +295,8 @@ async def observe_navigation(page: Page, target: ApplicationTarget | None = None
       const items=nodes.slice(0,400).map((el,index)=>{
         const marker=`n${index}`;el.setAttribute('data-zhida-nav',marker);
         const cardTitle=el.querySelector('[class*="job-title" i],[class*="jobTitle"],[class*="job-name" i],h2,h3');
-        const label=clean(cardTitle?.innerText||el.innerText||el.getAttribute('aria-label')||el.getAttribute('placeholder')||el.value);
+        const organization=organizations.get(el);
+        const label=organization?.label||clean(cardTitle?.innerText||el.innerText||el.getAttribute('aria-label')||el.getAttribute('placeholder')||el.value);
         const expansionCard=expandableTitles.get(el);
         const beisenTitle=beisenTitles.get(el);
         const card=expansionCard||beisenTitle?.card||el.closest('[class*="job-item"], [class*="job-card"], [class*="position-item"], li, article');
@@ -308,6 +312,9 @@ async def observe_navigation(page: Page, target: ApplicationTarget | None = None
         const beisenSearch=beisenList&&el.tagName==='INPUT'&&!el.closest('form')&&
           /^(搜索职位关键词|搜索職位關鍵詞|Search for job keywords)$/.test(clean(el.getAttribute('placeholder')));
         return {marker,label,href:el.tagName==='A'?el.getAttribute('href')||'':'',
+          organization:Boolean(organization),organizationSection:organization?.section||'',
+          navigationChrome:Boolean(el.closest('nav,header,[role="navigation"]')),
+          associatedForm:Boolean(el.form||el.hasAttribute('form')),explicitType:el.getAttribute('type')||'',
           input:el.tagName==='INPUT',type:el.type||'',context:clean(card?.innerText||label).slice(0,1000),
           expansionPid:expansionCard?.getAttribute('pid')||'',
           observedKey,beisenTitle:Boolean(beisenTitle),beisenSearch,
@@ -317,7 +324,8 @@ async def observe_navigation(page: Page, target: ApplicationTarget | None = None
       });
       return {items,title:document.title,text:clean(document.body?.innerText).slice(0,24000),
         heading:clean(heading?.innerText),detailContent,expandedJobId:activeCard?.getAttribute('pid')||''};
-    }""", {"autohomeList": autohome_list,"beisenList":beisen_list,"beisenDetail":beisen_detail})
+    }""".replace("__ORGANIZATION_ENTRANCES__", ORGANIZATION_ENTRANCES_JS),
+        {"autohomeList": autohome_list,"beisenList":beisen_list,"beisenDetail":beisen_detail})
     candidates = []
     private = {}
     seen = set()
@@ -330,7 +338,9 @@ async def observe_navigation(page: Page, target: ApplicationTarget | None = None
             if item["type"] not in {"text", "search"} or not SEARCH_HINT.search(label) or NON_JOB_SEARCH.search(label):
                 continue
             kind = "search_jobs"
-        elif item["type"] in {"submit", "reset"}:
+        elif item["type"] in {"submit", "reset"} and not (
+                item.get("organization") and not item.get("associatedForm")
+                and item.get("explicitType") not in {"submit", "reset"}):
             continue
         elif item["expansionPid"] or item["beisenTitle"]:
             kind = "open_job"
@@ -338,7 +348,7 @@ async def observe_navigation(page: Page, target: ApplicationTarget | None = None
                 (urlparse(href).hostname or "").casefold() == "talent.autohome.com.cn" and
                 urlparse(href).path == "/recruit-delivery.html")):
             kind = "open_job"
-        elif (LIST_LABEL.fullmatch(label) or (href and re.search(r"(?:#/jobs(?:\?|$)|/jobs/?$|/positions/?$)", href))):
+        elif (item.get("organization") or LIST_LABEL.fullmatch(label) or (href and re.search(r"(?:#/jobs(?:\?|$)|/jobs/?$|/positions/?$)", href))):
             kind = "browse_jobs"
         else:
             continue
@@ -349,6 +359,10 @@ async def observe_navigation(page: Page, target: ApplicationTarget | None = None
             # read-only preview. Only an observed listing/section link qualifies.
             continue
         if item["href"] and not href:
+            continue
+        if kind == "browse_jobs" and not item.get("organization") and href == page.url:
+            # An already-selected top navigation link is not a new entrance.
+            # Do not guess that re-clicking it reveals organization/job cards.
             continue
         unique = (kind, href, label, item["expansionPid"], item["observedKey"])
         if unique in seen:
@@ -370,7 +384,9 @@ async def observe_navigation(page: Page, target: ApplicationTarget | None = None
             if source_id:
                 matches_target = matches_target and source_id == item["expansionPid"]
         candidate = NavigationCandidate(id=identifier,label=label,url=href,kind=kind,
-            matches_target=matches_target)
+            matches_target=matches_target,
+            entry_scope="organization" if item.get("organization") else "navigation",
+            requires_user_choice=bool(item.get("organization")))
         candidates.append(candidate)
         private[identifier] = item
     return {"candidates":candidates,"private":private,"text":observed["text"],
@@ -387,6 +403,9 @@ def choose_candidate(candidates: list[NavigationCandidate], kind: str, target: A
         if not chosen:
             raise ValueError("页面候选已经变化，请重新识别后选择真实入口")
         return chosen
+    # Headquarters/branch selection expresses an application preference, not
+    # proof of a job match. Even a single organization needs an explicit choice.
+    allowed = [item for item in allowed if not item.requires_user_choice]
     if kind == "open_job":
         allowed = [item for item in allowed if item.matches_target] if target.job_title.strip() else []
     if kind == "browse_jobs" and re.search(r"校招|校园|campus|毕业|20\d{2}",

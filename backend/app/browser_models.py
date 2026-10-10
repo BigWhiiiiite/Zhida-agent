@@ -21,6 +21,8 @@ class NavigationCandidate(BaseModel):
     url: str = ""
     kind: Literal["browse_jobs", "search_jobs", "open_job"]
     matches_target: bool = False
+    entry_scope: Literal["navigation", "organization"] = "navigation"
+    requires_user_choice: bool = False
 
 
 class BrowserStart(BaseModel):
@@ -28,6 +30,7 @@ class BrowserStart(BaseModel):
     url: str = Field(min_length=1, max_length=2000)
     target: ApplicationTarget | None = None
     resume_id: str = Field(default="", max_length=200)
+    safari_window_token: str = Field(default="", max_length=200)
 
 
 class TaskResumeUpdate(BaseModel):
@@ -42,6 +45,92 @@ class ExpandSectionRequest(BaseModel):
 class NativeResumeImportRequest(BaseModel):
     resume_id: str = Field(min_length=1, max_length=200)
     confirm_site_parse: bool = False
+
+
+class QuestionEvidence(BaseModel):
+    text: str = Field(max_length=500)
+    source: str = Field(max_length=40)
+    owned: bool = False
+
+
+class FieldConstraints(BaseModel):
+    input_type: str = ""
+    input_mode: str = ""
+    pattern: str = ""
+    min_length: int | None = None
+    max_length: int | None = None
+    minimum: str = ""
+    maximum: str = ""
+    step: str = ""
+
+
+class FieldObservation(BaseModel):
+    version: int = 1
+    question_status: Literal["verified", "unverified", "missing", "ambiguous"] = "missing"
+    options_status: Literal["not_applicable", "native_complete", "group_complete", "observed_subset",
+                            "unavailable", "deferred", "dependent", "calendar"] = "not_applicable"
+    required_status: Literal["required", "not_marked"] = "not_marked"
+    required_evidence: list[str] = Field(default_factory=list)
+    record_status: Literal["not_applicable", "container_observed", "unresolved", "ambiguous"] = "not_applicable"
+    issues: list[str] = Field(default_factory=list)
+
+
+class CascadeOptionObservation(BaseModel):
+    model_config = {"extra": "forbid"}
+    text: str = Field(max_length=240)
+    text_truncated: bool = False
+    disabled: bool = False
+    branch: bool = False
+
+
+class CascadeLayerObservation(BaseModel):
+    model_config = {"extra": "forbid"}
+    visible_layer_index: int = Field(ge=0, le=4)
+    declared_level: int | None = Field(default=None, ge=1, le=99)
+    visible_option_count: int = Field(ge=0)
+    truncated: bool = False
+    options: list[CascadeOptionObservation] = Field(default_factory=list, max_length=80)
+
+
+class CascadeObservation(BaseModel):
+    """Read evidence of visible columns, never a selected or complete path."""
+    model_config = {"extra": "forbid"}
+    control_kind: Literal["cascade"] = "cascade"
+    read_only: Literal[True] = True
+    scope: Literal["owned_current_visible_layers"] = "owned_current_visible_layers"
+    options_capture: Literal["dependent"] = "dependent"
+    layers: list[CascadeLayerObservation] = Field(default_factory=list, max_length=5)
+    observed_layer_count: int = Field(ge=0)
+    truncated: bool = False
+    complete: Literal[False] = False
+    limitations: list[str] = Field(default_factory=list, max_length=5)
+
+
+class ExtractionIssue(BaseModel):
+    label: str
+    reason: str
+    selector: str = ""
+
+
+class FormExtractionReport(BaseModel):
+    version: int = 1
+    scope: Literal["current_visible_document"] = "current_visible_document"
+    # observed is not a claim that hidden/conditional fields do not exist.
+    capture_status: Literal["observed", "partial", "unknown"] = "unknown"
+    observed_controls: int = 0
+    captured_controls: int = 0
+    intentionally_excluded_controls: int = 0
+    unmapped_controls: int = 0
+    question_count: int = 0
+    verified_questions: int = 0
+    unclear_questions: int = 0
+    options_pending_questions: int = 0
+    ambiguous_record_questions: int = 0
+    embedded_regions: int = 0
+    unread_shadow_regions: int = 0
+    pending_sections: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    issues: list[ExtractionIssue] = Field(default_factory=list)
 
 
 class PageField(BaseModel):
@@ -78,16 +167,26 @@ class PageField(BaseModel):
     field_signature: str = ""
     signature_rank: int = 0
     container_key: str = ""
+    record_evidence: str = ""
     record_keys: list[str] = Field(default_factory=list)
     # All options belonging to one radio/checkbox question share this DOM-derived key.
     # It prevents option captions such as “是” and “否” from becoming separate questions.
     control_group_key: str = ""
     expected_input: str = ""
     date_precision: Literal["", "date", "month"] = ""
+    control_kind: str = ""
+    control_evidence: str = ""
     # Proven from this control's own opened area menu, never label guessing.
     region_picker: bool = False
     region_value_path: str = ""
     recognition_evidence: str = ""
+    # Raw, control-owned evidence is retained separately from a heuristic title.
+    question_candidates: list[QuestionEvidence] = Field(default_factory=list)
+    constraints: FieldConstraints = Field(default_factory=FieldConstraints)
+    observation: FieldObservation | None = None
+    required_evidence: list[str] = Field(default_factory=list)
+    options_capture: str = ""
+    cascade_observation: CascadeObservation | None = None
     # Server-derived knowledge references, never personal values or executable instructions.
     knowledge_profile_path: str = ""
     knowledge_id: str = ""
@@ -114,10 +213,14 @@ class BrowserSnapshot(BaseModel):
     session_id: str
     url: str
     title: str
+    browser_engine: Literal["safari", "chromium"] = "chromium"
     recognition_profile: str = "generic-semantic"
     site_route: SiteRoute = Field(default_factory=SiteRoute)
     fields: list[PageField]
+    # Prompt-only neighbour/record evidence. Not executable action targets.
+    context_fields: list[PageField] = Field(default_factory=list)
     knowledge_context: list[FieldKnowledgeEvidence] = Field(default_factory=list)
+    extraction_report: FormExtractionReport | None = None
 
 
 class FillAction(BaseModel):
@@ -303,3 +406,14 @@ class ApplicationAssistResult(BaseModel):
     events: list[ApplicationAssistEvent] = Field(default_factory=list)
     rounds: int = 0
     record_coverage: list[ApplicationRecordCoverage] = Field(default_factory=list)
+    model_calls: int = 0
+
+
+class ApplicationAssistProgress(BaseModel):
+    run_id: str
+    status: Literal['running', 'finished', 'interrupted'] = 'running'
+    phase: str = 'observe'
+    message: str = '正在读取当前申请表'
+    events: list[ApplicationAssistEvent] = Field(default_factory=list)
+    result: ApplicationAssistResult | None = None
+    cancel_requested: bool = False

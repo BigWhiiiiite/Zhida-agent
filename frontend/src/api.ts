@@ -1,6 +1,7 @@
 import type { ApplicationTarget, ChatConversation, ChatConversationSummary, ApplicationAgentTurn, ApplicationKnowledgeInput, ApplicationKnowledgeRecord, KnowledgeMappingTarget, ApplicationQueueItem, ApplicationReadiness, ApplicationWorkflowState, AuthSession, AutofillPhaseResult, BrowserSnapshot, CandidateProfile, CompanySize, Conflict, DiscoveryAdapter, ExecutionResult, FillAction, FormPlan, FormReviewResult, JobDiscoveryResult, JobEvidenceExplanation, JobVerification, ModelHealth, NativeResumeImportResult, OfficialJobSource, PreSubmitCheck, QueueStatus, RecommendationBatch, ResumeProfile, ResumeRecord, SmartJobSearchResult, UserAccount } from './types'
-import type {ApplicationAssistRequest, ApplicationAssistResult, ApplicationJourneyResult, ConfirmedResumeFact, ResumeFactTargets} from './types'
+import type {ApplicationAssistRequest, ApplicationAssistResult, ApplicationAssistProgress, ApplicationJourneyResult, ConfirmedResumeFact, ResumeFactTargets} from './types'
 import {resumeAttachmentRequest} from './resumeAttachment'
+import type {ObservationConsent,PageRegionObservation,ExtractionAuditRequest,ExtractionAuditResult} from './types'
 
 export const API = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/api`
 const nativeFetch=window.fetch.bind(window)
@@ -18,6 +19,9 @@ async function result<T>(response:Response):Promise<T>{
 }
 
 export const api={
+  previewExistingSafari:(url:string)=>fetch(`${API}/websites/safari/preview-existing`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}).then(result<{preview_token:string;url:string;expires_in_seconds:number}>),
+  confirmExistingSafari:(url:string,previewToken:string)=>fetch(`${API}/websites/safari/confirm-existing`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,preview_token:previewToken})}).then(result<{status:'requested';browser:'safari';automation_connected:false;safari_window_token:string;window_reused:true}>),
+  openExternalWebsite:(url:string,browser:'safari'|'chrome')=>fetch(`${API}/websites/open`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,browser})}).then(result<{status:'requested';browser:'safari'|'chrome';automation_connected:false;safari_window_token?:string;window_reused?:boolean}>),
   me:()=>fetch(`${API}/auth/me`).then(result<UserAccount>),
   register:(email:string,password:string,display_name:string)=>fetch(`${API}/auth/register`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password,display_name})}).then(result<AuthSession>),
   login:(email:string,password:string)=>fetch(`${API}/auth/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})}).then(result<AuthSession>),
@@ -60,9 +64,14 @@ export const api={
   chatConversation:(id:string)=>fetch(`${API}/chat/conversations/${encodeURIComponent(id)}`).then(result<ChatConversation>),
   saveChatDraft:(id:string,draft:{company:string;job_title:string;city:string;recruitment_cycle:string;url:string;intent:'apply'|'recommend'|'profile'|'clarify'})=>fetch(`${API}/chat/conversations/${encodeURIComponent(id)}/draft`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(draft)}).then(result<ChatConversation>),
   sendChatMessage:(id:string,text:string,image:File|null,consent:boolean)=>{const data=new FormData();data.append('text',text);data.append('model_consent',String(consent));if(image)data.append('image',image);return fetch(`${API}/chat/conversations/${encodeURIComponent(id)}/messages`,{method:'POST',body:data}).then(result<ChatConversation>)},
-  startBrowser:(url:string,target?:ApplicationTarget,resume_id='')=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,target,resume_id})}).then(result<BrowserSnapshot>),
+  startBrowser:(url:string,target?:ApplicationTarget,resume_id='',safari_window_token='')=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,target,resume_id,safari_window_token})}).then(result<BrowserSnapshot>),
   currentBrowser:()=>fetch(`${API}/browser/current`).then(result<{session_id:string|null;occupied:boolean;resume_id:string;assistance_version?:number;journey_version?:number;record_completion_version?:number}>),
   browserSnapshot:(id:string)=>fetch(`${API}/browser/${id}/snapshot`).then(result<BrowserSnapshot>),
+  recognitionDiagnostics:(id:string)=>fetch(`${API}/browser/${id}/recognition-diagnostics`).then(result<Record<string,unknown>>),
+  observationConsent:(id:string)=>fetch(`${API}/browser/${id}/observation-consent`).then(result<ObservationConsent>),
+  extractionAudit:(id:string,payload:ExtractionAuditRequest)=>fetch(`${API}/browser/${id}/extraction-audit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ExtractionAuditResult>),
+  setObservationConsent:(id:string,enabled:boolean,context_token:string)=>fetch(`${API}/browser/${id}/observation-consent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,context_token})}).then(result<ObservationConsent>),
+  observeRegion:(id:string,selector:string,include_image:boolean,context_token:string)=>fetch(`${API}/browser/${id}/observe-region`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector,include_image,context_token})}).then(result<PageRegionObservation>),
   selectTaskResume:(id:string,resume_id:string)=>fetch(`${API}/browser/${id}/resume`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({resume_id})}).then(result<{resume_id:string;context_token:string}>),
   expandBrowserSection:(id:string,selector:string,candidate_id='')=>fetch(`${API}/browser/${id}/expand`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector,candidate_id})}).then(result<BrowserSnapshot>),
   inspectBrowserField:(id:string,selector:string)=>fetch(`${API}/browser/${id}/field/inspect`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selector})}).then(result<FormReviewResult>),
@@ -78,7 +87,9 @@ export const api={
   planForm:(id:string)=>fetch(`${API}/browser/${id}/plan`,{method:'POST'}).then(result<FormPlan>),
   reviewForm:(id:string,useModel=false)=>fetch(`${API}/browser/${id}/review${useModel?'?use_model=true':''}`,{method:'POST'}).then(result<FormReviewResult>),
   autofillPhase:(id:string,phase:'rules'|'model')=>fetch(`${API}/browser/${id}/autofill`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phase})}).then(result<AutofillPhaseResult>),
-  assistApplication:(id:string,payload:ApplicationAssistRequest)=>fetch(`${API}/browser/${id}/assist`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ApplicationAssistResult>),
+  assistApplication:(id:string,payload:ApplicationAssistRequest,runId?:string)=>fetch(`${API}/browser/${id}/assist${runId?`?run_id=${encodeURIComponent(runId)}`:''}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ApplicationAssistResult>),
+  assistProgress:(id:string,runId:string)=>fetch(`${API}/browser/${id}/assist/progress/${encodeURIComponent(runId)}`).then(result<ApplicationAssistProgress>),
+  cancelAssist:(id:string,runId:string)=>fetch(`${API}/browser/${id}/assist/progress/${encodeURIComponent(runId)}/cancel`,{method:'POST'}).then(result<ApplicationAssistProgress>),
   executeForm:(id:string,actions:FillAction[],resume_id:string,context_token='')=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actions,min_confidence:.85,resume_id,context_token})}).then(result<ExecutionResult>),
   uploadResumeAttachment:(id:string,resumeId:string,contextToken:string,confirmed=false)=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(resumeAttachmentRequest(resumeId,contextToken,confirmed))}).then(result<ExecutionResult>),
   checkForm:(id:string)=>fetch(`${API}/browser/${id}/check`).then(result<PreSubmitCheck>),

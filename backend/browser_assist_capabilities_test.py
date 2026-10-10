@@ -24,6 +24,13 @@ class FakePage:
         self.wait_for_timeout = AsyncMock()
         self.evaluate = AsyncMock(side_effect=self._evaluate)
 
+    async def evaluate_handle(self, script, argument=None):
+        assert script == '() => document'
+        return SimpleNamespace(
+            evaluate=AsyncMock(return_value=True),
+            dispose=AsyncMock(),
+        )
+
     def _evaluate(self, script, argument=None):
         if script == "() => performance.timeOrigin":
             return self.document_origin
@@ -61,10 +68,9 @@ async def readiness_tests():
         assert (await service.settled_snapshot(SESSION)).fields[0].name == "name"
     assert service.snapshot.await_count == 3
     assert [call.kwargs for call in service.snapshot.await_args_list] == [
-        {"probe_options": False}, {"probe_options": False}, {}]
+        {"probe_options": False}, {"probe_options": False}, {"probe_options": False}]
 
-    # Reading menus may exceed the structural loading budget without falsely
-    # reporting a fully rendered form as loading. No real sleep/network used.
+    # Stable observation must never implicitly request dropdown discovery.
     service = service_at()
     clock = SimpleNamespace(now=0.0)
     clock.monotonic = lambda: clock.now
@@ -77,9 +83,9 @@ async def readiness_tests():
     service.snapshot = AsyncMock(side_effect=probe)
     with patch.object(browser_service, 'time', clock), patch.object(browser_service.asyncio, 'sleep', AsyncMock()):
         assert (await service.settled_snapshot(SESSION)).fields
-    assert clock.now == 6.0 and service.snapshot.await_count == 3
+    assert clock.now == 0.0 and service.snapshot.await_count == 3
 
-    # A new question during menu discovery must still invalidate the plan.
+    # A new question during final passive verification invalidates the plan.
     service = service_at()
     service.snapshot = AsyncMock(side_effect=[snapshot(), snapshot(), snapshot(fields=[field('changed')])])
     with patch.object(browser_service.asyncio, 'sleep', AsyncMock()):

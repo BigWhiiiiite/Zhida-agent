@@ -97,6 +97,12 @@ class ResumeProfile(BaseModel):
     ethnicity: str = ""
     political_status: str = ""
     marital_status: str = ""
+    height_cm: float | None = Field(default=None, gt=0, le=300)
+    weight_kg: float | None = Field(default=None, gt=0, le=600)
+    student_origin: str = ""
+    veteran_status: Literal["", "是", "否"] = ""
+    study_continuity: Literal["", "是", "否"] = ""
+    formal_employment_status: Literal["", "有", "无"] = ""
     qq: str = ""
     wechat: str = ""
     location: str = ""

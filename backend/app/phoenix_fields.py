@@ -6,6 +6,7 @@ ux-standard-form owns a record, including description blocks split by the ATS.
 from __future__ import annotations
 
 from .field_semantics import education_level_hint
+from .form_observation import retain_adapter_evidence
 
 
 CHOICE_STATE_JS = r"""el => {
@@ -128,5 +129,5 @@ async def refine_phoenix_fields(page, data: list[dict]) -> list[dict]:
             control = page.locator(item['selector'])
             if await control.evaluate("el=>el.matches('.phoenix-radio')"):
                 patch['current_value'] = await control.evaluate(CHOICE_STATE_JS)
-        result.append({**item, **patch})
+        result.append({**item, **retain_adapter_evidence(item, patch, 'phoenix-owned')})
     return result

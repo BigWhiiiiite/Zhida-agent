@@ -133,6 +133,8 @@ def test_option_boundaries() -> None:
         ("C", "C++"), ("C", "C#"), ("AB", "A/B"),
         ("远程", "远程面试（需服从线下面试安排）"),
         ("示例学院", "另一所示例学院"),
+        ("硕士", "研究生"), ("硕士", "硕士及以上"),
+        ("硕士", "博士研究生"), ("博士", "博士后"), ("本科", "学士"),
     )
     for wanted, candidate in negative:
         assert not _option_matches(wanted, candidate), (wanted, candidate)
@@ -141,12 +143,15 @@ def test_option_boundaries() -> None:
     for wanted, candidate in (("北京", "北京市"), ("内蒙古", "内蒙古自治区"),
                                ("男", "Male"), ("中国", "中国大陆"),
                                ("英语", "English"), ("远程", "线上面试"),
+                               ("硕士", "硕士研究生"), ("博士", "博士研究生"),
                                ("Python", "PYTHON"), ("Ｃ＋＋", "C++")):
         assert _option_matches(wanted, candidate), (wanted, candidate)
         assert _best_option(wanted, [candidate]) == candidate
         assert _selected_values_match([wanted], candidate)
     assert _best_option("北京市", ["北京市", "北京市"]) == ""
     assert _best_option("北京", ["北京市", "北京省"]) == ""
+    assert _best_option("硕士", ["硕士研究生", "硕 士 研 究 生"]) == ""
+    assert _best_option("硕士", ["硕士", "硕士研究生"]) == "硕士"
     assert not _selected_values_match(["北京"], "北京, 上海")
     assert not _selected_values_match(["北京", "上海"], "北京")
     assert not _selected_values_match(["北京", "北京"], "北京, 上海")

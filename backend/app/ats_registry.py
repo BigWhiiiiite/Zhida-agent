@@ -22,7 +22,7 @@ class SiteRoute(BaseModel):
 
 
 COMMON_OPTIONS = (
-    '[role="option"]', 'option', '.ant-select-item-option', '.arco-select-option',
+    '[role="option"]', 'option', '.ant-select-item-option', '.ant-select-dropdown-menu-item', '.arco-select-option',
     '.el-select-dropdown__item', '.ivu-select-item', '.semi-select-option',
     '[class*="select-option"]', '[class*="dropdown-item"]',
     '.select2-results__option[role="treeitem"]',
