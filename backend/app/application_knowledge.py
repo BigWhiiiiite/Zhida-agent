@@ -218,6 +218,8 @@ class KnowledgeMatch(BaseModel):
 
 
 def initialize() -> None:
+    if storage.postgresql_enabled():
+        return  # Managed exclusively by Alembic, never DDL with runtime role.
     with storage._connection() as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS application_knowledge (
             id TEXT PRIMARY KEY, user_id TEXT NOT NULL, site_scope TEXT NOT NULL,
@@ -399,6 +401,24 @@ def retrieve_knowledge(snapshot: BrowserSnapshot) -> dict[str, list[KnowledgeMat
     fields = snapshot.fields[:200]
     queries = ["；".join(filter(None, (_field_question(field), field.section,
                                      field.entity_scope)))[:1000] for field in fields]
+    if storage.postgresql_enabled():
+        from .backend_v2.workbench_rag import knowledge_candidates
+        ranked=knowledge_candidates(user_id,scope,queries)
+        result={}
+        for field,hit in zip(fields,ranked):
+            candidates=[]
+            for record in records:
+                exact,usable,reason=_eligibility(record,field)
+                if not exact and record.id not in hit['ids']:continue
+                candidates.append(KnowledgeMatch(record=record,score=1.0 if exact else .5,
+                    exact=exact,usable=usable,reason=reason,
+                    retrieval_mode='hybrid' if hit['mode'] in {'ann','exact_filtered'} else 'keyword-only'))
+            if len({(c.record.profile_path,c.record.entity_scope) for c in candidates if c.usable})>1:
+                for c in candidates:
+                    if c.usable:c.usable=False;c.reason='同一道题存在互相冲突的人工映射，请核对'
+            candidates.sort(key=lambda c:(c.usable,c.exact,c.score),reverse=True)
+            if candidates:result[field.selector]=candidates[:MAX_MATCHES_PER_FIELD]
+        return result
     vectors, query_vectors, dense = _vectors(user_id, rows, queries)
     result: dict[str, list[KnowledgeMatch]] = {}
     for field, query, query_vector in zip(fields, queries, query_vectors):

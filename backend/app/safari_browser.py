@@ -269,7 +269,11 @@ class SafariPage:
             self.url_validator(expected_url)
         key = uuid4().hex if handle else ""
         save = (
-            f"(window[{json.dumps(self._registry)}] ||= new Map()).set({json.dumps(key)}, result);"
+            f"const registry = (window[{json.dumps(self._registry)}] ||= new Map());"
+            "if (!Object.prototype.hasOwnProperty.call(registry, '__zhidaDocument')) "
+            "Object.defineProperty(registry, '__zhidaDocument', {value: document});"
+            "if (registry.__zhidaDocument !== document) throw new Error('ZHIDA_HANDLE_EXPIRED');"
+            f"registry.set({json.dumps(key)}, result);"
             "return {kind: result instanceof Element ? 'element' : 'value', present: result != null};"
             if handle else "return result === undefined ? null : result;"
         )
@@ -387,11 +391,19 @@ class SafariPage:
 class SafariHandle:
     def __init__(self, page, key, element=False, present=True):
         self.page, self.key, self.element, self.present = page, key, element, present
+        self._origin_url = page.url
+        self._origin_context = page.context
+        self._origin_window = page.window_id
+        self._origin_tab = page.tab_index
+        self._origin_registry = page._registry
+        self._disposed = False
 
     def as_element(self):
         return self if self.element and self.present else None
 
     async def evaluate(self, expression: str, arg=None):
+        if self._disposed:
+            raise ValueError("网页句柄已释放，请重新识别")
         ref = self.page._argument(self)
         return await self.page._evaluate(
             f"(() => {{ const el = {ref}; if (el == null) throw new Error('ZHIDA_HANDLE_EXPIRED');"
@@ -399,7 +411,31 @@ class SafariHandle:
         )
 
     async def dispose(self):
-        await self.page._evaluate(f"window[{json.dumps(self.page._registry)}]?.delete({json.dumps(self.key)})")
+        if self._disposed:
+            return
+        self._disposed = True
+        if (self.page.is_closed() or self.page.context is not self._origin_context
+                or self.page.window_id != self._origin_window or self.page.tab_index != self._origin_tab
+                or self.page._registry != self._origin_registry or not self._origin_url):
+            return
+        # Cleanup is not permission to inspect a replacement document. Do NOT
+        # call _evaluate(): its generic wrapper reads document.title. Check the
+        # exact origin URL in the same Apple Event before any JavaScript, then
+        # close the navigation race with a script guard. A same-URL reload has
+        # no original document-bound registry; only identity metadata is tested,
+        # never replacement page text, values, storage, or arbitrary cleanup.
+        script = f'''(() => {{
+          if (location.href !== {json.dumps(self._origin_url)}) return false;
+          const registry = window[{json.dumps(self._origin_registry)}];
+          if (!(registry instanceof Map) || registry.__zhidaDocument !== document ||
+              !registry.has({json.dumps(self.key)})) return false;
+          return registry.delete({json.dumps(self.key)});
+        }})()'''
+        command = ("if (URL of tab tabIndex of window id windowId) is not "
+                   + apple_literal(self._origin_url) + ' then return "ZHIDA_HANDLE_CLEANUP_SKIPPED"\n'
+                   + "return do JavaScript " + apple_literal(script)
+                   + " in tab tabIndex of window id windowId")
+        await self.page._command(command)
 
 
 class SafariLocator:

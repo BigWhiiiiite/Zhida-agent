@@ -54,6 +54,7 @@ from .form_agent import build_form_review, create_form_plan, create_local_form_p
 from .extraction_audit import (ExtractionAuditRequest, ExtractionAuditResult,
                                audit_extraction, document_fingerprint)
 from .page_observation import PageObservationRequest, PageRegionObservation, ObservationConsentRequest
+from .live_recognition import recognition_preview_router
 from .job_discovery import (official_job_sources, register_job_source,
                             remove_job_source, sync_official_source)
 from .job_models import (ApplicationQueueItem, ApplicationQueueUpdate,
@@ -81,8 +82,8 @@ from .storage import (create_pending_resume, current_user_id, delete_resume, del
 
 
 ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env", override=True)
-UPLOAD_DIR = ROOT / "uploads"
+load_dotenv(ROOT / ".env", override=False)
+UPLOAD_DIR = Path(os.getenv("ZHIDA_UPLOAD_DIR", str(ROOT / "uploads"))).expanduser().resolve()
 ALLOWED_SUFFIXES = {".pdf", ".docx", ".txt"}
 CONTENT_TYPES = {
     ".pdf": {"application/pdf", "application/octet-stream"},
@@ -183,6 +184,10 @@ async def lifespan(_: FastAPI):
     initialize_chat()
     app.state.browser_operation_lock = asyncio.Lock()
     yield
+    from .live_assisted import TASKS
+    for task in list(TASKS):task.cancel()
+    if TASKS:
+        await asyncio.gather(*list(TASKS),return_exceptions=True)
     await browser_demo.close()
 
 
@@ -676,6 +681,7 @@ async def current_browser_session() -> dict[str, Any]:
     # Recover task UI on refresh without exposing another user's URL or target.
     return {"session_id": session_id if owns_session else None, "occupied": bool(session_id),
             "assistance_version": 1,
+            "assistance_async_version": 1 if os.getenv('ZHIDA_V2_ASSISTED_ENABLED','false').lower()=='true' else 0,
             "record_completion_version": 1,
             "journey_version": 1,
             "resume_id": browser_task_resumes.get(session_id, "") if owns_session else ""}
@@ -755,6 +761,14 @@ def _require_local_browser_request(request: Request) -> None:
         raise HTTPException(403, "请从本机职达前端主动点击打开浏览器")
     if request.headers.get("sec-fetch-site") == "cross-site":
         raise HTTPException(403, "不能从其他网站启动本机浏览器")
+
+
+app.include_router(recognition_preview_router(
+    service=browser_demo, require_owner=_require_browser_owner,
+    task_binding=lambda session_id: (browser_task_resumes.get(session_id, ""),
+                                      browser_task_epochs.get(session_id, "")),
+    require_local=_require_local_browser_request,
+))
 
 
 @app.post("/api/websites/safari/preview-existing")
@@ -1322,7 +1336,8 @@ async def _run_application_assist(session_id: str, payload: ApplicationAssistReq
 
 
 async def _prepare_application_assist(session_id: str, payload: ApplicationAssistRequest,
-                                      *, on_progress=None, cancelled=lambda: False) -> ApplicationAssistResult:
+                                      *, on_progress=None, cancelled=lambda: False,
+                                      service_override=None) -> ApplicationAssistResult:
     _require_browser_owner(session_id)
     _require_task_resume(session_id, payload.resume_id)
     if browser_task_resumes.get(session_id) != payload.resume_id:
@@ -1346,7 +1361,7 @@ async def _prepare_application_assist(session_id: str, payload: ApplicationAssis
     pending = [names[key] for key in names if getattr(resume.profile, key)
                and any(item.field_path == key and item.status not in {"confirmed", "edited"}
                        for item in resume.evidence)]
-    return await prepare_application(browser_demo, session_id, payload, profile, guard=guard,
+    return await prepare_application(service_override or browser_demo, session_id, payload, profile, guard=guard,
         model_plan=lambda snapshot: _model_task_plan(session_id, snapshot),
         stamp_plan=lambda plan: _stamp_plan(session_id, plan),
         resume_path=_selected_resume_path(payload.resume_id) if payload.allow_site_parse else None,
@@ -1370,6 +1385,12 @@ async def assist_application(session_id: str, payload: ApplicationAssistRequest,
 
 @app.get('/api/browser/{session_id}/assist/progress/{run_id}', response_model=ApplicationAssistProgress)
 async def assist_progress(session_id: str, run_id: str) -> ApplicationAssistProgress:
+    from .live_assisted import enabled, store
+    if enabled():
+        try:
+            return store().progress(current_user_id(),run_id,session_id)
+        except LookupError:
+            pass
     _require_browser_owner(session_id)
     try:
         return assist_runs.get(run_id, current_user_id(), session_id)
@@ -1379,10 +1400,23 @@ async def assist_progress(session_id: str, run_id: str) -> ApplicationAssistProg
 
 @app.post('/api/browser/{session_id}/assist/progress/{run_id}/cancel', response_model=ApplicationAssistProgress)
 async def cancel_assist(session_id: str, run_id: str) -> ApplicationAssistProgress:
+    from .live_assisted import enabled, store
+    if enabled():
+        try:
+            return store().cancel(current_user_id(),run_id,session_id)
+        except LookupError:
+            pass
     progress = await assist_progress(session_id, run_id)
     if progress.status == 'running':
         progress.cancel_requested = True
     return progress
+
+
+from .live_assisted import create_assisted_router
+app.include_router(create_assisted_router(service=browser_demo,require_owner=_require_browser_owner,
+    task_binding=lambda sid:(browser_task_resumes.get(sid,''),_task_context(sid)[1]),
+    require_local=_require_local_browser_request,
+    prepare=_prepare_application_assist,operation_lock=lambda:app.state.browser_operation_lock))
 
 
 @app.post("/api/browser/{session_id}/journey", response_model=ApplicationJourneyResult)

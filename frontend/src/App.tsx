@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowRight, BriefcaseBusiness, Building2, Check, ChevronRight, CircleUserRound, Download, ExternalLink, FileJson, FileText, Files, Globe2, LayoutDashboard, ListChecks, LoaderCircle, LockKeyhole, LogOut, MapPin, MessageSquare, Play, Plus, RefreshCw, Save, ShieldCheck, Sparkles, Target, Trash2, UploadCloud, UserPlus, WandSparkles, X } from 'lucide-react'
 import { API, ApiError, api } from './api'
+import {backendConnection} from './backendConnection'
+import type {BackendHealth} from './backendConnection'
+import './backend-connection.css'
 import ApplicationKnowledge from './ApplicationKnowledge'
 import ApplicationWorkspace from './ApplicationWorkspace'
 import type {ApplicationWorkspaceSection} from './ApplicationWorkspace'
@@ -11,6 +14,7 @@ import AssistProgress from './AssistProgress'
 import ControlDiagnostics from './ControlDiagnostics'
 import FormExtractionQuality from './FormExtractionQuality'
 import ExtractionAudit from './ExtractionAudit'
+import RecognitionPreview from './RecognitionPreview'
 import PageObservation from './PageObservation'
 import AutofillRoutingSummary from './AutofillRoutingSummary'
 import ChatWorkspace from './ChatWorkspace'
@@ -27,7 +31,7 @@ import {canContinueWorkflow,workbenchView} from './workbenchView'
 import {observedJobTitle,shouldObserveWorkbench,workflowPageChanged} from './workbenchObservation'
 import './workbench-view.css'
 import { actionReviewTitle, modelPending, pendingActionSelectors, routeLabel, runAutofillPhases } from './autofillRouting'
-import {assistanceBackendReady,assistFailure,assistGuard,assistRequest,assistStatus,draftFieldsCompatible,forgetAssistRun,learnVerifiedDrafts,monthPrecisionMemory,needsMonthPrecisionConsent,rememberAssistRun,rememberedAssistRun,verifiedDraftEntries,watchAssist} from './applicationAssist'
+import {assistedSubmission,assistanceBackendReady,assistFailure,assistGuard,assistRequest,assistStatus,draftFieldsCompatible,forgetAssistRun,learnVerifiedDrafts,monthPrecisionMemory,needsMonthPrecisionConsent,rememberAssistRun,rememberedAssistRun,verifiedDraftEntries,watchAssist} from './applicationAssist'
 import type {ApplicationAssistResult,ApplicationAssistProgress,ApplicationJourneyResult} from './types'
 import type { ApplicationTarget, NavigationCandidate, ApplicationAgentTurn, ApplicationAnswerMemory, ApplicationQueueItem, ApplicationReadiness, ApplicationWorkflowState, BrowserSnapshot, CandidateProfile, CompanySize, Conflict, DiscoveryAdapter, Education, Evidence, ExecutionResult, Experience, FieldComparison, FillAction, FormPlan, JobEvidenceExplanation, JobRecommendation, JobVerification, LiveJobStatus, ModelHealth, NativeResumeImportResult, OfficialJobSource, PageField, PreSubmitCheck, Project, QueueStatus, RecommendationBatch, ResumeProfile, ResumeRecord, UserAccount } from './types'
 
@@ -39,6 +43,8 @@ const labels:Record<string,string>={name:'姓名',english_name:'英文姓名',ge
 
 export default function App(){
   const [user,setUser]=useState<UserAccount|null|undefined>(undefined)
+  const [backend,setBackend]=useState<BackendHealth|null>(null)
+  const [connectionError,setConnectionError]=useState('')
   const [page,setPage]=useState<Page>('overview'); const [profile,setProfile]=useState<CandidateProfile|null>(null)
   const [resumes,setResumes]=useState<ResumeRecord[]>([]); const [conflicts,setConflicts]=useState<Conflict[]>([])
   const [selected,setSelected]=useState(''); const [rawText,setRawText]=useState(''); const [busy,setBusy]=useState(false); const [notice,setNotice]=useState('')
@@ -48,7 +54,7 @@ export default function App(){
   const [activeBrowser,setActiveBrowser]=useState(false)
   const fileInput=useRef<HTMLInputElement>(null)
   const reload=async()=>{try{const [p,r,c]=await Promise.all([api.profile(),api.list(),api.conflicts()]);setProfile(p);setResumes(r);setConflicts(c);if(!selected&&r[0])setSelected(r[0].id)}catch(e){if(e instanceof ApiError&&e.status===401)setUser(null);else setNotice(message(e))}}
-  useEffect(()=>{api.me().then(setUser).catch(()=>setUser(null))},[])
+  useEffect(()=>{let active=true;void(async()=>{try{const health=await api.health();backendConnection(health);if(!active)return;setBackend(health);try{const account=await api.me();if(active)setUser(account)}catch(error){if(!active)return;if(error instanceof ApiError&&error.status===401)setUser(null);else setConnectionError(message(error))}}catch(error){if(active)setConnectionError(message(error))}})();return()=>{active=false}},[])
   useEffect(()=>{if(user)reload()},[user?.id])
   useEffect(()=>{if(user&&page==='chat')setChatVisitedUser(user.id)},[user?.id,page])
   useEffect(()=>{if(page!=='review'||!selected)return;let active=true;setRawText('');api.text(selected).then(data=>{if(active)setRawText(data.text)}).catch(e=>{if(active)setNotice(message(e))});return()=>{active=false}},[page,selected])
@@ -58,13 +64,14 @@ export default function App(){
   const updateResumeLocal=(item:ResumeRecord)=>setResumes(all=>all.map(r=>r.id===item.id?item:r))
   const nav=[['overview','总览',LayoutDashboard],['chat','求职助手',MessageSquare],['jobs','岗位推荐',Target],['profile','主档案',CircleUserRound],['resumes','简历资料库',Files],['review','待确认',AlertTriangle],['demo','投递工作台',Globe2]] as const
   const logout=async()=>{try{await api.logout()}catch{}setUser(null);setProfile(null);setResumes([]);setConflicts([]);setSelected('');setRawText('');setLaunchJob(null);setChatTarget(null);setChatVisitedUser(null);setActiveBrowser(false);setPage('overview');setNotice('')}
-  if(user===undefined)return <div className="auth-loading"><LoaderCircle className="spin" size={28}/><span>正在恢复登录状态…</span></div>
+  if(connectionError)return <div className="auth-loading"><section className="backend-unavailable" role="alert"><h2>暂时无法连接职达后端</h2><p>{connectionError}</p><p>请先启动 PostgreSQL 新后端网关（18000）和前端。不会自动切回旧资料库，也不需要重新注册账号。</p><button className="primary" onClick={()=>window.location.reload()}>重新检查连接</button></section></div>
+  if(user===undefined)return <div className="auth-loading"><LoaderCircle className="spin" size={28}/><span>正在检查后端并恢复登录状态…</span></div>
   if(!user)return <AuthPage onAuthenticated={setUser}/>
   return <div className="shell"><aside><div className="brand"><span><BriefcaseBusiness size={20}/></span><div><strong>职达 Zhida</strong><small>求职资料 Agent</small></div></div>
     <button className="primary full" onClick={()=>fileInput.current?.click()} disabled={busy}><Plus size={17}/>上传新简历</button><input ref={fileInput} hidden type="file" accept=".pdf,.docx,.txt" onChange={e=>upload(e.target.files?.[0])}/>
     <nav>{nav.map(([key,label,Icon])=><button key={key} className={page===key?'active':''} onClick={()=>setPage(key)}><Icon size={18}/>{label}{key==='review'&&<b>{conflicts.length+resumes.flatMap(r=>r.evidence).filter(e=>e.status==='pending_review').length}</b>}</button>)}</nav>
     <div className="privacy"><ShieldCheck size={17}/><div><strong>受控模型传输</strong><small>解析、匹配与授权聊天时发送</small></div></div><div className={`account-chip ${user.is_local?'local':''}`}><span>{user.is_local?'本':(user.display_name||user.email)[0].toUpperCase()}</span><div><strong>{user.is_local?'本机免登录':user.display_name||'职达用户'}</strong><small>{user.is_local?'数据保存在当前电脑':user.email}</small></div>{!user.is_local&&<button title="退出登录" onClick={logout}><LogOut size={15}/></button>}</div></aside>
-    <main><Top page={page}/>{notice&&<div className="notice">{notice}<button onClick={()=>setNotice('')}>×</button></div>}
+    <main>{backend&&<div className={`backend-connection ${backendConnection(backend).legacy?'legacy':''}`} role="status"><strong>{backendConnection(backend).label}</strong><small>{backendConnection(backend).detail}</small></div>}<Top page={page}/>{notice&&<div className="notice">{notice}<button onClick={()=>setNotice('')}>×</button></div>}
       {page==='overview'&&profile&&<Overview profile={profile} resumes={resumes} conflicts={conflicts} go={setPage}/>}
       {shouldKeepChatMounted(page,chatVisitedUser,user.id)&&<div hidden={page!=='chat'}><ChatWorkspace key={user.id} activeBrowser={activeBrowser} onGo={setPage} onLaunch={target=>{if(activeBrowser){setNotice('请先进入投递工作台结束原会话，再开始新目标。');setPage('demo');return}setLaunchJob(null);setChatTarget(target);setPage('demo');setNotice('目标已带入工作台。请先在官网完成登录和选岗，再提供信息填写页网址；确认设置不会自动投递。')}}/></div>}
       {page==='jobs'&&profile&&<JobRecommendations profile={profile} resumes={resumes} notify={setNotice} onApply={(job,resumeId,queueId)=>{if(activeBrowser){setPage('demo');setNotice('已有浏览器任务正在进行，请先结束原会话。当前网页及人工修改没有被覆盖。');return}setChatTarget(null);setLaunchJob({recommendation:job,resumeId,queueId});setPage('demo');setNotice(`已选择 ${job.job.company} · ${job.job.title}，岗位链接已自动带入投递工作台。`)}}/>}
@@ -79,7 +86,7 @@ function AuthPage({onAuthenticated}:{onAuthenticated:(user:UserAccount)=>void}){
   const [mode,setMode]=useState<'login'|'register'>('login');const [displayName,setDisplayName]=useState('');const [email,setEmail]=useState('');const [password,setPassword]=useState('');const [confirmPassword,setConfirmPassword]=useState('');const [busy,setBusy]=useState(false);const [error,setError]=useState('')
   const switchMode=(next:'login'|'register')=>{setMode(next);setError('');setPassword('');setConfirmPassword('')}
   const submit=async(e:React.FormEvent)=>{e.preventDefault();setError('');if(mode==='register'&&password!==confirmPassword){setError('两次输入的密码不一致');return}setBusy(true);try{const session=mode==='register'?await api.register(email,password,displayName):await api.login(email,password);onAuthenticated(session.user)}catch(err){setError(message(err))}finally{setBusy(false)}}
-  return <main className="auth-shell"><section className="auth-brand"><span><BriefcaseBusiness size={27}/></span><strong>职达 Zhida</strong><small>让每一份求职资料都有清晰归属</small><div><ShieldCheck size={18}/><p><b>账号级资料隔离</b><br/>密码只保存安全哈希，简历和投递清单按用户分开。</p></div></section><section className="auth-card"><div className="auth-tabs"><button className={mode==='login'?'active':''} onClick={()=>switchMode('login')}>登录</button><button className={mode==='register'?'active':''} onClick={()=>switchMode('register')}>创建账号</button></div><div className="auth-heading"><span>{mode==='login'?<LockKeyhole size={19}/>:<UserPlus size={19}/>}</span><div><h1>{mode==='login'?'欢迎回来':'创建你的职达账号'}</h1><p>{mode==='login'?'继续管理简历和投递任务':'第一位注册用户会自动接管当前本地资料'}</p></div></div><form onSubmit={submit}>{mode==='register'&&<label><span>显示名称</span><input autoComplete="name" value={displayName} onChange={e=>setDisplayName(e.target.value)} placeholder="例如：李春博"/></label>}<label><span>邮箱账号</span><input type="email" autoComplete="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@example.com"/></label><label><span>密码</span><input type="password" autoComplete={mode==='login'?'current-password':'new-password'} required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} placeholder="至少 8 位，包含两类字符"/></label>{mode==='register'&&<label><span>确认密码</span><input type="password" autoComplete="new-password" required minLength={8} value={confirmPassword} onChange={e=>setConfirmPassword(e.target.value)} placeholder="再次输入密码"/></label>}{error&&<div className="auth-error"><AlertTriangle size={15}/>{error}</div>}<button className="primary auth-submit" disabled={busy}>{busy?<LoaderCircle className="spin" size={17}/>:mode==='login'?<LockKeyhole size={17}/>:<UserPlus size={17}/>} {busy?'请稍候':mode==='login'?'登录':'创建账号并进入'}</button></form><footer>本地开发版使用 HttpOnly 会话 Cookie；部署时请开启 HTTPS。</footer></section></main>
+  return <main className="auth-shell"><section className="auth-brand"><span><BriefcaseBusiness size={27}/></span><strong>职达 Zhida</strong><small>让每一份求职资料都有清晰归属</small><div><ShieldCheck size={18}/><p><b>账号级资料隔离</b><br/>密码只保存安全哈希，简历和投递清单按用户分开。</p></div></section><section className="auth-card"><div className="auth-tabs"><button className={mode==='login'?'active':''} onClick={()=>switchMode('login')}>登录</button><button className={mode==='register'?'active':''} onClick={()=>switchMode('register')}>创建账号</button></div><div className="auth-heading"><span>{mode==='login'?<LockKeyhole size={19}/>:<UserPlus size={19}/>}</span><div><h1>{mode==='login'?'欢迎回来':'创建你的职达账号'}</h1><p>{mode==='login'?'继续管理简历和投递任务':'创建独立账号，已有资料仍归原账号所有'}</p></div></div><form onSubmit={submit}>{mode==='register'&&<label><span>显示名称</span><input autoComplete="name" value={displayName} onChange={e=>setDisplayName(e.target.value)} placeholder="例如：李春博"/></label>}<label><span>邮箱账号</span><input type="email" autoComplete="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@example.com"/></label><label><span>密码</span><input type="password" autoComplete={mode==='login'?'current-password':'new-password'} required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} placeholder="至少 8 位，包含两类字符"/></label>{mode==='register'&&<label><span>确认密码</span><input type="password" autoComplete="new-password" required minLength={8} value={confirmPassword} onChange={e=>setConfirmPassword(e.target.value)} placeholder="再次输入密码"/></label>}{error&&<div className="auth-error"><AlertTriangle size={15}/>{error}</div>}<button className="primary auth-submit" disabled={busy}>{busy?<LoaderCircle className="spin" size={17}/>:mode==='login'?<LockKeyhole size={17}/>:<UserPlus size={17}/>} {busy?'请稍候':mode==='login'?'登录':'创建账号并进入'}</button></form><footer>本地开发版使用 HttpOnly 会话 Cookie；部署时请开启 HTTPS。</footer></section></main>
 }
 
 function Top({page}:{page:Page}){const copy={chat:['求职助手','通过文字与招聘截图明确目标，再进入可控的投递流程。'],overview:['候选人资料总览','一次维护，反复用于之后的每次申请。'],jobs:['推荐投递清单','根据已确认简历生成可解释推荐，选中后直接进入投递流程。'],profile:['候选人主档案','这里是你的事实来源，Agent 不会擅自覆盖已确认信息。'],resumes:['简历资料库','管理不同语言、岗位方向和版本的简历。'],review:['识别结果检查','对照原文确认 Agent 拆分的字段，并处理资料冲突。'],demo:['投递工作台','选择简历和信息填写页，剩下的交给职达辅助。']}[page];return <header><div><p className="eyebrow">ZHIDA / PROFILE WORKSPACE</p><h1>{copy[0]}</h1><p>{copy[1]}</p></div>{page!=='demo'&&<a className="export" href={`${API}/export`} target="_blank" rel="noreferrer"><FileJson size={17}/>导出 JSON</a>}</header>}
@@ -547,7 +554,15 @@ function BrowserDemo({ownerId,active,profile,resumes,notify,onProfileUpdate,onRe
     try{
       const deferredFields=[...skippedSelectors].map(selector=>snapshot.fields.find(field=>field.selector===selector))
       if(deferredFields.some(field=>!field))throw new Error('本次留空的字段已变化，请先同步核对，未启动填写。')
-      const result=await api.assistApplication(snapshot.session_id,assistRequest(selectedResume,allowSiteParse&&snapshot.browser_engine!=='safari',deferredFields as PageField[]),run.id).catch(async error=>{
+      const capability=await api.currentBrowser()
+      const request=assistRequest(selectedResume,allowSiteParse&&snapshot.browser_engine!=='safari',deferredFields as PageField[])
+      const submission=assistedSubmission(capability.assistance_async_version??0,{
+          start:()=>api.startAssistance(snapshot.session_id,request,run.id),wait:async()=>{
+            const receipt=await watching
+            if(receipt.result)return receipt.result
+            throw receipt.error||new Error('未取得本轮回执；不会自动重发填写')
+          },legacy:()=>api.assistApplication(snapshot.session_id,request,run.id)})
+      const result=await submission.catch(async error=>{
         const receipt=await watching
         if(receipt.result)return receipt.result
         throw assistFailure(error,receipt.error)
@@ -759,6 +774,7 @@ function BrowserDemo({ownerId,active,profile,resumes,notify,onProfileUpdate,onRe
       <div className="review-buttons">
         {!snapshot&&<button disabled={!!busy||!hasMatchingSafari||!backendReady} onClick={()=>void start()}>只连接并读取页面</button>}
         <button disabled={!!busy} onClick={restoreExistingSession}>只读同步当前页</button>
+        {snapshot&&<button disabled={!!busy||stalePage} onClick={async()=>{if(!snapshot||busy)return;setBusy('reconcile');try{const receipt=await api.reconcileAssistance(snapshot.session_id);notify(`只读核对完成：已核实 ${receipt.resolved} 项，结果未明 ${receipt.remaining} 项；没有填写或重发操作。`)}catch(error){notify(message(error))}finally{setBusy('')}}}>只读核对未明操作</button>}
         {snapshot&&<button disabled={!!busy||!canAnalyze||hasDraftEdits} onClick={analyzeWithAI}>仅分析，不填写</button>}
         {snapshot&&<button disabled={!!busy||stalePage} onClick={async()=>{if(!snapshot||busy)return;setBusy('control-diagnostics');try{setControlDiagnostics(await api.recognitionDiagnostics(snapshot.session_id))}catch(error){notify(message(error))}finally{setBusy('')}}}>读取控件结构</button>}
       </div>
@@ -766,6 +782,7 @@ function BrowserDemo({ownerId,active,profile,resumes,notify,onProfileUpdate,onRe
       {recoveryWarning&&<p role="alert">{recoveryWarning}</p>}
       {systemGroups.length>0&&<details open><summary>识别缺口（不是用户事实问题）</summary><ul>{systemGroups.map(group=><li key={group.key}><strong>{group.label}</strong>：{group.checkboxGroup?.blockReason||group.fields.map(userQuestionBlockReason).filter(Boolean).join('；')}<button disabled={!!busy||stalePage} onClick={()=>inspectField(group.fields[0])}>定位检查</button></li>)}</ul></details>}
     </section>
+    {snapshot&&<RecognitionPreview sessionId={snapshot.session_id} resumeId={selectedResume} url={snapshot.url} disabled={!!busy} stale={stalePage} onBusy={value=>setBusy(value?'d2-recognition-preview':'')} notify={notify}/>}
     {snapshot?.extraction_report&&<FormExtractionQuality report={snapshot.extraction_report}/>}
     {snapshot&&<ExtractionAudit snapshot={snapshot} resumeId={selectedResume} revision={plan?.context_token||''} disabled={!!busy||stalePage} onBusy={value=>setBusy(value?'extraction-audit':'')} notify={notify} onPageInvalidated={()=>{setObservedChange(workflow);setWorkflow(null);setCheck(null);setRecoveryWarning('招聘页面已变化或连接已失效。旧填写计划已暂停，临时答案保留，请先同步当前页。')}}/>}
     {snapshot&&<PageObservation snapshot={snapshot} resumeId={selectedResume} revision={plan?.context_token||''} disabled={!!busy||stalePage} onBusy={value=>setBusy(value?'page-observation':'')} notify={notify}/>}

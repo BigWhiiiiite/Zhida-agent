@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextvars import ContextVar, Token
 from datetime import datetime, timedelta, timezone
@@ -37,7 +38,17 @@ def current_user_id() -> str:
     return user_id
 
 
+def postgresql_enabled() -> bool:
+    selected = os.getenv("ZHIDA_STORAGE_BACKEND", "sqlite").strip().lower()
+    if selected not in {"sqlite", "postgresql"}:
+        raise RuntimeError("ZHIDA_STORAGE_BACKEND 必须是 sqlite 或 postgresql；不会静默回退")
+    return selected == "postgresql"
+
+
 def _connection() -> sqlite3.Connection:
+    if postgresql_enabled():
+        from .backend_v2.workbench_storage import connection
+        return connection()  # type: ignore[return-value]
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -76,6 +87,10 @@ def _migrate_application_queue(conn: sqlite3.Connection) -> None:
 
 
 def initialize() -> None:
+    if postgresql_enabled():
+        from .backend_v2.workbench_storage import assert_ready
+        assert_ready()
+        return
     with _connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -227,6 +242,10 @@ def initialize() -> None:
 def create_user_account(email: str, display_name: str, password_hash: str) -> sqlite3.Row:
     user_id, now = str(uuid4()), _now()
     with _connection() as conn:
+        if hasattr(conn, "set_tenant"):
+            # Registration authenticates a new identity before touching private
+            # rows. Old unowned records may only be assigned during migration.
+            conn.set_tenant(user_id)
         first_user = not conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
         conn.execute("""INSERT INTO users
             (id, email, display_name, password_hash, created_at, updated_at)
@@ -236,7 +255,7 @@ def create_user_account(email: str, display_name: str, password_hash: str) -> sq
                ORDER BY CASE WHEN user_id=? THEN 0 ELSE 1 END LIMIT 1""",
             (LOCAL_USER_ID, LOCAL_USER_ID),
         ).fetchone()
-        if first_user and claimable_profile:
+        if first_user and claimable_profile and not hasattr(conn, "set_tenant"):
             conn.execute("DELETE FROM candidate_profiles WHERE user_id IN ('', ?) AND id!=?",
                          (LOCAL_USER_ID, claimable_profile["id"]))
             conn.execute("UPDATE candidate_profiles SET user_id=? WHERE id=?",
@@ -254,6 +273,15 @@ def create_user_account(email: str, display_name: str, password_hash: str) -> sq
 def activate_local_user() -> None:
     """Claim pre-auth data for the local workspace without creating login credentials."""
     now = _now()
+    if postgresql_enabled():
+        from .backend_v2.workbench_storage import connection
+        # The local desktop identity remains available without a password. This
+        # does not scan or claim another user's migrated records.
+        with connection(LOCAL_USER_ID) as conn:
+            conn.execute("""INSERT INTO candidate_profiles (id,user_id,profile_json,created_at,updated_at)
+                VALUES (?,?,?,?,?) ON CONFLICT(user_id) DO NOTHING""",
+                (LOCAL_USER_ID, LOCAL_USER_ID, ResumeProfile().model_dump_json(), now, now))
+        return
     with _connection() as conn:
         local_profile = conn.execute(
             "SELECT id FROM candidate_profiles WHERE user_id=? LIMIT 1", (LOCAL_USER_ID,)

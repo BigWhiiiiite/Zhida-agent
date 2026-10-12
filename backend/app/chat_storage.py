@@ -21,6 +21,8 @@ class ConversationConflict(RuntimeError):
 
 
 def initialize() -> None:
+    if storage.postgresql_enabled():
+        return  # Managed exclusively by Alembic, never DDL with runtime role.
     with storage._connection() as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS chat_conversations (
             id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL,

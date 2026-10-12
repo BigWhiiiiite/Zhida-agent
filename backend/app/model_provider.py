@@ -20,6 +20,34 @@ from .models import ModelHealth
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
 
+class MeteredResponsesModel(OpenAIResponsesModel):
+    async def get_response(self,*args,**kwargs):
+        from .backend_v2.model_budget import MODEL_SCOPE,ModelReservation
+        scope=MODEL_SCOPE.get()
+        if scope is None:return await super().get_response(*args,**kwargs)
+        reservation=ModelReservation(scope,self.model,[args[:2],kwargs.get('input','')])
+        reservation.start()
+        try:
+            # A reservation covers one HTTP attempt. Do not let SDK-internal
+            # retries bypass the shared RPM/token/concurrency budget. Use a
+            # derived client rather than mutating the cached shared client.
+            client=self._get_client().with_options(max_retries=0)
+            response_model=OpenAIResponsesModel(model=self.model,openai_client=client)
+            result=await response_model.get_response(*args,**kwargs)
+        except BaseException:
+            reservation.finish()
+            raise
+        reservation.finish(result.usage)
+        return result
+
+    async def stream_response(self,*args,**kwargs):
+        # D3 deliberately uses complete structured responses so usage/plan
+        # validation cannot be bypassed by a partial streamed suggestion.
+        from .backend_v2.model_budget import MODEL_SCOPE
+        if MODEL_SCOPE.get() is not None:raise ValueError('D3 只使用可校验完整结果，不流式派发填写')
+        async for event in super().stream_response(*args,**kwargs):yield event
+
+
 # Agents SDK 0.8.4 logs the full model input on terminal errors in one run-loop
 # branch. Application code already turns those errors into safe API messages, so
 # silence the SDK logger to prevent resumes from appearing in server logs.
@@ -97,7 +125,7 @@ def configured_model(model_name: str | None = None, reasoning_effort: str | None
 
     # The custom proxy is OpenAI-compatible but tracing should not be sent to a second endpoint.
     set_tracing_disabled(True)
-    model = OpenAIResponsesModel(model=model_name, openai_client=client)
+    model = MeteredResponsesModel(model=model_name, openai_client=client)
     settings = ModelSettings(store=False, extra_body={"reasoning": {"effort": wire_effort}})
     return model, settings
 

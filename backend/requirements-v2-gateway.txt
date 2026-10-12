@@ -1,0 +1,4 @@
+# PostgreSQL gateway keeps the current UI/browser/parser API contracts while
+# native workflow orchestration is still being migrated. Install into .venv-v2.
+-r requirements-v2.txt
+-r requirements.txt

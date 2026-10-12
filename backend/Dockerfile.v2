@@ -1,0 +1,19 @@
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /opt/zhida/backend
+COPY requirements-v2.txt ./
+RUN pip install --no-cache-dir -r requirements-v2.txt \
+    && useradd --create-home --uid 10001 zhida \
+    && install -d -o zhida -g zhida -m 0700 /opt/zhida/backend/.v2-runtime/files
+
+COPY app ./app
+COPY alembic-v2.ini ./alembic-v2.ini
+COPY migrations_v2 ./migrations_v2
+COPY scripts ./scripts
+
+USER zhida
+CMD ["uvicorn", "app.backend_v2.api:app", "--host", "0.0.0.0", "--port", "8000"]

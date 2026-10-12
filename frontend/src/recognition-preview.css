@@ -1,0 +1,14 @@
+.recognition-preview small{color:#657965;line-height:1.6}
+.recognition-preview-report{border-top:1px solid #dce6dc;margin-top:18px;padding-top:12px;overflow-wrap:anywhere}
+.recognition-preview-notice{background:#fff8e9;border:1px solid #dfbd8a;padding:10px;border-radius:8px}
+.recognition-preview-fields{display:grid;gap:8px;margin:16px 0}
+.recognition-preview-fields>details{border:1px solid #dce6dc;border-radius:8px;padding:12px;background:#fbfdf9}
+.recognition-preview details>summary{cursor:pointer}
+.recognition-preview-fields>details>summary{display:flex;justify-content:space-between;gap:16px;line-height:1.6}
+.recognition-preview-fields>details>summary small{flex:none}
+.recognition-preview-fields dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.recognition-preview-fields dl>div{background:#f0f5ed;padding:8px;border-radius:6px}
+.recognition-preview-fields dt{font-size:12px;color:#657965}
+.recognition-preview-fields dd{margin:4px 0 0}
+.recognition-preview-issues>li{margin:12px 0;line-height:1.6}
+@media(max-width:600px){.recognition-preview-fields>details>summary{display:grid;gap:4px}}

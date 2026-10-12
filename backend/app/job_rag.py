@@ -292,6 +292,9 @@ def _evidence_for_job(item: JobRecommendation,
 def enrich_recommendation_batch(batch: RecommendationBatch, profile: CandidateProfile,
                                 aliases: dict[str, tuple[str, ...]]) -> RecommendationBatch:
     """Enrich top candidates; keep official-site and eligibility gates unchanged."""
+    if os.getenv("ZHIDA_STORAGE_BACKEND", "sqlite").lower() == "postgresql":
+        from .backend_v2.workbench_rag import enrich
+        return enrich(batch, profile, aliases)
     model_name = os.getenv("APP_JOB_EMBEDDING_MODEL", MODEL_NAME).strip() or MODEL_NAME
     cards, dense_ready = _indexed_chunks(profile, model_name)
     if not cards:

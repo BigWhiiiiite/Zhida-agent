@@ -242,6 +242,14 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
     inventory = []
     deferred = {}
     model_calls = 0
+    # Imported only for D3, so SQLite/legacy startup need not load LangGraph.
+    if os.getenv('ZHIDA_V2_ASSISTED_ENABLED','false').lower()=='true':
+        from .application_graph import create_graph_form_plan, create_graph_model_plan
+        local_plan = create_graph_form_plan
+        original_model_plan = model_plan
+        model_plan = lambda snapshot: create_graph_model_plan(snapshot,original_model_plan)
+    else:
+        local_plan = create_local_form_plan
 
     def event(kind, message, completed=0, failed=0, issues=()):
         item = ApplicationAssistEvent(kind=kind, message=message, completed=completed,
@@ -295,9 +303,29 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
 
     async def seed(fields, record, kind):
         prefix, anchor = KINDS[kind]
+        key = fields[0].container_key if fields else ''
+        originally_empty = _empty_record(fields)
         anchors = [f for f in fields if semantic_key_for(f) == prefix+'.'+anchor
                    and f.field_type in {'text', 'textarea'}]
-        if len(anchors) != 1 or not _empty_record(fields):
+        # Some ATSs mount school/major only after degree. Explicitly allocate
+        # the degree of ONE verified empty record, then re-observe the school
+        # anchor. Never infer a populated record's identity from its position.
+        if kind=='education' and not anchors and originally_empty:
+            degrees=[f for f in fields if semantic_key_for(f)=='education.degree'
+                and f.field_type in {'combobox','select-one'}]
+            if len(degrees)!=1 or not record.degree:
+                raise ValueError('教育栏目尚未展开，且没有唯一学历选择入口；不猜本科或硕士')
+            chosen=FillAction(selector=degrees[0].selector,label=degrees[0].label,action='select',
+                value=record.degree,confidence=1,value_source='所选简历向唯一空教育记录的明确分配')
+            guard()
+            result=await service.execute(session_id,ExecutePlanRequest(actions=[chosen]),before_action=guard)
+            if result.failed or result.verified!=1:
+                raise ValueError('学历选项未回读成功；不会继续向此记录填写学校或学院')
+            latest=await observe()
+            fields=_record_groups(latest,'education').get(key,[])
+            anchors=[f for f in fields if semantic_key_for(f)=='education.school'
+                and f.field_type in {'text','textarea'} and not f.current_value.strip()]
+        if len(anchors) != 1 or not originally_empty:
             raise ValueError('待分配记录不是唯一空组，已停止，避免覆盖或串填')
         value = getattr(record, anchor)
         if not value:
@@ -406,7 +434,7 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
         # picker later in the page must not prevent role/content from being
         # attempted or erase this batch's already completed readback receipt.
         record_review = build_form_review(snapshot,
-            apply_deferrals(stamp_plan(create_local_form_plan(snapshot, profile))))
+            apply_deferrals(stamp_plan(local_plan(snapshot, profile))))
         text_actions = record_text_actions(record_review, inventory)
         if text_actions:
             guard()
@@ -435,7 +463,7 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
             snapshot = await observe()
             if failures:
                 review = _retain_execution_failures(build_form_review(snapshot,
-                    apply_deferrals(stamp_plan(create_local_form_plan(snapshot, profile)))), failures)
+                    apply_deferrals(stamp_plan(local_plan(snapshot, profile)))), failures)
                 return finish('partial', '经历文本仍有提交或回读失败；已填内容保留，先核对这些字段，不重复填写其他栏目')
 
         language = _language_allocation(snapshot,profile)
@@ -473,7 +501,7 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
             key = observation_key(snapshot)
             repeated = key in seen
             seen.add(key)
-            plan = apply_deferrals(stamp_plan(create_local_form_plan(snapshot, profile)))
+            plan = apply_deferrals(stamp_plan(local_plan(snapshot, profile)))
             review = build_form_review(snapshot, plan)
             actions = remaining_actions(review)
             pending = {a.selector for a in plan.actions if a.needs_model and a.selector not in deferred}
@@ -560,7 +588,7 @@ async def prepare_application(service, session_id, request: ApplicationAssistReq
             # form twice consecutively; no identity or execution guard is lost.
 
         snapshot = await observe()
-        final_plan = apply_deferrals(stamp_plan(create_local_form_plan(snapshot, profile)))
+        final_plan = apply_deferrals(stamp_plan(local_plan(snapshot, profile)))
         if model_actions:
             # Preserve already grounded model mappings only while the same
             # field identity exists; no new model-generated values are added.

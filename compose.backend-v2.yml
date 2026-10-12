@@ -1,0 +1,169 @@
+name: zhida-backend-v2
+
+x-app-environment: &app-environment
+  ZHIDA_V2_ENVIRONMENT: development
+  ZHIDA_V2_DATABASE_URL: postgresql+psycopg://zhida_runtime:${ZHIDA_V2_APP_DATABASE_PASSWORD:?Run backend_v2_stack.py init first}@postgres:5432/zhida_v2
+  ZHIDA_V2_REDIS_CACHE_URL: redis://:${ZHIDA_V2_REDIS_PASSWORD:?Run backend_v2_stack.py init first}@redis-cache:6379/0
+  ZHIDA_V2_REDIS_CONTROL_URL: redis://:${ZHIDA_V2_REDIS_PASSWORD:?Run backend_v2_stack.py init first}@redis-control:6379/0
+  ZHIDA_V2_BROKER_URL: amqp://zhida:${ZHIDA_V2_RABBITMQ_PASSWORD:?Run backend_v2_stack.py init first}@rabbitmq:5672/zhida
+  ZHIDA_V2_LOCAL_USER_ENABLED: ${ZHIDA_V2_LOCAL_USER_ENABLED:-false}
+  ZHIDA_V2_LOCAL_USER_ID: ${ZHIDA_V2_LOCAL_USER_ID:-local-development-user}
+  ZHIDA_V2_COOKIE_SECURE: ${ZHIDA_V2_COOKIE_SECURE:-false}
+  ZHIDA_V2_WORKFLOW_ENABLED: ${ZHIDA_V2_WORKFLOW_ENABLED:-false}
+  ZHIDA_V2_RECOGNITION_ENABLED: ${ZHIDA_V2_RECOGNITION_ENABLED:-false}
+  ZHIDA_V2_ASSISTED_ENABLED: ${ZHIDA_V2_ASSISTED_ENABLED:-false}
+  ZHIDA_V2_FILE_ROOT: /opt/zhida/backend/.v2-runtime/files
+
+x-application: &application
+  build:
+    context: ./backend
+    dockerfile: Dockerfile.v2
+  profiles: [application]
+  environment: *app-environment
+  init: true
+  stop_grace_period: 30s
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis-cache:
+      condition: service_healthy
+    redis-control:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg17
+    environment:
+      POSTGRES_USER: zhida_migrator
+      POSTGRES_PASSWORD: ${ZHIDA_V2_POSTGRES_PASSWORD:?Run backend_v2_stack.py init first}
+      POSTGRES_DB: zhida_v2
+      ZHIDA_V2_APP_DATABASE_PASSWORD: ${ZHIDA_V2_APP_DATABASE_PASSWORD:?Run backend_v2_stack.py init first}
+    ports:
+      - "127.0.0.1:${ZHIDA_V2_POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backend/scripts/postgres_v2_roles.sh:/docker-entrypoint-initdb.d/10-zhida-roles.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U zhida_migrator -d zhida_v2"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-cache:
+    image: redis:7.4.2-alpine
+    environment:
+      REDISCLI_AUTH: ${ZHIDA_V2_REDIS_PASSWORD:?Run backend_v2_stack.py init first}
+    command: [redis-server, --requirepass, "${ZHIDA_V2_REDIS_PASSWORD}", --maxmemory, 256mb, --maxmemory-policy, allkeys-lfu, --save, "", --appendonly, "no"]
+    ports:
+      - "127.0.0.1:${ZHIDA_V2_REDIS_CACHE_PORT:-16379}:6379"
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis-control:
+    image: redis:7.4.2-alpine
+    environment:
+      REDISCLI_AUTH: ${ZHIDA_V2_REDIS_PASSWORD:?Run backend_v2_stack.py init first}
+    command: [redis-server, --requirepass, "${ZHIDA_V2_REDIS_PASSWORD}", --maxmemory, 128mb, --maxmemory-policy, noeviction, --appendonly, "yes", --appendfsync, everysec]
+    ports:
+      - "127.0.0.1:${ZHIDA_V2_REDIS_CONTROL_PORT:-16380}:6379"
+    volumes:
+      - redis-control-data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  rabbitmq:
+    image: rabbitmq:4.1.0-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: zhida
+      RABBITMQ_DEFAULT_PASS: ${ZHIDA_V2_RABBITMQ_PASSWORD:?Run backend_v2_stack.py init first}
+      RABBITMQ_DEFAULT_VHOST: zhida
+    ports:
+      - "127.0.0.1:${ZHIDA_V2_RABBITMQ_PORT:-15674}:5672"
+      - "127.0.0.1:${ZHIDA_V2_RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: [CMD, rabbitmq-diagnostics, -q, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.v2
+    profiles: [application]
+    environment:
+      <<: *app-environment
+      ZHIDA_V2_DATABASE_URL: postgresql+psycopg://zhida_migrator:${ZHIDA_V2_POSTGRES_PASSWORD:?Run backend_v2_stack.py init first}@postgres:5432/zhida_v2
+    command: [python, scripts/migrate_backend_v2.py]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *application
+    command: [uvicorn, "app.backend_v2.api:app", --host, 0.0.0.0, --port, "8000"]
+    volumes:
+      - document-files:/opt/zhida/backend/.v2-runtime/files
+      - type: bind
+        source: ./backend/data/embedding_models
+        target: /opt/zhida/backend/data/embedding_models
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${ZHIDA_V2_API_PORT:-18000}:8000"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v2/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker-workflow:
+    <<: *application
+    command: [python, -m, app.backend_v2.cli, worker, --queue, workflow.advance]
+
+  worker-document:
+    <<: *application
+    command: [python, -m, app.backend_v2.cli, worker, --queue, document.parse]
+    volumes:
+      - document-files:/opt/zhida/backend/.v2-runtime/files
+
+  worker-rag:
+    <<: *application
+    command: [python, -m, app.backend_v2.cli, worker, --queue, rag.index]
+    volumes:
+      - type: bind
+        source: ./backend/data/embedding_models
+        target: /opt/zhida/backend/data/embedding_models
+        read_only: true
+        bind:
+          create_host_path: false
+
+  worker-maintenance:
+    <<: *application
+    command: [python, -m, app.backend_v2.cli, worker, --queue, maintenance]
+
+  publisher:
+    <<: *application
+    command: [python, -m, app.backend_v2.cli, publisher]
+
+  scheduler:
+    <<: *application
+    command: [python, -m, app.backend_v2.cli, scheduler]
+
+volumes:
+  postgres-data:
+  redis-control-data:
+  rabbitmq-data:
+  document-files:

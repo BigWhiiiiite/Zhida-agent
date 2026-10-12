@@ -138,3 +138,10 @@ export function draftFieldsCompatible(selectors:string[],before:BrowserSnapshot,
       JSON.stringify(old.required_evidence||[])===JSON.stringify(next.required_evidence||[]))
   })
 }
+
+// One submission only. A receipt timeout never causes a second write request.
+export async function assistedSubmission<T>(version:number,operations:{start:()=>Promise<unknown>;wait:()=>Promise<T>;legacy:()=>Promise<T>}):Promise<T>{
+  if(version<1)return operations.legacy()
+  await operations.start()
+  return operations.wait()
+}

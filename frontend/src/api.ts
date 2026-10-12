@@ -2,8 +2,11 @@ import type { ApplicationTarget, ChatConversation, ChatConversationSummary, Appl
 import type {ApplicationAssistRequest, ApplicationAssistResult, ApplicationAssistProgress, ApplicationJourneyResult, ConfirmedResumeFact, ResumeFactTargets} from './types'
 import {resumeAttachmentRequest} from './resumeAttachment'
 import type {ObservationConsent,PageRegionObservation,ExtractionAuditRequest,ExtractionAuditResult} from './types'
+import type {BackendHealth} from './backendConnection'
 
-export const API = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/api`
+// Same-origin proxy targets the explicit PostgreSQL gateway; no silent fallback
+// to the old :8000 SQLite process. VITE_API_URL is an intentional override only.
+export const API = import.meta.env.VITE_API_URL ?? '/api'
 const nativeFetch=window.fetch.bind(window)
 const fetch=(input:RequestInfo|URL,init:RequestInit={})=>nativeFetch(input,{...init,credentials:'include'})
 
@@ -19,6 +22,7 @@ async function result<T>(response:Response):Promise<T>{
 }
 
 export const api={
+  health:()=>fetch(`${API}/health`).then(result<BackendHealth>),
   previewExistingSafari:(url:string)=>fetch(`${API}/websites/safari/preview-existing`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}).then(result<{preview_token:string;url:string;expires_in_seconds:number}>),
   confirmExistingSafari:(url:string,previewToken:string)=>fetch(`${API}/websites/safari/confirm-existing`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,preview_token:previewToken})}).then(result<{status:'requested';browser:'safari';automation_connected:false;safari_window_token:string;window_reused:true}>),
   openExternalWebsite:(url:string,browser:'safari'|'chrome')=>fetch(`${API}/websites/open`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,browser})}).then(result<{status:'requested';browser:'safari'|'chrome';automation_connected:false;safari_window_token?:string;window_reused?:boolean}>),
@@ -65,9 +69,10 @@ export const api={
   saveChatDraft:(id:string,draft:{company:string;job_title:string;city:string;recruitment_cycle:string;url:string;intent:'apply'|'recommend'|'profile'|'clarify'})=>fetch(`${API}/chat/conversations/${encodeURIComponent(id)}/draft`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(draft)}).then(result<ChatConversation>),
   sendChatMessage:(id:string,text:string,image:File|null,consent:boolean)=>{const data=new FormData();data.append('text',text);data.append('model_consent',String(consent));if(image)data.append('image',image);return fetch(`${API}/chat/conversations/${encodeURIComponent(id)}/messages`,{method:'POST',body:data}).then(result<ChatConversation>)},
   startBrowser:(url:string,target?:ApplicationTarget,resume_id='',safari_window_token='')=>fetch(`${API}/browser/start`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,target,resume_id,safari_window_token})}).then(result<BrowserSnapshot>),
-  currentBrowser:()=>fetch(`${API}/browser/current`).then(result<{session_id:string|null;occupied:boolean;resume_id:string;assistance_version?:number;journey_version?:number;record_completion_version?:number}>),
+  currentBrowser:()=>fetch(`${API}/browser/current`).then(result<{session_id:string|null;occupied:boolean;resume_id:string;assistance_version?:number;assistance_async_version?:number;journey_version?:number;record_completion_version?:number}>),
   browserSnapshot:(id:string)=>fetch(`${API}/browser/${id}/snapshot`).then(result<BrowserSnapshot>),
   recognitionDiagnostics:(id:string)=>fetch(`${API}/browser/${id}/recognition-diagnostics`).then(result<Record<string,unknown>>),
+  recognitionPreview:(id:string,payload:{expected_url:string;resume_id:string})=>fetch(`${API}/browser/${encodeURIComponent(id)}/recognition-preview`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<unknown>),
   observationConsent:(id:string)=>fetch(`${API}/browser/${id}/observation-consent`).then(result<ObservationConsent>),
   extractionAudit:(id:string,payload:ExtractionAuditRequest)=>fetch(`${API}/browser/${id}/extraction-audit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ExtractionAuditResult>),
   setObservationConsent:(id:string,enabled:boolean,context_token:string)=>fetch(`${API}/browser/${id}/observation-consent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,context_token})}).then(result<ObservationConsent>),
@@ -88,6 +93,8 @@ export const api={
   reviewForm:(id:string,useModel=false)=>fetch(`${API}/browser/${id}/review${useModel?'?use_model=true':''}`,{method:'POST'}).then(result<FormReviewResult>),
   autofillPhase:(id:string,phase:'rules'|'model')=>fetch(`${API}/browser/${id}/autofill`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phase})}).then(result<AutofillPhaseResult>),
   assistApplication:(id:string,payload:ApplicationAssistRequest,runId?:string)=>fetch(`${API}/browser/${id}/assist${runId?`?run_id=${encodeURIComponent(runId)}`:''}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ApplicationAssistResult>),
+  startAssistance:(id:string,payload:ApplicationAssistRequest,runId:string)=>fetch(`${API}/browser/${id}/assist/start?run_id=${encodeURIComponent(runId)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(result<ApplicationAssistProgress>),
+  reconcileAssistance:(id:string)=>fetch(`${API}/browser/${id}/assist/reconcile`,{method:'POST'}).then(result<{resolved:number;remaining:number;writes_executed:number}>),
   assistProgress:(id:string,runId:string)=>fetch(`${API}/browser/${id}/assist/progress/${encodeURIComponent(runId)}`).then(result<ApplicationAssistProgress>),
   cancelAssist:(id:string,runId:string)=>fetch(`${API}/browser/${id}/assist/progress/${encodeURIComponent(runId)}/cancel`,{method:'POST'}).then(result<ApplicationAssistProgress>),
   executeForm:(id:string,actions:FillAction[],resume_id:string,context_token='')=>fetch(`${API}/browser/${id}/execute`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actions,min_confidence:.85,resume_id,context_token})}).then(result<ExecutionResult>),

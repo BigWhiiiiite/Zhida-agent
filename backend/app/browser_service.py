@@ -2642,13 +2642,14 @@ class BrowserDemoService:
                       resume_path: Path | None = None, *,
                       resume_filename: str = '',
                       before_action: Callable[[], None] | None = None,
-                      on_progress: Callable[[int, str], None] | None = None) -> ExecutionResult:
+                      on_progress: Callable[[int, str], None] | None = None,
+                      audit_action: Callable | None = None) -> ExecutionResult:
         page = self._require(session_id)
         document = await page.evaluate_handle('() => document')
         try:
             return await self._execute_bound_document(session_id, request, resume_path,
                 resume_filename=resume_filename, before_action=before_action,
-                document=document, on_progress=on_progress)
+                document=document, on_progress=on_progress, audit_action=audit_action)
         finally:
             try:
                 await document.dispose()
@@ -2658,7 +2659,8 @@ class BrowserDemoService:
     async def _execute_bound_document(self, session_id: str, request: ExecutePlanRequest,
                       resume_path: Path | None = None, *, resume_filename: str = '',
                       before_action: Callable[[], None] | None = None, document,
-                      on_progress: Callable[[int, str], None] | None = None) -> ExecutionResult:
+                      on_progress: Callable[[int, str], None] | None = None,
+                      audit_action: Callable | None = None) -> ExecutionResult:
         page = self._require(session_id)
         workflow = await self.workflow_state(session_id)
         if workflow.navigation_blocker:
@@ -2809,6 +2811,13 @@ class BrowserDemoService:
                     before_action()
                 expected_values = ([str(action.value)] if field.region_picker else _split_values(action.value))
                 stage('write_value')
+                if audit_action:
+                    # A persistence failure MUST escape the per-widget error
+                    # handler: continuing would permit an unrecorded write.
+                    try:
+                        audit_action(action, field)
+                    except Exception as exc:
+                        raise interrupted('执行记账未完成，未执行这一项写入') from exc
                 if action.action == "fill":
                     await locator.fill(str(action.value), timeout=8000)
                 elif action.action == "select":
